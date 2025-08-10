@@ -71,7 +71,7 @@ Creates rich entity embeddings by combining three complementary approaches:
 
 ### Step 1: Install RAPIDS
 
-We recommend using Conda:
+Conda is recommended:
 
 ```bash
 # Create a new environment with RAPIDS
@@ -344,3 +344,4 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 Maintained by: **Andrew Jordan**  
 Contact: **andrewjordan3@gmail.com**  
 Last Updated: **August 2025**
+
