@@ -3,7 +3,7 @@ pandas
 numpy
 phonetics
 sentence-transformers
-pypostal
+postal
 pydantic
 pyyaml
 
@@ -16,4 +16,5 @@ pyyaml
 cudf
 cuml
 cupy
+
 cugraph
