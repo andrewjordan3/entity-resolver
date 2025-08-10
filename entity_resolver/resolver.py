@@ -147,7 +147,7 @@ class EntityResolver:
         # Address processing component (needs multiple configs for full functionality)
         self.address_processor = AddressProcessor(
             validation_config=self.config.validation,
-            columns_config=self.config.columns,
+            column_config=self.config.columns,
             vectorizer_config=self.config.vectorizer  # For similarity parameters
         )
         self.logger.debug("AddressProcessor initialized")
@@ -698,4 +698,5 @@ class EntityResolver:
             raise MemoryError(
                 f"Unable to transfer {len(df):,} records to GPU. "
                 f"Consider reducing batch size or upgrading GPU memory."
+
             ) from e
