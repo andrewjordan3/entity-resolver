@@ -1,0 +1,264 @@
+# ===================================================================
+# Default Configuration for the Entity Resolver
+# ===================================================================
+# This file contains all the default parameters for the entity resolution
+# pipeline. To customize a run, you can create a copy of this file,
+# change the desired values, and provide its path when initializing
+# the resolver. Any parameter not specified in your custom file will
+# fall back to the default value listed here.
+
+# === Core Data and I/O Configurations ===
+columns:
+  # The column containing the primary entity name (e.g., 'company_name').
+  entity_col: 'company_name'
+  # A list of columns that together form the address.
+  address_cols: ['address']
+
+output:
+  # The case style for the final canonical name. Options: 'proper' for Title Case, 'raw' for as-is.
+  output_format: 'proper'
+  # The confidence score (0.0 to 1.0) below which a match will be flagged for manual review.
+  review_confidence_threshold: 0.75
+  # The logging level for console output. 10=DEBUG, 20=INFO, 30=WARNING.
+  log_level: 20
+  # If True, the final output DataFrame will include separate columns for canonical address components.
+  split_address_components: false
+
+# === Preprocessing Configurations ===
+normalization:
+  # A dictionary of common abbreviations or misspellings and their standard form.
+  replacements:
+    traiier: trailer
+    rpr: repair
+    svcs: service
+    svc: service
+    ctr: center
+    ctrs: centers
+    cntr: center
+    trk: truck
+    auto: automotive
+    auth: authorized
+    dist: distribution
+    mfg: manufacturing
+    mfr: manufacturing
+    equip: equipment
+    natl: national
+    mgmt: management
+    assoc: associates
+  # A set of common legal and organizational suffixes to be removed from names.
+  suffixes_to_remove:
+    - inc
+    - incorporated
+    - llc
+    - "ll"
+    - lp
+    - llp
+    - ltd
+    - limited
+    - corp
+    - corporation
+    - co
+    - company
+    - plc
+    - pllc
+    - pa
+    - pc
+    - sc
+    - dba
+    - fka
+    - aka
+    - etal
+    - "et al"
+    - international
+    - intl
+    - usa
+    - america
+    - us
+    - group
+    - grp
+    - holdings
+    - ent
+
+# === Modeling Stage Configurations ===
+vectorizer:
+  # A list of feature streams to generate. Options: 'tfidf', 'phonetic', 'semantic'.
+  encoders: ['tfidf', 'phonetic', 'semantic']
+  # A list of dimensionality reduction techniques for sparse vectors. Options: 'svd', 'pca'.
+  sparse_reducers: ['svd', 'pca']
+  # If True, the normalized address will be appended to the entity name for the TF-IDF stream.
+  use_address_in_encoding: true
+  # Controls the strength of spectral damping (0.0 to 1.0). 1.0 is full whitening, 0.0 is no whitening.
+  damping_beta: 0.4
+  # Small constant to prevent division by zero in numerical operations.
+  epsilon: 1.0e-8
+
+  # --- Semantic Stream ---
+  # Sentence-transformer model for semantic encoding.
+  semantic_model: 'all-mpnet-base-v2'
+  semantic_batch_size: 512
+
+  # --- TF-IDF Stream ---
+  # Parameters for the TfidfVectorizer.
+  tfidf_params:
+    analyzer: 'char'
+    ngram_range: [3, 5]
+    max_features: 10000
+    min_df: 3
+    sublinear_tf: true
+    dtype: 'float64'
+  # Parameters for TruncatedSVD applied to TF-IDF vectors.
+  tfidf_svd_params:
+    n_components: 2048
+  # Parameters for PCA applied to TF-IDF vectors.
+  tfidf_pca_params:
+    n_components: 768
+
+  # --- Phonetic Stream ---
+  # Maximum number of words to consider for phonetic encoding.
+  phonetic_max_words: 5
+  # Parameters for CountVectorizer on phonetic codes.
+  phonetic_params:
+    analyzer: 'word'
+    binary: true
+    max_features: 2000
+  # Parameters for TruncatedSVD applied to phonetic vectors.
+  phonetic_svd_params:
+    n_components: 384
+  # Parameters for PCA applied to phonetic vectors.
+  phonetic_pca_params:
+    n_components: 256
+
+  # --- Stream Balancing ---
+  # Defines the desired final variance contribution of each stream. Must sum to 1.0.
+  stream_proportions:
+    semantic: 0.45
+    tfidf: 0.40
+    phonetic: 0.15
+
+  # --- String Matching ---
+  # TF-IDF parameters for the string similarity search fallback.
+  similarity_tfidf:
+    analyzer: 'char'
+    ngram_range: [3, 5]
+    min_df: 2
+    sublinear_tf: true
+    norm: 'l2'
+  # Nearest neighbor parameters for the string similarity search fallback.
+  similarity_nn:
+    n_neighbors: 24
+    metric: 'cosine'
+
+# === Clustering Stage Configurations ===
+clusterer:
+  # --- UMAP Ensemble ---
+  # Number of UMAP models in the ensemble (must be >= 1).
+  umap_n_runs: 3
+  # Default parameters for the UMAP models in the ensemble.
+  # Note: The 'spread' value must be strictly greater than 'min_dist'.
+  umap_params:
+    n_neighbors: 15
+    n_components: 48
+    min_dist: 0.05
+    spread: 0.5
+    metric: 'cosine'
+    init: 'spectral'
+    n_epochs: 400
+    negative_sample_rate: 7
+    repulsion_strength: 1.0
+    learning_rate: 0.5
+  # Defines the search space for randomized UMAP parameters in the ensemble.
+  umap_ensemble_sampling_config:
+    local_view_ratio: 0.7
+    n_neighbors_local: [10, 35]
+    n_neighbors_global: [50, 70]
+    min_dist: [0.0, 0.15]
+    spread: [0.5, 2.0]
+    n_epochs: [200, 500]
+    learning_rate: [0.5, 1.5]
+    repulsion_strength: [0.5, 1.5]
+    negative_sample_rate: [5, 20]
+    init_strategies: ['spectral', 'random']
+
+  # --- Kernel PCA Consensus Embedding ---
+  cosine_consensus_n_samples: 8192
+  cosine_consensus_batch_size: 2048
+
+  # --- HDBSCAN Clustering ---
+  # High-noise warning threshold (0.0 to 1.0).
+  max_noise_rate_warn: 0.95
+  # Parameters for the HDBSCAN clustering algorithm.
+  hdbscan_params:
+    min_cluster_size: 3
+    min_samples: 1
+    cluster_selection_epsilon: 0.15
+    prediction_data: true
+    alpha: 0.8
+    cluster_selection_method: 'leaf'
+
+  # --- SNN Graph Clustering Engine ---
+  snn_clustering_params:
+    k_neighbors: 40
+    louvain_resolution: 0.65
+  noise_attachment_params:
+    k: 15
+    tau: 0.82
+    min_matching: 2
+    ratio_threshold: 1.5
+
+  # --- SNN Cluster Merging ---
+  # The median similarity (0-1) between two clusters must exceed this to be considered for a merge.
+  merge_median_threshold: 0.84
+  # The maximum similarity (0-1) (single most similar pair) must also exceed this.
+  merge_max_threshold: 0.90
+  # To avoid O(n^2) comparisons, sample this many points from large clusters for the check.
+  merge_sample_size: 20
+  # In the pre-filtering step, only cluster pairs with centroid similarity above this are checked in detail.
+  centroid_similarity_threshold: 0.75
+  merge_batch_size: 2048
+  centroid_sample_size: 2048
+
+  # --- Ensemble of HDBSCAN and SNN ---
+  ensemble_params:
+    purity_min: 0.75
+    min_overlap: 2
+    allow_new_snn_clusters: true
+    min_newcluster_size: 4
+    default_rescue_conf: 0.60
+
+# === Validation Stage Configurations ===
+validation:
+  # Maximum difference allowed between street numbers within the same cluster.
+  street_number_threshold: 50
+  # Minimum fuzzy match ratio (0-100) required for an address to be considered valid in a cluster.
+  address_fuzz_ratio: 87
+  # Minimum fuzzy match ratio (0-100) required for a name to be considered valid in a cluster.
+  name_fuzz_ratio: 89
+  # If True, entities in different states will not be placed in the same cluster.
+  enforce_state_boundaries: true
+  # A list of state pairs that are allowed to be matched across borders (e.g., [['IL', 'WI']]).
+  allow_neighboring_states: []
+  # To prevent OOM errors, this limits the size of the cross-join during reassignment.
+  profile_comparison_max_pairs_per_chunk: 1000000
+
+  # Weights for scoring potential new clusters during the reassignment step. Must sum to 1.0.
+  reassignment_scoring_weights:
+    name_similarity: 0.40
+    address_similarity: 0.40
+    cluster_size: 0.10
+    cluster_probability: 0.10
+  validate_cluster_batch_size: 2000
+
+# === Confidence Scoring Configurations ===
+scoring:
+  # These weights determine the contribution of each factor to the final score. Must sum to 1.0.
+  weights:
+    cluster_probability: 0.25
+    name_similarity: 0.20
+    address_confidence: 0.25
+    cohesion_score: 0.15
+    cluster_size_factor: 0.15
+
+# === Global Settings ===
+# This seed is used for all random operations (PCA, UMAP, etc.) to ensure
+# that runs are reproducible.
+random_state: 42

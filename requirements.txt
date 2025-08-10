@@ -1,0 +1,19 @@
+# Core CPU Libraries
+pandas
+numpy
+phonetics
+sentence-transformers
+pypostal
+pydantic
+pyyaml
+
+# --- GPU Libraries ---
+# Note: These libraries are part of the NVIDIA RAPIDS suite.
+# They are typically installed via Conda and are specific to your
+# CUDA version. Listing them here is for documentation purposes.
+# Installation instructions should be followed from the official
+# RAPIDS AI website.
+cudf
+cuml
+cupy
+cugraph
