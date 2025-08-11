@@ -7,7 +7,6 @@ that are optimized for GPU execution and sparse matrix operations.
 """
 
 import logging
-from typing import Optional
 
 import cupy
 from cupyx.scipy.sparse.linalg import svds

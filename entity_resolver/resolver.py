@@ -654,6 +654,10 @@ class EntityResolver:
         # Set the log level on the package logger
         # This will apply to all child loggers (normalizer, vectorizer, etc.)
         package_logger.setLevel(self.config.output.log_level)
+
+        # Stop messages from propagating to the root logger,
+        # which prevents the duplicate output seen in Colab.
+        package_logger.propagate = False
         
         # Only add a handler if one doesn't already exist
         # This prevents duplicate log messages when creating multiple EntityResolver instances

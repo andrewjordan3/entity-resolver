@@ -477,7 +477,7 @@ class AddressProcessor:
         # Find similar address pairs
         matched_pairs = utils.find_similar_pairs(
             string_series=unique_addresses[key_col],
-            vectorizer_params=self.vectorizer_config.similarity_tfidf,
+            tfidf_params=self.vectorizer_config.similarity_tfidf,
             nn_params=self.vectorizer_config.similarity_nn,
             distance_threshold=distance_threshold,
         )
