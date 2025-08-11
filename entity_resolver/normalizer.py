@@ -12,6 +12,7 @@ import logging
 from typing import Dict
 
 import cudf
+import cupy as cp
 
 # Local Package Imports
 from .config import NormalizationConfig
@@ -33,6 +34,7 @@ class TextNormalizer:
     Attributes:
         config (NormalizationConfig): Configuration for normalization rules
         _compiled_patterns (Dict): Pre-compiled regex patterns for efficiency
+        _consolidation_stats (Dict): Statistics from last consolidation operation
     """
     
     def __init__(self, config: NormalizationConfig):
@@ -45,6 +47,7 @@ class TextNormalizer:
         """
         self.config = config
         self._compiled_patterns = self._compile_regex_patterns()
+        self._consolidation_stats = {}
         
         logger.info("Initialized TextNormalizer")
         logger.debug(f"Replacements configured: {len(config.replacements)}")
@@ -234,90 +237,274 @@ class TextNormalizer:
         Raises:
             KeyError: If required columns are missing
         """
+        # Reset consolidation stats
+        self._consolidation_stats = {
+            'total_addresses': 0,
+            'addresses_with_multiple_names': 0,
+            'records_affected': 0,
+            'names_changed': 0,
+            'unique_before': 0,
+            'unique_after': 0,
+            'empty_addresses_skipped': 0,
+            'consolidation_examples': []
+        }
+        
         # Validate required columns
         required_columns = ['addr_normalized_key', 'normalized_text']
         missing_columns = [col for col in required_columns if col not in gdf.columns]
         if missing_columns:
             raise KeyError(f"Missing required columns: {missing_columns}")
         
-        logger.info("Starting address-based name consolidation...")
+        logger.info("=" * 60)
+        logger.info("Starting address-based name consolidation")
+        logger.info("=" * 60)
         
-        # Count unique names per address
-        logger.debug("Analyzing name variations per address...")
-        name_counts_per_address = gdf.groupby('addr_normalized_key')['normalized_text'].nunique()
+        # First, check how many addresses are empty or invalid
+        empty_addresses = (gdf['addr_normalized_key'] == '') | gdf['addr_normalized_key'].isna()
+        empty_count = empty_addresses.sum()
+        
+        if empty_count > 0:
+            logger.warning(f"Found {empty_count:,} records with empty/invalid addresses - these will be skipped")
+            self._consolidation_stats['empty_addresses_skipped'] = int(empty_count)
+        
+        # Filter out empty addresses for consolidation
+        valid_address_mask = ~empty_addresses
+        valid_gdf = gdf[valid_address_mask]
+        
+        if len(valid_gdf) == 0:
+            logger.warning("No valid addresses found for consolidation")
+            return gdf
+        
+        # Count unique names per address (excluding empty addresses)
+        logger.info("Analyzing name variations per address...")
+        name_counts_per_address = valid_gdf.groupby('addr_normalized_key')['normalized_text'].nunique()
+        
+        # Get detailed statistics
+        total_unique_addresses = len(name_counts_per_address)
+        self._consolidation_stats['total_addresses'] = total_unique_addresses
+        
+        # Log distribution of name counts
+        name_count_distribution = name_counts_per_address.value_counts().sort_index()
+        logger.debug("Distribution of name counts per address:")
+        for count, freq in name_count_distribution.head(10).items():
+            logger.debug(f"  - {count} names: {freq:,} addresses")
         
         # Identify addresses with multiple names
         addresses_to_consolidate = name_counts_per_address[name_counts_per_address > 1].index
+        consolidation_needed = len(addresses_to_consolidate)
+        self._consolidation_stats['addresses_with_multiple_names'] = consolidation_needed
         
-        if len(addresses_to_consolidate) == 0:
+        if consolidation_needed == 0:
             logger.info("No addresses found with multiple names - skipping consolidation")
+            self._log_consolidation_summary()
             return gdf
         
-        total_addresses = len(name_counts_per_address)
-        consolidation_needed = len(addresses_to_consolidate)
-        
         logger.info(
-            f"Found {consolidation_needed:,}/{total_addresses:,} addresses "
-            f"({consolidation_needed/total_addresses:.1%}) requiring name consolidation"
+            f"Found {consolidation_needed:,}/{total_unique_addresses:,} addresses "
+            f"({consolidation_needed/total_unique_addresses:.1%}) with multiple names"
         )
         
         # Get statistics on name variations
-        max_names = name_counts_per_address[addresses_to_consolidate].max()
-        avg_names = name_counts_per_address[addresses_to_consolidate].mean()
-        logger.debug(f"Name variations per address: max={max_names}, avg={avg_names:.2f}")
+        name_variations = name_counts_per_address[addresses_to_consolidate]
+        max_names = int(name_variations.max())
+        avg_names = float(name_variations.mean())
+        median_names = float(name_variations.median())
+        
+        logger.info(f"Name variations statistics:")
+        logger.info(f"  - Maximum names at one address: {max_names}")
+        logger.info(f"  - Average names per address: {avg_names:.2f}")
+        logger.info(f"  - Median names per address: {median_names:.1f}")
         
         # Filter to relevant records
         subset_gdf = gdf[gdf['addr_normalized_key'].isin(addresses_to_consolidate)]
         affected_records = len(subset_gdf)
-        logger.debug(f"Processing {affected_records:,} records for consolidation")
+        self._consolidation_stats['records_affected'] = affected_records
+        logger.info(f"Processing {affected_records:,} records for consolidation")
+        
+        # Track unique names before consolidation
+        unique_before = gdf['normalized_text'].nunique()
+        self._consolidation_stats['unique_before'] = int(unique_before)
         
         # Build canonical name mapping
-        logger.debug("Determining canonical names for each address...")
+        logger.info("Determining canonical names for each address...")
+        address_to_canonical_map = self._build_canonical_mapping(
+            subset_gdf, 
+            addresses_to_consolidate
+        )
+        
+        if not address_to_canonical_map:
+            logger.warning("No canonical names determined - returning original DataFrame")
+            self._log_consolidation_summary()
+            return gdf
+        
+        # Apply consolidation
+        logger.info("Applying canonical name mapping...")
+        gdf = self._apply_canonical_mapping(gdf, address_to_canonical_map)
+        
+        # Track unique names after consolidation
+        unique_after = gdf['normalized_text'].nunique()
+        self._consolidation_stats['unique_after'] = int(unique_after)
+        
+        # Log summary
+        self._log_consolidation_summary()
+        
+        return gdf
+    
+    def _build_canonical_mapping(
+        self, 
+        subset_gdf: cudf.DataFrame, 
+        addresses_to_consolidate: cudf.Index
+    ) -> Dict[str, str]:
+        """
+        Build mapping from addresses to canonical names.
+        
+        Args:
+            subset_gdf: DataFrame filtered to addresses needing consolidation
+            addresses_to_consolidate: Index of addresses with multiple names
+            
+        Returns:
+            Dictionary mapping address keys to canonical names
+        """
         address_to_canonical_map = {}
         
-        # Process in batches for better progress tracking
+        # Convert to list for processing
         addresses_list = addresses_to_consolidate.to_pandas()
-        batch_size = 1000
+        total_addresses = len(addresses_list)
         
-        for i in range(0, len(addresses_list), batch_size):
+        # Process in batches with progress tracking
+        batch_size = 1000
+        examples_collected = 0
+        max_examples = 10
+        
+        for i in range(0, total_addresses, batch_size):
             batch = addresses_list[i:i+batch_size]
             
             for addr_key in batch:
                 # Get all names at this address
-                name_series = subset_gdf[subset_gdf['addr_normalized_key'] == addr_key]['normalized_text']
+                names_at_address = subset_gdf[
+                    subset_gdf['addr_normalized_key'] == addr_key
+                ]['normalized_text']
                 
-                # Determine best canonical name
-                canonical_name = utils.get_canonical_name_gpu(name_series)
+                # Skip if no names found (shouldn't happen but be safe)
+                if len(names_at_address) == 0:
+                    continue
+                
+                # Get unique names and their frequencies
+                name_counts = names_at_address.value_counts()
+                
+                # Collect examples for logging
+                if examples_collected < max_examples and len(name_counts) > 1:
+                    example = {
+                        'address': addr_key[:50] + '...' if len(addr_key) > 50 else addr_key,
+                        'names': name_counts.head(3).to_pandas().to_dict(),
+                        'canonical': None  # Will be set below
+                    }
+                    
+                    # Determine canonical name
+                    canonical_name = utils.get_canonical_name_gpu(names_at_address)
+                    example['canonical'] = canonical_name
+                    
+                    self._consolidation_stats['consolidation_examples'].append(example)
+                    examples_collected += 1
+                else:
+                    # Just determine canonical name without logging
+                    canonical_name = utils.get_canonical_name_gpu(names_at_address)
+                
                 address_to_canonical_map[addr_key] = canonical_name
             
-            if (i + batch_size) % 5000 == 0:
-                logger.debug(f"  - Processed {min(i + batch_size, len(addresses_list)):,}/{len(addresses_list):,} addresses")
+            # Progress logging
+            if (i + batch_size) % 5000 == 0 or (i + batch_size) >= total_addresses:
+                progress = min(i + batch_size, total_addresses)
+                logger.debug(f"  - Processed {progress:,}/{total_addresses:,} addresses ({progress/total_addresses:.1%})")
         
-        if not address_to_canonical_map:
-            logger.warning("No canonical names determined - returning original DataFrame")
-            return gdf
+        logger.info(f"Built canonical mapping for {len(address_to_canonical_map):,} addresses")
         
+        # Log examples
+        if self._consolidation_stats['consolidation_examples']:
+            logger.debug("Sample consolidation decisions:")
+            for idx, example in enumerate(self._consolidation_stats['consolidation_examples'][:5], 1):
+                logger.debug(f"  Example {idx}:")
+                logger.debug(f"    Address: {example['address']}")
+                logger.debug(f"    Names found: {example['names']}")
+                logger.debug(f"    Canonical chosen: {example['canonical']}")
+        
+        return address_to_canonical_map
+    
+    def _apply_canonical_mapping(
+        self, 
+        gdf: cudf.DataFrame, 
+        address_to_canonical_map: Dict[str, str]
+    ) -> cudf.DataFrame:
+        """
+        Apply canonical name mapping to DataFrame.
+        
+        Args:
+            gdf: Original DataFrame
+            address_to_canonical_map: Mapping from addresses to canonical names
+            
+        Returns:
+            DataFrame with consolidated names
+        """
         # Create mapping DataFrame for efficient merge
-        logger.debug("Applying canonical name mapping...")
         consolidation_map_gdf = cudf.DataFrame({
             'addr_normalized_key': list(address_to_canonical_map.keys()),
             'canonical_name': list(address_to_canonical_map.values())
         })
         
+        # Store original names for comparison
+        original_names = gdf['normalized_text'].copy()
+        
         # Merge and update normalized_text
-        original_col = gdf['normalized_text'].copy()
         gdf = gdf.merge(consolidation_map_gdf, on='addr_normalized_key', how='left')
         gdf['normalized_text'] = gdf['canonical_name'].fillna(gdf['normalized_text'])
         
-        # Calculate statistics
-        names_changed = (gdf['normalized_text'] != original_col).sum()
-        final_unique = gdf['normalized_text'].nunique()
-        
-        logger.info(
-            f"Consolidation complete: "
-            f"{names_changed:,} records updated, "
-            f"{final_unique:,} unique names remain"
-        )
+        # Count changes
+        names_changed = (gdf['normalized_text'] != original_names).sum()
+        self._consolidation_stats['names_changed'] = int(names_changed)
         
         # Clean up temporary column
-        return gdf.drop(columns=['canonical_name'])
+        gdf = gdf.drop(columns=['canonical_name'])
+        
+        return gdf
+    
+    def _log_consolidation_summary(self) -> None:
+        """Log comprehensive summary of consolidation results."""
+        stats = self._consolidation_stats
+        
+        logger.info("=" * 60)
+        logger.info("Address Consolidation Summary:")
+        logger.info("=" * 60)
+        
+        if stats.get('total_addresses', 0) > 0:
+            logger.info(f"Total unique addresses analyzed: {stats['total_addresses']:,}")
+            logger.info(f"Addresses with multiple names: {stats['addresses_with_multiple_names']:,}")
+            logger.info(f"Records affected by consolidation: {stats['records_affected']:,}")
+            logger.info(f"Names actually changed: {stats['names_changed']:,}")
+            
+            if stats.get('empty_addresses_skipped', 0) > 0:
+                logger.info(f"Records with empty addresses (skipped): {stats['empty_addresses_skipped']:,}")
+            
+            if stats.get('unique_before', 0) > 0 and stats.get('unique_after', 0) > 0:
+                reduction = stats['unique_before'] - stats['unique_after']
+                reduction_pct = (reduction / stats['unique_before']) * 100 if stats['unique_before'] > 0 else 0
+                logger.info(f"Unique names before: {stats['unique_before']:,}")
+                logger.info(f"Unique names after: {stats['unique_after']:,}")
+                logger.info(f"Reduction: {reduction:,} names ({reduction_pct:.1f}%)")
+            
+            # Calculate effectiveness
+            if stats['addresses_with_multiple_names'] > 0:
+                effectiveness = (stats['names_changed'] / stats['records_affected']) * 100 if stats['records_affected'] > 0 else 0
+                logger.info(f"Consolidation effectiveness: {effectiveness:.1f}% of affected records were consolidated")
+        else:
+            logger.info("No consolidation performed")
+        
+        logger.info("=" * 60)
+    
+    def get_consolidation_stats(self) -> Dict:
+        """
+        Get statistics from the last consolidation operation.
+        
+        Returns:
+            Dictionary containing consolidation statistics
+        """
+        return self._consolidation_stats.copy()
