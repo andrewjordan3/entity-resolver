@@ -10,7 +10,7 @@ import logging
 from typing import Dict, Any
 
 # --- Local Package Imports ---
-from .config import ValidationConfig, OutputConfig
+from .config import ValidationConfig, OutputConfig, VectorizerConfig
 from . import utils
 
 # Set up a logger for this module
@@ -27,7 +27,7 @@ class ClusterRefiner:
         cluster ID to a single canonical entity profile (name and address).
     3.  **Applies Map**: Merges the canonical information back onto the full dataset.
     """
-    def __init__(self, validation_config: ValidationConfig, output_config: OutputConfig):
+    def __init__(self, validation_config: ValidationConfig, output_config: OutputConfig, vectorizer_config: VectorizerConfig):
         """
         Initializes the ClusterRefiner.
 
@@ -37,6 +37,7 @@ class ClusterRefiner:
         """
         self.validation_config = validation_config
         self.output_config = output_config
+        self.vectorizer_config = vectorizer_config
 
     def refine_clusters(self, gdf: cudf.DataFrame) -> cudf.DataFrame:
         """
@@ -77,7 +78,7 @@ class ClusterRefiner:
         for cid in unique_clusters:
             cluster_subset = clustered_gdf[clustered_gdf['final_cluster'] == cid]
             
-            canonical_name = utils.get_canonical_name_gpu(cluster_subset['normalized_text'])
+            canonical_name = utils.get_canonical_name_gpu(cluster_subset['normalized_text'], self.vectorizer_config.similarity_tfidf)
             best_addr_row = utils.get_best_address_gpu(cluster_subset)
             avg_prob = cluster_subset['cluster_probability'].mean()
             

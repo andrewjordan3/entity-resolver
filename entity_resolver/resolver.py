@@ -177,7 +177,8 @@ class EntityResolver:
         # Refinement component for final cluster processing
         self.refiner = ClusterRefiner(
             validation_config=self.config.validation,
-            output_config=self.config.output  # For formatting rules
+            output_config=self.config.output,  # For formatting rules
+            vectorizer_config=self.config.vectorizer
         )
         self.logger.debug("ClusterRefiner initialized")
         

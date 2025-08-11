@@ -68,7 +68,7 @@ class ClusterMerger:
         profiles = []
         for cid in unique_cluster_ids:
             cluster_subset = clustered_gdf[clustered_gdf['cluster'] == cid]
-            canonical_name = utils.get_canonical_name_gpu(cluster_subset['normalized_text'])
+            canonical_name = utils.get_canonical_name_gpu(cluster_subset['normalized_text'], self.vectorizer_config.similarity_tfidf)
             best_addr_row = utils.get_best_address_gpu(cluster_subset)
             if not best_addr_row.empty:
                 profiles.append({

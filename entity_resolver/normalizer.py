@@ -287,7 +287,8 @@ class TextNormalizer:
         # Log distribution of name counts
         name_count_distribution = name_counts_per_address.value_counts().sort_index()
         logger.debug("Distribution of name counts per address:")
-        for count, freq in name_count_distribution.head(10).items():
+        distribution_pd = name_count_distribution.head(10).to_pandas()
+        for count, freq in distribution_pd.items():
             logger.debug(f"  - {count} names: {freq:,} addresses")
         
         # Identify addresses with multiple names
