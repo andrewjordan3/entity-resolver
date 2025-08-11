@@ -638,38 +638,49 @@ class EntityResolver:
     
     def _setup_logger(self) -> logging.Logger:
         """
-        Set up a properly configured logger for this resolver instance.
+        Set up logging for the entire entity_resolver package.
         
-        Creates a logger with consistent formatting and appropriate level
-        based on configuration settings.
+        This method configures the package-level logger so that all modules
+        inherit the same log level and handler configuration. This ensures
+        consistent logging throughout the pipeline.
         
         Returns:
-            Configured Logger instance
+            Logger instance for this specific module
         """
-        # Use module name plus class name for consistent logger hierarchy
-        logger_name = f"{__name__}.{self.__class__.__name__}"
-        logger = logging.getLogger(logger_name)
+        # Get the package-level logger (parent of all module loggers)
+        package_logger = logging.getLogger('entity_resolver')
         
-        # Prevent duplicate handlers if logger already exists
-        if logger.hasHandlers():
-            logger.handlers.clear()
+        # Set the log level on the package logger
+        # This will apply to all child loggers (normalizer, vectorizer, etc.)
+        package_logger.setLevel(self.config.output.log_level)
         
-        # Create console handler with custom formatter
-        console_handler = logging.StreamHandler()
-        log_format = logging.Formatter(
-            fmt='%(asctime)s - %(levelname)-8s - [%(name)s] - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        console_handler.setFormatter(log_format)
+        # Only add a handler if one doesn't already exist
+        # This prevents duplicate log messages when creating multiple EntityResolver instances
+        if not package_logger.handlers:
+            console_handler = logging.StreamHandler()
+            
+            # Set formatter for consistent log format
+            log_format = logging.Formatter(
+                fmt='%(asctime)s - %(levelname)-8s - [%(name)s] - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            console_handler.setFormatter(log_format)
+            
+            # Set handler level to match package level
+            console_handler.setLevel(self.config.output.log_level)
+            
+            # Add handler to package logger
+            package_logger.addHandler(console_handler)
+            
+            # Ensure propagation is enabled for proper hierarchy
+            package_logger.propagate = True
         
-        # Add handler and set level from configuration
-        logger.addHandler(console_handler)
-        logger.setLevel(self.config.output.log_level)
+        # If log level changed, update existing handler
+        elif package_logger.handlers:
+            package_logger.handlers[0].setLevel(self.config.output.log_level)
         
-        # Prevent propagation to avoid duplicate messages
-        logger.propagate = False
-        
-        return logger
+        # Return a module-specific logger for the resolver's own messages
+        return logging.getLogger(__name__)
     
     def _prepare_gpu_dataframe(self, df: pd.DataFrame) -> cudf.DataFrame:
         """
@@ -700,4 +711,5 @@ class EntityResolver:
                 f"Consider reducing batch size or upgrading GPU memory."
 
             ) from e
+
 
