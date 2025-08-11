@@ -509,3 +509,4 @@ class TextNormalizer:
             Dictionary containing consolidation statistics
         """
         return self._consolidation_stats.copy()
+    
