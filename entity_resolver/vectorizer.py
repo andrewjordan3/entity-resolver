@@ -613,6 +613,9 @@ class MultiStreamVectorizer:
             RuntimeError: If SVD model not found in transform mode
         """
         svd_key = f'{stream_name}_svd_reducer'
+
+        # Cast the sparse matrix to float32 right before the SVD calculation.
+        sparse_vectors = sparse_vectors.astype(cupy.float32)
         
         if is_training:
             logger.debug(f"Fitting TruncatedSVD for '{stream_name}' with params: {svd_params}")
