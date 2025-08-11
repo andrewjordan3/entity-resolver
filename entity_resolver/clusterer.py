@@ -1,0 +1,900 @@
+# entity_resolver/clusterer.py
+"""
+Entity clustering pipeline combining UMAP manifold learning and HDBSCAN density clustering.
+
+This module implements a sophisticated clustering approach that combines:
+1. UMAP ensemble for robust dimensionality reduction
+2. HDBSCAN for density-based clustering
+3. SNN graph clustering for noise rescue and high recall
+
+The ensemble approach balances precision (HDBSCAN) with recall (SNN) to achieve
+robust entity resolution even with challenging data distributions.
+"""
+
+import logging
+from typing import Any, Dict, List, Tuple, Optional
+
+import cupy as cp
+import cudf
+import numpy as np
+
+# GPU Library Imports
+from cuml.cluster import HDBSCAN
+from cuml.manifold import UMAP
+import cugraph
+
+# Local Package Imports
+from .config import ClustererConfig
+from . import utils
+
+# Set up module-level logger
+logger = logging.getLogger(__name__)
+
+
+class EntityClusterer:
+    """
+    Orchestrate entity clustering using UMAP ensemble and HDBSCAN with SNN rescue.
+
+    This class implements a multi-stage clustering pipeline:
+    
+    Training Pipeline:
+    1. UMAP ensemble → consensus embedding
+    2. HDBSCAN → core clusters + noise points
+    3. SNN graph clustering → rescue noise / mint new clusters
+    
+    Inference Pipeline:
+    1. Transform via fitted UMAP ensemble
+    2. Predict cluster membership with fitted HDBSCAN
+    
+    Attributes:
+        config (ClustererConfig): Configuration for all clustering parameters
+        cluster_model (HDBSCAN): Fitted HDBSCAN model
+        umap_ensemble (List[UMAP]): Collection of fitted UMAP models
+        random_state (int): Random seed for reproducibility
+    """
+
+    def __init__(self, config: ClustererConfig) -> None:
+        """
+        Initialize the clusterer with configuration.
+        
+        Args:
+            config: ClustererConfig containing all clustering parameters
+        """
+        self.config = config
+        self.cluster_model: Optional[HDBSCAN] = None
+        self.umap_ensemble: List[UMAP] = []
+        
+        # Extract random state for consistent seeding
+        self.random_state = self.config.umap_params.get("random_state", 42)
+        
+        logger.info("Initialized EntityClusterer")
+        logger.debug(f"UMAP ensemble size: {config.umap_n_runs}")
+        logger.debug(f"HDBSCAN min_cluster_size: {config.hdbscan_params.get('min_cluster_size')}")
+        logger.debug(f"SNN k_neighbors: {config.snn_clustering_params.get('k_neighbors')}")
+
+    # ========================================================================
+    # PUBLIC API
+    # ========================================================================
+    
+    def fit_transform(
+        self, 
+        gdf: cudf.DataFrame, 
+        vectors: cp.ndarray
+    ) -> Tuple[cudf.DataFrame, cp.ndarray]:
+        """
+        Fit clustering models and transform data.
+        
+        Args:
+            gdf: Input DataFrame to add cluster labels to
+            vectors: High-dimensional feature vectors to cluster
+            
+        Returns:
+            Tuple of (DataFrame with cluster labels, reduced vectors)
+            
+        Raises:
+            ValueError: If inputs are invalid
+            RuntimeError: If clustering fails
+        """
+        logger.info(f"Starting fit_transform with {len(gdf):,} records")
+        self._validate_inputs(gdf, vectors)
+        return self._process_clustering(gdf, vectors, is_training=True)
+
+    def transform(
+        self, 
+        gdf: cudf.DataFrame, 
+        vectors: cp.ndarray
+    ) -> Tuple[cudf.DataFrame, cp.ndarray]:
+        """
+        Transform new data using fitted models.
+        
+        Args:
+            gdf: Input DataFrame to add cluster predictions to
+            vectors: Feature vectors to assign to clusters
+            
+        Returns:
+            Tuple of (DataFrame with cluster predictions, reduced vectors)
+            
+        Raises:
+            RuntimeError: If models haven't been fitted
+            ValueError: If inputs are invalid
+        """
+        logger.info(f"Starting transform with {len(gdf):,} records")
+        self._validate_inputs(gdf, vectors)
+        return self._process_clustering(gdf, vectors, is_training=False)
+
+    # ========================================================================
+    # CORE ORCHESTRATION
+    # ========================================================================
+    
+    def _process_clustering(
+        self,
+        gdf: cudf.DataFrame,
+        vectors: cp.ndarray,
+        is_training: bool,
+    ) -> Tuple[cudf.DataFrame, cp.ndarray]:
+        """
+        Execute clustering pipeline for training or inference.
+        
+        Args:
+            gdf: Input DataFrame
+            vectors: Feature vectors
+            is_training: Whether to fit new models or use existing
+            
+        Returns:
+            Tuple of (clustered DataFrame, reduced vectors)
+        """
+        operation_mode = "Training" if is_training else "Inference"
+        logger.info(f"Processing clustering in {operation_mode} mode")
+        
+        # Ensure proper dtype and memory layout for GPU operations
+        vectors = self._prepare_vectors(vectors)
+        
+        # Step 1: Dimensionality reduction via UMAP ensemble
+        logger.info("Step 1: Dimensionality reduction with UMAP ensemble")
+        reduced_vectors = self._run_umap_ensemble(vectors, is_training)
+        
+        if is_training:
+            # Training path: Full clustering pipeline
+            logger.info("Step 2: Core clustering with HDBSCAN")
+            gdf_clustered = self._run_hdbscan(gdf.copy(), reduced_vectors)
+            
+            logger.info("Step 3: SNN graph clustering for noise rescue")
+            snn_labels = self._run_snn_engine(reduced_vectors)
+            
+            logger.info("Step 4: Ensemble HDBSCAN and SNN results")
+            gdf_final = self._ensemble_cluster_labels(gdf_clustered, snn_labels)
+            
+            # Log final clustering statistics
+            self._log_clustering_stats(gdf_final)
+            
+        else:
+            # Inference path: Predict using fitted models
+            logger.info("Step 2: Predicting cluster assignments")
+            gdf_final = self._predict_clusters(gdf.copy(), reduced_vectors)
+        
+        return gdf_final, reduced_vectors
+    
+    def _prepare_vectors(self, vectors: cp.ndarray) -> cp.ndarray:
+        """
+        Prepare vectors for GPU operations (float32, C-contiguous).
+        
+        Args:
+            vectors: Input vectors
+            
+        Returns:
+            Properly formatted vectors
+        """
+        # Convert to float32 if needed
+        if vectors.dtype != cp.float32:
+            logger.debug(f"Converting vectors from {vectors.dtype} to float32")
+            vectors = vectors.astype(cp.float32, copy=False)
+        
+        # Ensure C-contiguous memory layout for GPU efficiency
+        if not vectors.flags.c_contiguous:
+            logger.debug("Making vectors C-contiguous for GPU operations")
+            vectors = cp.ascontiguousarray(vectors)
+        
+        logger.debug(f"Prepared vectors: shape={vectors.shape}, dtype={vectors.dtype}")
+        return vectors
+    
+    def _predict_clusters(
+        self, 
+        gdf: cudf.DataFrame, 
+        reduced_vectors: cp.ndarray
+    ) -> cudf.DataFrame:
+        """
+        Predict cluster assignments for new data.
+        
+        Args:
+            gdf: DataFrame to add predictions to
+            reduced_vectors: Reduced feature vectors
+            
+        Returns:
+            DataFrame with cluster predictions
+            
+        Raises:
+            RuntimeError: If models aren't fitted
+            NotImplementedError: If HDBSCAN doesn't support predict
+        """
+        if not self.cluster_model:
+            raise RuntimeError(
+                "HDBSCAN model not fitted. Call fit_transform first."
+            )
+        
+        # Check if predict is available
+        if not hasattr(self.cluster_model, "predict"):
+            raise NotImplementedError(
+                "This HDBSCAN build doesn't support predict(). "
+                "Consider using approximate predict or nearest-centroid assignment."
+            )
+        
+        # Predict cluster assignments
+        gdf["cluster"] = self.cluster_model.predict(reduced_vectors)
+        
+        # Assign default confidence for predictions
+        default_conf = float(self.config.ensemble_params.get("default_rescue_conf", 0.75))
+        gdf["cluster_probability"] = cp.where(
+            gdf["cluster"] != -1, 
+            default_conf, 
+            0.0
+        )
+        
+        # Log prediction statistics
+        n_assigned = int((gdf["cluster"] != -1).sum())
+        logger.info(f"Predicted {n_assigned:,}/{len(gdf):,} records to clusters")
+        
+        return gdf
+
+    # ========================================================================
+    # CLUSTERING COMPONENTS
+    # ========================================================================
+    
+    def _run_hdbscan(
+        self, 
+        gdf: cudf.DataFrame, 
+        reduced_vectors: cp.ndarray
+    ) -> cudf.DataFrame:
+        """
+        Run HDBSCAN density-based clustering.
+        
+        Args:
+            gdf: DataFrame to add cluster labels to
+            reduced_vectors: Low-dimensional embeddings
+            
+        Returns:
+            DataFrame with HDBSCAN cluster labels and probabilities
+        """
+        logger.info("Running HDBSCAN for core clustering")
+        logger.debug(f"HDBSCAN parameters: {self.config.hdbscan_params}")
+        
+        # Fit HDBSCAN
+        clusterer = HDBSCAN(**self.config.hdbscan_params)
+        clusterer.fit(reduced_vectors)
+        
+        # Store fitted model for later use
+        self.cluster_model = clusterer
+        
+        # Add cluster assignments to DataFrame
+        gdf["cluster"] = clusterer.labels_
+        gdf["cluster_probability"] = clusterer.probabilities_
+        
+        # Calculate and log statistics
+        n_clusters = int(gdf["cluster"][gdf["cluster"] != -1].nunique())
+        n_noise = int((gdf["cluster"] == -1).sum())
+        noise_rate = n_noise / max(len(gdf), 1)
+        
+        logger.info(
+            f"HDBSCAN results: {n_clusters} clusters, "
+            f"{n_noise:,} noise points ({noise_rate:.1%})"
+        )
+        
+        # Log cluster size distribution
+        if n_clusters > 0:
+            cluster_sizes = gdf[gdf["cluster"] != -1]["cluster"].value_counts()
+            logger.debug(
+                f"Cluster sizes: min={cluster_sizes.min()}, "
+                f"max={cluster_sizes.max()}, "
+                f"mean={cluster_sizes.mean():.1f}"
+            )
+        
+        # Warn if noise rate is too high
+        max_noise_warn = float(self.config.max_noise_rate_warn)
+        if noise_rate > max_noise_warn:
+            logger.warning(
+                f"High noise rate ({noise_rate:.1%} > {max_noise_warn:.1%}). "
+                f"Consider adjusting min_cluster_size or UMAP parameters."
+            )
+        
+        return gdf
+
+    def _run_snn_engine(self, reduced_vectors: cp.ndarray) -> cp.ndarray:
+        """
+        Run SNN graph clustering for noise rescue.
+        
+        This three-stage process:
+        1. Build mutual rank graph and detect communities
+        2. Attach noise points to nearby communities
+        3. Merge over-split clusters
+        
+        Args:
+            reduced_vectors: Low-dimensional embeddings
+            
+        Returns:
+            Array of SNN cluster labels (-1 for noise)
+        """
+        logger.info("Starting SNN Graph Clustering Engine")
+        
+        # Normalize vectors for cosine similarity
+        logger.debug("Normalizing vectors for cosine similarity")
+        row_norms = cp.linalg.norm(reduced_vectors, axis=1, keepdims=True)
+        vectors_norm = reduced_vectors / (row_norms + 1e-8)
+        
+        # Stage 1: Community detection
+        logger.info("SNN Stage 1: Building graph and finding communities")
+        k_neighbors = self.config.snn_clustering_params["k_neighbors"]
+        logger.debug(f"Building mutual rank graph with k={k_neighbors}")
+        
+        snn_graph = utils.build_mutual_rank_graph(vectors_norm, k=k_neighbors)
+        
+        if snn_graph.number_of_edges() == 0:
+            logger.warning("SNN graph has no edges. All points treated as noise.")
+            return cp.full(reduced_vectors.shape[0], -1, dtype=cp.int32)
+        
+        logger.debug(
+            f"Graph statistics: {snn_graph.number_of_vertices()} vertices, "
+            f"{snn_graph.number_of_edges()} edges"
+        )
+        
+        # Run Louvain community detection
+        resolution = self.config.snn_clustering_params["louvain_resolution"]
+        logger.debug(f"Running Louvain with resolution={resolution}")
+        
+        partitions_df, modularity = cugraph.louvain(snn_graph, resolution=resolution)
+        
+        # Convert to label array
+        initial_labels = cp.full(reduced_vectors.shape[0], -1, dtype=cp.int32)
+        initial_labels[partitions_df["vertex"].values] = partitions_df["partition"].values
+        
+        n_communities = int(initial_labels[initial_labels != -1].max() + 1)
+        logger.info(f"Found {n_communities} initial communities (modularity={modularity:.3f})")
+        
+        # Stage 2: Attach noise points
+        logger.info("SNN Stage 2: Attaching noise points to communities")
+        initial_noise = int((initial_labels == -1).sum())
+        
+        labels_after_attachment = utils.attach_noise_points(
+            vectors_norm, 
+            initial_labels, 
+            **self.config.noise_attachment_params
+        )
+        
+        attached_noise = initial_noise - int((labels_after_attachment == -1).sum())
+        logger.debug(f"Attached {attached_noise:,}/{initial_noise:,} noise points")
+        
+        # Stage 3: Merge over-split clusters
+        logger.info("SNN Stage 3: Merging over-split clusters")
+        
+        # Build merge parameters from config
+        merge_params = {
+            'merge_median_threshold': self.config.merge_median_threshold,
+            'merge_max_threshold': self.config.merge_max_threshold,
+            'merge_sample_size': self.config.merge_sample_size,
+            'centroid_similarity_threshold': self.config.centroid_similarity_threshold,
+            'merge_batch_size': self.config.merge_batch_size,
+            'centroid_sample_size': self.config.centroid_sample_size,
+        }
+        
+        final_labels = utils.merge_snn_clusters(
+            vectors_norm, 
+            labels_after_attachment, 
+            merge_params
+        )
+        
+        # Log final SNN statistics
+        n_final_clusters = int(final_labels[final_labels != -1].max() + 1) if (final_labels != -1).any() else 0
+        final_noise = int((final_labels == -1).sum())
+        
+        logger.info(
+            f"SNN complete: {n_final_clusters} clusters, "
+            f"{final_noise:,} noise points ({final_noise/len(final_labels):.1%})"
+        )
+        
+        return final_labels
+
+    def _run_umap_ensemble(
+        self, 
+        vectors: cp.ndarray, 
+        is_training: bool
+    ) -> cp.ndarray:
+        """
+        Perform manifold learning using UMAP ensemble.
+        
+        Args:
+            vectors: High-dimensional feature vectors
+            is_training: Whether to fit new models
+            
+        Returns:
+            Low-dimensional consensus embedding
+            
+        Raises:
+            RuntimeError: If ensemble fails or no models available
+        """
+        logger.info(f"Running UMAP ensemble on shape {vectors.shape}")
+        
+        # Normalize rows for stable neighborhoods
+        vectors_normalized = utils.normalize_rows(vectors)
+        
+        n_runs = int(self.config.umap_n_runs)
+        umap_embeddings: List[cp.ndarray] = []
+        
+        if is_training:
+            # Training: Fit ensemble of UMAP models
+            trained_umaps: List[UMAP] = []
+            rng = np.random.default_rng(self.random_state)
+            
+            for run_idx in range(n_runs):
+                # Generate diverse parameters for this run
+                umap_params = self._generate_run_parameters(run_index=run_idx, rng=rng)
+                
+                logger.debug(f"UMAP run {run_idx + 1}/{n_runs}")
+                
+                try:
+                    reducer = UMAP(**umap_params)
+                    embedding = reducer.fit_transform(vectors_normalized)
+                    
+                    # Validate embedding
+                    if cp.isnan(embedding).any():
+                        logger.warning(f"UMAP run {run_idx + 1} produced NaN values, skipping")
+                        continue
+                    
+                    umap_embeddings.append(embedding)
+                    trained_umaps.append(reducer)
+                    
+                except Exception as e:
+                    logger.error(f"UMAP run {run_idx + 1}/{n_runs} failed: {e}")
+                    continue
+            
+            if not trained_umaps:
+                raise RuntimeError("All UMAP ensemble runs failed")
+            
+            self.umap_ensemble = trained_umaps
+            logger.info(f"Successfully fitted {len(trained_umaps)}/{n_runs} UMAP models")
+            
+        else:
+            # Inference: Transform with existing models
+            if not self.umap_ensemble:
+                raise RuntimeError("No pre-trained UMAP models found")
+            
+            logger.info(f"Transforming with {len(self.umap_ensemble)} UMAP models")
+            
+            for idx, reducer in enumerate(self.umap_ensemble):
+                try:
+                    embedding = reducer.transform(vectors_normalized)
+                    
+                    if cp.isnan(embedding).any():
+                        logger.warning(f"UMAP model {idx + 1} produced NaN values, skipping")
+                        continue
+                    
+                    umap_embeddings.append(embedding)
+                    
+                except Exception as e:
+                    logger.error(f"UMAP transform {idx + 1} failed: {e}")
+                    continue
+        
+        if not umap_embeddings:
+            raise RuntimeError("UMAP ensemble produced no valid embeddings")
+        
+        # Combine embeddings into consensus
+        logger.info(f"Creating consensus from {len(umap_embeddings)} embeddings")
+        
+        final_vectors = utils.create_consensus_embedding(
+            embeddings_list=umap_embeddings,
+            n_samples=self.config.cosine_consensus_n_samples,
+            batch_size=self.config.cosine_consensus_batch_size,
+            random_state=self.random_state
+        )
+        
+        logger.info(f"UMAP ensemble complete: shape {final_vectors.shape}")
+        return final_vectors
+
+    # ========================================================================
+    # ENSEMBLE COMBINATION
+    # ========================================================================
+    
+    def _ensemble_cluster_labels(
+        self, 
+        gdf_hdbscan: cudf.DataFrame, 
+        snn_labels: cp.ndarray
+    ) -> cudf.DataFrame:
+        """
+        Combine HDBSCAN and SNN results via purity-based mapping.
+        
+        This method:
+        1. Maps SNN clusters to HDBSCAN clusters based on overlap purity
+        2. Rescues HDBSCAN noise points using mapped SNN clusters
+        3. Optionally creates new clusters from large unmapped SNN groups
+        
+        Args:
+            gdf_hdbscan: DataFrame with HDBSCAN labels
+            snn_labels: Array of SNN cluster labels
+            
+        Returns:
+            DataFrame with ensembled cluster labels
+        """
+        params = self.config.ensemble_params
+        logger.info("Ensembling HDBSCAN (precision) with SNN (recall)")
+        
+        hdb_labels = gdf_hdbscan["cluster"].values
+        hdb_probs = gdf_hdbscan["cluster_probability"].values
+        
+        # Find mapping between SNN and HDBSCAN clusters
+        snn_to_hdb_map = self._find_snn_to_hdbscan_mapping(hdb_labels, snn_labels, params)
+        
+        # Initialize final labels with HDBSCAN results
+        final_labels = hdb_labels.copy()
+        final_probs = hdb_probs.copy()
+        noise_mask = final_labels == -1
+        
+        # Apply mapping to rescue noise points
+        rescued_count = self._rescue_noise_points(
+            final_labels, 
+            final_probs, 
+            noise_mask,
+            snn_labels, 
+            snn_to_hdb_map, 
+            params
+        )
+        
+        # Optionally mint new clusters
+        if params.get("allow_new_snn_clusters", True):
+            new_clusters = self._mint_new_clusters(
+                final_labels, 
+                final_probs,
+                noise_mask, 
+                snn_labels, 
+                snn_to_hdb_map, 
+                params
+            )
+        else:
+            new_clusters = 0
+        
+        # Update DataFrame
+        gdf_hdbscan["cluster"] = final_labels
+        gdf_hdbscan["cluster_probability"] = final_probs
+        
+        logger.info(
+            f"Ensemble complete: rescued {rescued_count:,} noise points, "
+            f"created {new_clusters} new clusters"
+        )
+        
+        return gdf_hdbscan
+    
+    def _find_snn_to_hdbscan_mapping(
+        self, 
+        hdb_labels: cp.ndarray, 
+        snn_labels: cp.ndarray,
+        params: Dict[str, Any]
+    ) -> cudf.DataFrame:
+        """
+        Find best mapping from SNN clusters to HDBSCAN clusters.
+        
+        Args:
+            hdb_labels: HDBSCAN cluster labels
+            snn_labels: SNN cluster labels
+            params: Ensemble parameters
+            
+        Returns:
+            DataFrame with 'snn' and 'hdb' columns for valid mappings
+        """
+        logger.debug("Finding SNN to HDBSCAN cluster mappings")
+        
+        # Create overlap DataFrame
+        overlap_df = cudf.DataFrame({"hdb": hdb_labels, "snn": snn_labels})
+        clustered_both = overlap_df[(overlap_df["hdb"] != -1) & (overlap_df["snn"] != -1)]
+        
+        if clustered_both.empty:
+            logger.warning("No overlap between HDBSCAN and SNN clusters")
+            return cudf.DataFrame({"snn": [], "hdb": []})
+        
+        # Calculate overlap statistics
+        overlap_counts = clustered_both.groupby(["snn", "hdb"]).size().reset_index(name="overlap")
+        snn_total_sizes = overlap_counts.groupby("snn")["overlap"].sum().reset_index(name="snn_total")
+        overlap_counts = overlap_counts.merge(snn_total_sizes, on="snn")
+        overlap_counts["purity"] = overlap_counts["overlap"] / overlap_counts["snn_total"]
+        
+        # Find best match for each SNN cluster
+        best_matches = (
+            overlap_counts
+            .sort_values(["snn", "overlap"], ascending=[True, False])
+            .drop_duplicates(subset=["snn"])
+        )
+        
+        # Filter by purity and overlap thresholds
+        valid_mappings = best_matches[
+            (best_matches["purity"] >= params["purity_min"]) &
+            (best_matches["overlap"] >= params["min_overlap"])
+        ][["snn", "hdb"]]
+        
+        logger.debug(f"Found {len(valid_mappings)} valid SNN->HDBSCAN mappings")
+        return valid_mappings
+    
+    def _rescue_noise_points(
+        self,
+        final_labels: cp.ndarray,
+        final_probs: cp.ndarray,
+        noise_mask: cp.ndarray,
+        snn_labels: cp.ndarray,
+        snn_to_hdb_map: cudf.DataFrame,
+        params: Dict[str, Any]
+    ) -> int:
+        """
+        Rescue HDBSCAN noise points using SNN clusters.
+        
+        Returns:
+            Number of rescued points
+        """
+        # Map SNN labels to HDBSCAN clusters
+        snn_labels_df = cudf.DataFrame({"snn": snn_labels})
+        snn_labels_df = snn_labels_df.merge(snn_to_hdb_map, on="snn", how="left")
+        mapped_hdb_labels = snn_labels_df["hdb"].fillna(-1).astype("int32").values
+        
+        # Rescue noise points that SNN assigns to mapped clusters
+        rescue_mask = noise_mask & (mapped_hdb_labels != -1)
+        final_labels[rescue_mask] = mapped_hdb_labels[rescue_mask]
+        
+        # Set confidence for rescued points
+        default_conf = float(params.get("default_rescue_conf", 0.75))
+        final_probs[rescue_mask] = default_conf
+        
+        return int(rescue_mask.sum())
+    
+    def _mint_new_clusters(
+        self,
+        final_labels: cp.ndarray,
+        final_probs: cp.ndarray,
+        noise_mask: cp.ndarray,
+        snn_labels: cp.ndarray,
+        snn_to_hdb_map: cudf.DataFrame,
+        params: Dict[str, Any]
+    ) -> int:
+        """
+        Create new clusters from large unmapped SNN groups.
+        
+        Returns:
+            Number of new clusters created
+        """
+        # Find SNN clusters that aren't mapped to HDBSCAN
+        snn_sizes = cudf.Series(snn_labels).value_counts().reset_index()
+        snn_sizes.columns = ["snn", "size"]
+        
+        unmapped_snn = snn_sizes.merge(snn_to_hdb_map, on="snn", how="left")
+        new_cluster_candidates = unmapped_snn[
+            (unmapped_snn["snn"] != -1) & 
+            unmapped_snn["hdb"].isnull() &
+            (unmapped_snn["size"] >= params["min_newcluster_size"])
+        ]
+        
+        if new_cluster_candidates.empty:
+            return 0
+        
+        # Assign new cluster IDs
+        next_id = int(final_labels.max()) + 1 if int(final_labels.max()) >= 0 else 0
+        candidate_ids = new_cluster_candidates["snn"].values
+        
+        new_id_map = cudf.DataFrame({
+            "snn": candidate_ids,
+            "new_id": cp.arange(next_id, next_id + len(candidate_ids), dtype=cp.int32),
+        })
+        
+        # Apply new cluster assignments
+        snn_labels_df = cudf.DataFrame({"snn": snn_labels})
+        snn_labels_df = snn_labels_df.merge(new_id_map, on="snn", how="left")
+        new_ids = snn_labels_df["new_id"].fillna(-1).astype("int32").values
+        
+        assign_new_mask = noise_mask & (new_ids != -1)
+        final_labels[assign_new_mask] = new_ids[assign_new_mask]
+        
+        # Set confidence for new clusters
+        default_conf = float(params.get("default_rescue_conf", 0.75))
+        final_probs[assign_new_mask] = default_conf
+        
+        return len(candidate_ids)
+
+    # ========================================================================
+    # PARAMETER GENERATION
+    # ========================================================================
+    
+    def _sample_min_dist_and_spread(self, rng: np.random.Generator) -> Tuple[float, float]:
+        """
+        Sample correlated (min_dist, spread) pair for UMAP.
+        
+        For entity resolution, we prefer tighter local structure, so we bias
+        toward smaller min_dist values.
+        
+        Args:
+            rng: Random number generator
+            
+        Returns:
+            Tuple of (min_dist, spread) values
+        """
+        sampling_config = self.config.umap_ensemble_sampling_config
+        min_dist_low, min_dist_high = sampling_config['min_dist']
+        spread_low, spread_high = sampling_config['spread']
+
+        # Use log-uniform sampling for min_dist for better hyperparameter search.
+        # Add a small epsilon to the lower bound if it's zero to avoid log(0).
+        log_min_dist_low = np.log10(min_dist_low + 1e-9)
+        log_min_dist_high = np.log10(min_dist_high)
+        
+        log_min_dist = rng.uniform(log_min_dist_low, log_min_dist_high)
+        min_dist = 10.0 ** log_min_dist
+
+        # To ensure spread > min_dist, the valid lower bound for spread must
+        # be at least min_dist. We take the maximum of the configured lower
+        # bound and the sampled min_dist.
+        valid_spread_low = max(spread_low, min_dist + 1e-5)
+
+        # If the calculated lower bound for spread is already higher than
+        # the configured upper bound, we simply use the upper bound.
+        if valid_spread_low >= spread_high:
+            spread = spread_high
+        else:
+            # Sample spread from its valid, constrained range
+            spread = rng.uniform(valid_spread_low, spread_high)
+            
+        return float(min_dist), float(spread)
+
+    def _generate_run_parameters(
+        self, 
+        run_index: int, 
+        rng: np.random.Generator
+    ) -> Dict[str, Any]:
+        """
+        Generate UMAP parameters for ensemble run.
+        
+        Run 0 uses stable base parameters; subsequent runs use randomized
+        parameters to diversify the ensemble.
+        
+        Args:
+            run_index: Index of current ensemble run
+            rng: Random number generator
+            
+        Returns:
+            Dictionary of UMAP parameters
+        """
+        umap_params = self.config.umap_params.copy()
+        sampling = self.config.umap_ensemble_sampling_config
+        
+        if run_index == 0:
+            logger.debug("UMAP run 1: Using base parameters as stable anchor")
+        else:
+            # Sample n_neighbors (bimodal for local/global views)
+            if rng.random() < sampling["local_view_ratio"]:
+                n_low, n_high = sampling["n_neighbors_local"]
+            else:
+                n_low, n_high = sampling["n_neighbors_global"]
+            
+            umap_params["n_neighbors"] = int(
+                rng.integers(low=n_low, high=n_high, endpoint=True)
+            )
+            
+            # Sample correlated min_dist/spread
+            min_dist, spread = self._sample_min_dist_and_spread(rng)
+            umap_params["min_dist"] = float(min_dist)
+            umap_params["spread"] = float(spread)
+            
+            # Sample other parameters
+            umap_params.update({
+                "n_epochs": int(rng.integers(
+                    low=sampling["n_epochs"][0],
+                    high=sampling["n_epochs"][1],
+                    endpoint=True
+                )),
+                "learning_rate": float(rng.uniform(
+                    low=sampling["learning_rate"][0],
+                    high=sampling["learning_rate"][1]
+                )),
+                "repulsion_strength": float(rng.uniform(
+                    low=sampling["repulsion_strength"][0],
+                    high=sampling["repulsion_strength"][1]
+                )),
+                "negative_sample_rate": int(rng.integers(
+                    low=sampling["negative_sample_rate"][0],
+                    high=sampling["negative_sample_rate"][1],
+                    endpoint=True
+                )),
+                "init": rng.choice(sampling["init_strategies"]).item(),
+            })
+        
+        # Ensure unique but deterministic seed per run
+        umap_params["random_state"] = int(self.random_state + run_index * 104729)
+        
+        return umap_params
+
+    # ========================================================================
+    # UTILITY METHODS
+    # ========================================================================
+    
+    def _validate_inputs(self, gdf: cudf.DataFrame, vectors: cp.ndarray) -> None:
+        """
+        Validate input DataFrame and vectors.
+        
+        Args:
+            gdf: Input DataFrame
+            vectors: Feature vectors
+            
+        Raises:
+            ValueError: If inputs are invalid
+        """
+        if len(gdf) != vectors.shape[0]:
+            raise ValueError(
+                f"DataFrame length ({len(gdf)}) doesn't match "
+                f"vector rows ({vectors.shape[0]})"
+            )
+        
+        if vectors.shape[1] == 0:
+            raise ValueError("Feature vectors have zero dimensions")
+        
+        if cp.isnan(vectors).any():
+            raise ValueError("Feature vectors contain NaN values")
+    
+    def _log_clustering_stats(self, gdf: cudf.DataFrame) -> None:
+        """
+        Log comprehensive clustering statistics.
+        
+        Args:
+            gdf: Clustered DataFrame
+        """
+        cluster_col = gdf["cluster"]
+        n_clusters = int(cluster_col[cluster_col != -1].nunique())
+        n_noise = int((cluster_col == -1).sum())
+        
+        logger.info(f"{'='*60}")
+        logger.info(f"Final clustering statistics:")
+        logger.info(f"  Total records: {len(gdf):,}")
+        logger.info(f"  Number of clusters: {n_clusters}")
+        logger.info(f"  Noise points: {n_noise:,} ({n_noise/len(gdf):.1%})")
+        
+        if n_clusters > 0:
+            cluster_sizes = cluster_col[cluster_col != -1].value_counts()
+            logger.info(f"  Cluster size range: {cluster_sizes.min()}-{cluster_sizes.max()}")
+            logger.info(f"  Mean cluster size: {cluster_sizes.mean():.1f}")
+            logger.info(f"  Median cluster size: {cluster_sizes.median():.0f}")
+        
+        # Confidence statistics
+        probs = gdf["cluster_probability"]
+        logger.info(f"  Mean confidence: {probs.mean():.3f}")
+        logger.info(f"  High confidence (>0.9): {(probs > 0.9).sum():,} records")
+        logger.info(f"  Low confidence (<0.5): {(probs < 0.5).sum():,} records")
+        logger.info(f"{'='*60}")
+    
+    def get_models(self) -> Dict[str, Any]:
+        """
+        Get trained models for persistence.
+        
+        Returns:
+            Dictionary containing cluster_model and UMAP ensemble
+        """
+        return {
+            "cluster_model": self.cluster_model,
+            "umap_reducer_ensemble": self.umap_ensemble
+        }
+    
+    def set_models(
+        self, 
+        cluster_model: HDBSCAN, 
+        umap_reducer_ensemble: List[UMAP]
+    ) -> None:
+        """
+        Load pre-trained models.
+        
+        Args:
+            cluster_model: Fitted HDBSCAN model
+            umap_reducer_ensemble: List of fitted UMAP models
+        """
+        self.cluster_model = cluster_model
+        self.umap_ensemble = umap_reducer_ensemble
+        logger.info(
+            f"Loaded pre-trained models: "
+            f"HDBSCAN and {len(umap_reducer_ensemble)} UMAP models"
+        )

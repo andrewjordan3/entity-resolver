@@ -1,0 +1,8 @@
+# Core CPU Libraries
+pandas
+numpy
+phonetics
+sentence-transformers
+postal
+pydantic
+pyyaml
