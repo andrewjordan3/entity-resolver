@@ -186,7 +186,7 @@ class EntityResolver:
             scoring_config=self.config.scoring,
             output_config=self.config.output,
             vectorizer_config=self.config.vectorizer,
-            columns_config=self.config.columns
+            column_config=self.config.columns
         )
         self.logger.debug("ConfidenceScorer initialized")
         
@@ -700,3 +700,4 @@ class EntityResolver:
                 f"Consider reducing batch size or upgrading GPU memory."
 
             ) from e
+
