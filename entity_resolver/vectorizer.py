@@ -623,7 +623,7 @@ class MultiStreamVectorizer:
             # Log explained variance information
             if hasattr(svd_model, 'explained_variance_ratio_'):
                 cumsum_variance = cupy.cumsum(svd_model.explained_variance_ratio_)
-                variance_90 = int(cupy.searchsorted(cumsum_variance, 0.9)) + 1
+                variance_90 = int(cupy.searchsorted(cumsum_variance, cupy.array([0.9]))) + 1
                 logger.debug(
                     f"SVD explained variance: "
                     f"{float(cumsum_variance[-1]):.4f} total, "
@@ -741,4 +741,5 @@ class MultiStreamVectorizer:
             f"{len(reduction_models)} reduction models"
         )
         logger.debug(f"Encoder models: {list(trained_encoders.keys())}")
+
         logger.debug(f"Reduction models: {list(reduction_models.keys())}")
