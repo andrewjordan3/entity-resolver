@@ -91,7 +91,7 @@ class GPUTruncatedSVD:
             
         # Ensure float64 for high-precision SVD and variance calculations
         if sparse_matrix.dtype != cupy.float64:
-            sparse_matrix = sparse_matrix.astype(cupy.float64, copy=False)
+            sparse_matrix = sparse_matrix.astype(cupy.float64)
         
         logger.debug(f"Prepared matrix: shape={sparse_matrix.shape}, dtype={sparse_matrix.dtype}")
         return sparse_matrix
