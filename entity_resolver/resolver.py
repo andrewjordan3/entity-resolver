@@ -440,7 +440,7 @@ class EntityResolver:
         
         # Step 4: Cluster similar entities
         self.logger.info("Step 4/7: Clustering similar entities...")
-        gdf, cluster_labels = self.clusterer.fit_transform(gdf, vectors)
+        gdf, _ = self.clusterer.fit_transform(gdf, vectors)
         unique_clusters = gdf['cluster'].nunique()
         self.logger.debug(f"Initial clustering produced {unique_clusters:,} clusters")
         
@@ -676,9 +676,6 @@ class EntityResolver:
             
             # Add handler to package logger
             package_logger.addHandler(console_handler)
-            
-            # Ensure propagation is enabled for proper hierarchy
-            package_logger.propagate = True
         
         # If log level changed, update existing handler
         elif package_logger.handlers:

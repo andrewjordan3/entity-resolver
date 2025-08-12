@@ -368,8 +368,15 @@ class MultiStreamVectorizer:
         if is_training:
             # Configure and fit new TF-IDF vectorizer
             tfidf_params = self.config.tfidf_params.copy()
-            # Convert string dtype to actual cupy type
-            tfidf_params['dtype'] = cupy.float64
+            
+            # Safely get the dtype string, defaulting to 'float64' if not provided.
+            dtype_str = tfidf_params.get('dtype', 'float64')
+            
+            # Convert the string into the actual cupy type
+            if dtype_str == 'float64':
+                tfidf_params['dtype'] = cupy.float64
+            elif dtype_str == 'float32':
+                tfidf_params['dtype'] = cupy.float32
             
             logger.debug(f"Fitting TF-IDF with params: {tfidf_params}")
             model = TfidfVectorizer(**tfidf_params)
@@ -479,45 +486,46 @@ class MultiStreamVectorizer:
     
     def _combine_streams(self, vector_streams: Dict[str, cupy.ndarray]) -> cupy.ndarray:
         """
-        Balance energy of vector streams and concatenate them.
+        Normalizes, balances, and combines multiple vector streams.
 
-        This method ensures each stream contributes appropriately to the final
-        representation by normalizing their energy levels according to configured
-        proportions before concatenation.
+        This method first L2 normalizes each stream, then scales them by their
+        configured proportions before casting to float32 and concatenating.
+        A final L2 normalization is applied for UMAP compatibility.
 
         Args:
             vector_streams: Dictionary mapping stream names to vector arrays
 
         Returns:
-            Combined and balanced vector array
+            A single, combined, and normalized vector array.
         """
-        logger.info(f"Balancing and combining {len(vector_streams)} feature streams...")
+        logger.info(f"Normalizing, balancing, and combining {len(vector_streams)} feature streams...")
         
-        # Log stream statistics before balancing
-        for stream_name, vectors in vector_streams.items():
-            mean_norm = float(cupy.linalg.norm(vectors, axis=1).mean())
-            logger.debug(
-                f"Stream '{stream_name}': shape={vectors.shape}, "
-                f"mean_norm={mean_norm:.4f}"
-            )
+        # First, L2 normalize each stream
+        normalized_streams = {
+            name: utils.normalize_rows(vectors) for name, vectors in vector_streams.items()
+        }
         
-        # Balance streams according to configured proportions
+        # Second, balance the normalized streams by their proportions
         balanced_vectors_list = utils.balance_feature_streams(
-            vector_streams=vector_streams,
-            proportions=self.config.stream_proportions,
-            eps=self.config.epsilon
+            vector_streams=normalized_streams,
+            proportions=self.config.stream_proportions
         )
         
-        # Concatenate balanced streams
-        logger.info("Concatenating balanced feature streams...")
-        combined_vectors = cupy.concatenate(balanced_vectors_list, axis=1)
+        # Cast all balanced streams to float32 before concatenation
+        final_streams = [vec.astype(cupy.float32, copy=False) for vec in balanced_vectors_list]
         
+        # Concatenate the final streams
+        combined_vectors = cupy.concatenate(final_streams, axis=1)
+        
+        # Final L2 normalization for UMAP cosine distance
+        final_normalized_vectors = utils.normalize_rows(combined_vectors)
+
         logger.debug(
-            f"Combined vectors: shape={combined_vectors.shape}, "
-            f"mean_norm={float(cupy.linalg.norm(combined_vectors, axis=1).mean()):.4f}"
+            f"Combined vectors: shape={final_normalized_vectors.shape}, "
+            f"mean_norm={float(cupy.linalg.norm(final_normalized_vectors, axis=1).mean()):.4f}"
         )
         
-        return combined_vectors
+        return final_normalized_vectors
     
     def _reduce_feature_stream(
         self,
@@ -613,9 +621,6 @@ class MultiStreamVectorizer:
             RuntimeError: If SVD model not found in transform mode
         """
         svd_key = f'{stream_name}_svd_reducer'
-
-        # Cast the sparse matrix to float32 right before the SVD calculation.
-        sparse_vectors = sparse_vectors.astype(cupy.float32)
         
         if is_training:
             logger.debug(f"Fitting TruncatedSVD for '{stream_name}' with params: {svd_params}")
@@ -646,8 +651,9 @@ class MultiStreamVectorizer:
         logger.debug(f"Applying spectral damping with beta={beta} to SVD output")
         
         # Calculate scaling factors based on singular values
-        # Adding epsilon prevents division by zero
-        scaling_factors = (svd_model.singular_values_ + self.config.epsilon) ** (-beta)
+        # Clamp to epsilon for numerical stability
+        safe_singular_values = cupy.maximum(svd_model.singular_values_, self.config.epsilon)
+        scaling_factors = safe_singular_values ** (-beta)
         
         # Apply damping to vectors
         damped_vectors = dense_vectors * scaling_factors
@@ -707,6 +713,8 @@ class MultiStreamVectorizer:
                     f"Call fit_transform first to train the model."
                 )
             reduced_vectors = pca_model.transform(dense_vectors)
+
+        logger.debug(f"Successfully applied PCA to '{stream_name}' stream with output dtype: {reduced_vectors.dtype}")
         
         return reduced_vectors
     

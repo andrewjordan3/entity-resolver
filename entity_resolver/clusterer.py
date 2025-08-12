@@ -421,9 +421,6 @@ class EntityClusterer:
         """
         logger.info(f"Running UMAP ensemble on shape {vectors.shape}")
         
-        # Normalize rows for stable neighborhoods
-        vectors_normalized = utils.normalize_rows(vectors)
-        
         n_runs = int(self.config.umap_n_runs)
         umap_embeddings: List[cp.ndarray] = []
         
@@ -440,7 +437,7 @@ class EntityClusterer:
                 
                 try:
                     reducer = UMAP(**umap_params)
-                    embedding = reducer.fit_transform(vectors_normalized)
+                    embedding = reducer.fit_transform(vectors)
                     
                     # Validate embedding
                     if cp.isnan(embedding).any():
@@ -469,7 +466,7 @@ class EntityClusterer:
             
             for idx, reducer in enumerate(self.umap_ensemble):
                 try:
-                    embedding = reducer.transform(vectors_normalized)
+                    embedding = reducer.transform(vectors)
                     
                     if cp.isnan(embedding).any():
                         logger.warning(f"UMAP model {idx + 1} produced NaN values, skipping")
@@ -493,6 +490,13 @@ class EntityClusterer:
             batch_size=self.config.cosine_consensus_batch_size,
             random_state=self.random_state
         )
+
+        # --- GPU Memory Cleanup ---
+        # The umap_embeddings list can be very large. We delete it and
+        # call the garbage collector to free up GPU memory immediately.
+        del umap_embeddings
+        cp.get_default_memory_pool().free_all_blocks()
+        logger.debug("Cleaned up UMAP embedding list from GPU memory.")
         
         logger.info(f"UMAP ensemble complete: shape {final_vectors.shape}")
         return final_vectors

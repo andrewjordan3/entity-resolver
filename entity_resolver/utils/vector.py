@@ -18,8 +18,8 @@ def normalize_rows(vectors: cupy.ndarray, eps: float = 1e-8) -> cupy.ndarray:
     Performs a safe, row-wise L2 normalization on a CuPy array.
 
     This ensures each row vector has a magnitude of 1, which is essential
-    for cosine similarity calculations. A small epsilon is added to the norm
-    to prevent division by zero for any all-zero row vectors.
+    for cosine similarity calculations. A small epsilon is used to prevent
+    division by zero, and original all-zero rows are preserved as all-zero.
 
     Args:
         vectors: A 2D CuPy array.
@@ -29,8 +29,24 @@ def normalize_rows(vectors: cupy.ndarray, eps: float = 1e-8) -> cupy.ndarray:
         The row-normalized CuPy array.
     """
     norms = cupy.linalg.norm(vectors, axis=1, keepdims=True)
-    return vectors / (norms + eps)
-
+    
+    # Use clamping for safe division
+    safe_norms = cupy.maximum(norms, eps)
+    L2_vectors = vectors / safe_norms
+    
+    # Explicitly set original zero-rows back to zero
+    zero_mask = (norms == 0)
+    L2_vectors[zero_mask.ravel()] = 0
+    
+    # Log statistics
+    num_zero_rows = int(zero_mask.sum())
+    num_total_rows = len(L2_vectors)
+    logger.debug(
+        f"L2 normalized {num_total_rows:,} rows: "
+        f"{num_total_rows - num_zero_rows:,} non-zero, {num_zero_rows:,} zero."
+    )
+    
+    return L2_vectors
 
 def center_kernel_matrix(kernel_matrix: cupy.ndarray) -> cupy.ndarray:
     """
@@ -148,35 +164,32 @@ def get_top_k_positive_eigenpairs(
 
 def balance_feature_streams(
     vector_streams: Dict[str, cupy.ndarray],
-    proportions: Dict[str, float],
-    eps: float = 1e-8
+    proportions: Dict[str, float]
 ) -> List[cupy.ndarray]:
     """
-    Balances the energy of feature streams to match target proportions.
+    Scales L2-normalized vector streams to their target energy proportions.
 
-    This method calculates the average energy (mean squared L2 norm) of
-    each feature stream and computes a scaling factor to adjust its energy
-    to a desired proportion. This ensures each stream contributes a controlled
-    amount of variance to the final combined vector.
+    This method assumes each input vector stream has already been row-wise
+    L2 normalized (i.e., each vector has a magnitude of 1). It then scales
+    each stream by the square root of its desired proportion.
 
     Args:
-        vector_streams: Dictionary of stream names to CuPy arrays.
+        vector_streams: Dictionary of stream names to pre-normalized CuPy arrays.
         proportions: Dictionary mapping stream names to desired energy proportions.
-        eps: A small epsilon to prevent division by zero.
 
     Returns:
         A list of the balanced (rescaled) CuPy arrays.
     """
-    def block_energy(Z: cupy.ndarray) -> float:
-        return float((Z * Z).sum(axis=1).mean().get())
-
-    energies = {name: block_energy(vec) for name, vec in vector_streams.items()}
-    scaling_factors = {
-        name: (proportions[name] / (energies[name] + eps)) ** 0.5
-        for name in vector_streams.keys()
-    }
-    logger.debug(f"Balancing streams with scaling factors: {scaling_factors}")
-    return [vec * scaling_factors[name] for name, vec in vector_streams.items()]
+    balanced_vectors_list = []
+    logging_dict = {}
+    for name, vectors in vector_streams.items():
+        proportion = proportions.get(name, 0.0)
+        scaling_factor = cupy.sqrt(proportion)
+        balanced_vectors_list.append(vectors * scaling_factor)
+        logging_dict[name] = scaling_factor
+    logger.debug(f"Balancing streams with scaling factors: {', '.join(f'{stream}: {scale:.4f}' for stream, scale in logging_dict.items())}")
+        
+    return balanced_vectors_list
 
 
 # --- Consensus Embedding Helper Functions ---

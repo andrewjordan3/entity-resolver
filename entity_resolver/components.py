@@ -63,6 +63,39 @@ class GPUTruncatedSVD:
             f"svds_kwargs={svds_kwargs}"
         )
 
+    def _prepare_input_matrix(self, sparse_matrix: cupy.sparse.spmatrix) -> cupy.sparse.csr_matrix:
+        """
+        Validates and prepares the input sparse matrix for SVD.
+        
+        Ensures the matrix is a CSR matrix, contains no NaN/inf values, and has 
+        a dtype of float64 for high-precision calculations.
+        
+        Args:
+            sparse_matrix: The input CuPy sparse matrix.
+            
+        Returns:
+            A sparse CSR matrix with dtype=cupy.float64.
+        """
+        if not isinstance(sparse_matrix, cupy.sparse.spmatrix):
+            raise TypeError(f"Input must be a CuPy sparse matrix, not {type(sparse_matrix)}")
+
+        # Check for invalid values in the sparse data array
+        if cupy.isnan(sparse_matrix.data).any():
+            raise ValueError("Input sparse matrix contains NaN values.")
+        if cupy.isinf(sparse_matrix.data).any():
+            raise ValueError("Input sparse matrix contains infinity values.")
+            
+        # Ensure CSR format for efficient row slicing and matrix multiplication
+        if not isinstance(sparse_matrix, cupy.sparse.csr_matrix):
+            sparse_matrix = sparse_matrix.tocsr()
+            
+        # Ensure float64 for high-precision SVD and variance calculations
+        if sparse_matrix.dtype != cupy.float64:
+            sparse_matrix = sparse_matrix.astype(cupy.float64, copy=False)
+        
+        logger.debug(f"Prepared matrix: shape={sparse_matrix.shape}, dtype={sparse_matrix.dtype}")
+        return sparse_matrix
+
     def fit(self, sparse_matrix_csr: cupy.sparse.csr_matrix) -> 'GPUTruncatedSVD':
         """
         Compute singular value decomposition on the sparse matrix.
@@ -94,10 +127,26 @@ class GPUTruncatedSVD:
             f"Fitting GPUTruncatedSVD on sparse matrix with shape {sparse_matrix_csr.shape}, "
             f"density={sparse_matrix_csr.nnz / (n_samples * n_features):.4f}"
         )
+
+        # --- Total variance of X (calculated efficiently for sparse matrices) ---
+        # Frobenius norm squared: sum of squares of all non-zero entries
+        sum_sq = float((sparse_matrix_csr.multiply(sparse_matrix_csr)).sum())
+
+        # Column means vector μ (length = n_features)
+        col_sum = sparse_matrix_csr.sum(axis=0)
+        mu = cupy.asarray(col_sum).ravel().astype(cupy.float64, copy=False) / float(n_samples)
+
+        # Squared L2 norm of the mean vector: ||μ||^2
+        mu_sq_norm = float(cupy.inner(mu, mu))
+
+        # Total variance = (||X||_F^2 - n * ||μ||^2) / (n - 1)
+        numerator = sum_sq - n_samples * mu_sq_norm
+        numerator = max(numerator, 0.0) # Guard against tiny negative from roundoff
+        total_variance = numerator / max(n_samples - 1, 1)
         
         # Perform sparse SVD using ARPACK solver
         # Note: cupyx.scipy.sparse.linalg.svds is deterministic (no random_state needed)
-        U, singular_values, V_transpose = svds(
+        _, singular_values, V_transpose = svds(
             sparse_matrix_csr,
             k=self.n_components,
             return_singular_vectors=True,
@@ -105,18 +154,20 @@ class GPUTruncatedSVD:
         )
         
         # Sort singular values in descending order (svds doesn't guarantee order)
-        descending_indices = cupy.argsort(singular_values)[::-1]
+        # Guard small values with float64
+        sorted_values = cupy.asarray(singular_values, dtype=cupy.float64)
+        sorted_values = cupy.abs(sorted_values)
+        descending_indices = cupy.argsort(sorted_values)[::-1]
         
-        self.singular_values_ = singular_values[descending_indices]
+        self.singular_values_ = sorted_values[descending_indices]
         self.components_ = V_transpose[descending_indices, :]
         
         # Calculate explained variance (singular values squared, normalized by n_samples)
-        self.explained_variance_ = (self.singular_values_ ** 2) / (n_samples - 1)
+        self.explained_variance_ = (self.singular_values_ ** 2) / max(n_samples - 1, 1)
         
         # Calculate explained variance ratio
-        # Note: We can only explain variance captured by the k components we computed
-        total_variance = float(cupy.sum(self.explained_variance_))
-        if total_variance > 0:
+        eps = 1e-18 # Guard for division by zero
+        if total_variance > eps:
             self.explained_variance_ratio_ = self.explained_variance_ / total_variance
         else:
             self.explained_variance_ratio_ = cupy.zeros_like(self.explained_variance_)
@@ -125,7 +176,7 @@ class GPUTruncatedSVD:
         cumulative_variance = float(cupy.sum(self.explained_variance_ratio_))
         logger.info(
             f"GPUTruncatedSVD fit complete. "
-            f"Top singular value: {float(self.singular_values_[0]):.4f}, "
+            f"Top singular value: {float(self.singular_values_[0]):.6e}, "
             f"Explained variance ratio: {cumulative_variance:.4f}"
         )
         
@@ -148,19 +199,18 @@ class GPUTruncatedSVD:
             sparse_matrix_csr: Input sparse matrix with shape (n_samples, n_features)
         
         Returns:
-            Dense array of transformed data with shape (n_samples, n_components)
+            Dense array of transformed data with shape (n_samples, n_components) of dtype cupy.float64
         """
         logger.debug("Starting fit_transform on sparse matrix")
+
+        prepared_matrix = self._prepare_input_matrix(sparse_matrix_csr)
         
         # Fit the model
-        self.fit(sparse_matrix_csr)
+        self.fit(prepared_matrix)
         
         # Transform the data: Z = X * V (where V = components_.T)
         # This projects the original data onto the principal components
-        transformed_matrix = sparse_matrix_csr @ self.components_.T
-        
-        # Cast to float32 for compatibility with downstream cuML components
-        transformed_matrix = transformed_matrix.astype(cupy.float32)
+        transformed_matrix = prepared_matrix @ self.components_.T
         
         logger.debug(
             f"fit_transform complete. Output shape: {transformed_matrix.shape}, "
@@ -192,7 +242,7 @@ class GPUTruncatedSVD:
                 "Call fit() or fit_transform() first."
             )
         
-        n_samples, n_features = sparse_matrix_csr.shape
+        _, n_features = sparse_matrix_csr.shape
         expected_features = self.components_.shape[1]
         
         if n_features != expected_features:
@@ -201,15 +251,14 @@ class GPUTruncatedSVD:
                 f"was fitted with {expected_features} features"
             )
         
+        prepared_matrix = self._prepare_input_matrix(sparse_matrix_csr)
+
         logger.debug(
-            f"Transforming sparse matrix with shape {sparse_matrix_csr.shape}"
+            f"Transforming sparse matrix with shape {prepared_matrix.shape}"
         )
         
         # Project data onto principal components
-        transformed_matrix = sparse_matrix_csr @ self.components_.T
-        
-        # Cast to float32 for compatibility
-        transformed_matrix = transformed_matrix.astype(cupy.float32)
+        transformed_matrix = prepared_matrix @ self.components_.T
         
         return transformed_matrix
     
