@@ -101,7 +101,7 @@ def get_canonical_name_gpu(name_series: cudf.Series, tfidf_params: Dict[str, Any
     if len(unique_names) == 1:
         return unique_names.iloc[0]
 
-    logger.info(f"Finding canonical name from {len(unique_names)} unique candidates (out of {len(name_series)} total).")
+    logger.debug(f"Finding canonical name from {len(unique_names)} unique candidates (out of {len(name_series)} total).")
 
     # --- Score Calculation ---
     name_counts = name_series.value_counts().reindex(unique_names).fillna(0)
@@ -129,6 +129,6 @@ def get_canonical_name_gpu(name_series: cudf.Series, tfidf_params: Dict[str, Any
     # Find the index of the highest score and return the corresponding name.
     best_name_index = final_scores.argmax()
     best_name = unique_names.iloc[int(best_name_index)]
-    logger.info(f"Selected '{best_name}' as the canonical name.")
+    logger.debug(f"Selected '{best_name}' as the canonical name.")
 
     return best_name
