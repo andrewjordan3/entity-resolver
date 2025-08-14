@@ -91,7 +91,7 @@ class GPUTruncatedSVD:
         row_norms = cupy.sqrt(matrix.power(2).sum(axis=1)).ravel()
         
         # Create scale factors, guarding against division by zero for empty rows.
-        eps = 1e-12
+        eps = 1e-8
         scale_factors = cupy.where(row_norms > eps, 1.0 / row_norms, 0.0)
 
         # Apply scaling efficiently to the non-zero data of the CSR matrix.
@@ -110,6 +110,7 @@ class GPUTruncatedSVD:
             scale_factors[data_row_ids], 
             out=normalized_matrix.data
         )
+        self._ensure_finite(normalized_matrix, "L2 Normalized Rows")
         
         logger.debug(
             f"Row-normalized matrix: {int(cupy.sum(row_norms > eps))}/{matrix.shape[0]} "
@@ -174,7 +175,7 @@ class GPUTruncatedSVD:
         matrix_to_prune = sparse_matrix.copy()
 
         # Step 1: Prune microscopic values
-        pruning_threshold = 1e-15
+        pruning_threshold = 1e-12
         matrix_to_prune.data[cupy.abs(matrix_to_prune.data) < pruning_threshold] = 0
         matrix_to_prune.eliminate_zeros()
         logger.debug(f"Pruned microscopic values below {pruning_threshold:.1e}.")
@@ -182,7 +183,7 @@ class GPUTruncatedSVD:
         # Step 1b: Zero-out lower-tail tiny values (bottom 0.1%)
         if matrix_to_prune.nnz > 0:
             # Percentile expects q in [0, 100]; use 0.1 for the 0.1th percentile
-            lb = cupy.percentile(matrix_to_prune.data, 0.1)
+            lb = cupy.percentile(matrix_to_prune.data, 1.0)
 
             # If the percentile threshold is above the microscopic threshold, apply it
             # (otherwise this step is redundant with the 1e-15 prune)
@@ -198,9 +199,29 @@ class GPUTruncatedSVD:
                     )
 
         # Step 2: Prune columns by document frequency and energy
+        row_sums = cupy.asarray(matrix_to_prune.sum(axis=1)).ravel()
+        row_threshold = 1e-10  # Rows with total sum below this are problematic
+        valid_rows = row_sums > row_threshold
+        n_valid_rows = int(valid_rows.sum())
+        
+        if n_valid_rows < n_samples:
+            logger.warning(
+                f"Removing {n_samples - n_valid_rows} near-empty rows "
+                f"(sum < {row_threshold:.1e}) to prevent numerical issues."
+            )
+            matrix_to_prune = matrix_to_prune[valid_rows, :]
+            n_samples = n_valid_rows
+        
+        if n_samples == 0:
+            raise ValueError("All rows were removed during pruning. Matrix is essentially empty.")
+
         doc_frequency = cupy.bincount(matrix_to_prune.indices, minlength=n_features)
         max_df_ratio = 0.98
         df_mask = doc_frequency <= int(max_df_ratio * n_samples)
+
+        # Also remove columns that appear in too few documents (min_df)
+        min_df = max(2, int(0.001 * n_samples))  # At least 0.1% of documents
+        df_mask &= doc_frequency >= min_df
 
         col_energy = cupy.bincount(
             matrix_to_prune.indices,
@@ -211,17 +232,21 @@ class GPUTruncatedSVD:
         if total_energy == 0.0:
             raise ValueError("All columns have zero energy after microscopic pruning; cannot proceed.")
         
-        energy_cutoff_ratio = 0.999
+        # Keep columns that contribute meaningful energy
+        energy_threshold = 1e-10 * total_energy / n_features
+        energy_mask = col_energy > energy_threshold
+
+        energy_cutoff_ratio = 0.995
         energy_desc_order = cupy.argsort(col_energy)[::-1]
         cumulative_energy = cupy.cumsum(col_energy[energy_desc_order])
         num_cols_for_cutoff = int(cupy.searchsorted(
             cumulative_energy, energy_cutoff_ratio * cumulative_energy[-1]
         ) + 1)
         energy_cols_to_keep = energy_desc_order[:num_cols_for_cutoff]
-        energy_mask = cupy.zeros(n_features, dtype=bool)
-        energy_mask[energy_cols_to_keep] = True
+        cumulative_energy_mask = cupy.zeros(n_features, dtype=bool)
+        cumulative_energy_mask[energy_cols_to_keep] = True
 
-        final_keep_mask = df_mask & energy_mask
+        final_keep_mask = df_mask & energy_mask & cumulative_energy_mask
         kept_column_indices = cupy.where(final_keep_mask)[0]
 
         if kept_column_indices.size == 0:
@@ -234,9 +259,46 @@ class GPUTruncatedSVD:
         pruned_matrix = matrix_to_prune[:, kept_column_indices]
         pruned_matrix.eliminate_zeros()
 
+        # Pre-normalization outlier removal (BEFORE L2 normalization)
+        # This is crucial - outliers can cause huge problems during normalization
+        if pruned_matrix.nnz > 0:
+            # Use a more aggressive percentile for outlier detection
+            upper_percentile = 99.0  # Changed from 99.9
+            ub = cupy.percentile(pruned_matrix.data, upper_percentile)
+            
+            if cupy.isfinite(ub) and float(ub) > 0:
+                outlier_mask = pruned_matrix.data > ub
+                n_outliers = int(outlier_mask.sum())
+                if n_outliers > 0:
+                    # Cap outliers to the threshold
+                    pruned_matrix.data[outlier_mask] = ub
+                    logger.debug(
+                        f"Capped {n_outliers} outliers (>{float(ub):.3e}) "
+                        f"at {upper_percentile}th percentile."
+                    )
+
         # Step 3: Row-wise L2 Normalization
         normalized_matrix = self._l2_normalize_rows(pruned_matrix)
 
+        # Ensure no infinite or NaN values crept in
+        if not cupy.isfinite(normalized_matrix.data).all():
+            # Find and fix problematic values
+            bad_mask = ~cupy.isfinite(normalized_matrix.data)
+            n_bad = int(bad_mask.sum())
+            if n_bad > 0:
+                logger.warning(f"Found {n_bad} non-finite values after normalization. Replacing with 0.")
+                normalized_matrix.data[bad_mask] = 0
+                normalized_matrix.eliminate_zeros()
+        
+        # Final validation
+        if normalized_matrix.nnz == 0:
+            raise ValueError("Matrix became empty after normalization.")
+        
+        # If dealing with the augmented matrix, also need to handle the valid_rows mapping
+        if n_valid_rows < sparse_matrix.shape[0]:
+            # Return the valid row indices as well for proper reconstruction
+            return normalized_matrix, kept_column_indices, cupy.where(valid_rows)[0]
+        
         return normalized_matrix, kept_column_indices
 
     def _run_eigsh_with_restarts(
@@ -362,7 +424,7 @@ class GPUTruncatedSVD:
 
         # Step 2: Global Scaling by Frobenius norm
         frobenius_norm_sq = float((processed_matrix.data ** 2).sum())
-        if frobenius_norm_sq <= 1e-12:
+        if frobenius_norm_sq <= 1e-10:
             raise ValueError("Matrix has zero Frobenius norm after processing.")
         alpha = 1.0 / cupy.sqrt(frobenius_norm_sq)
         scaled_matrix = processed_matrix * alpha
@@ -377,7 +439,18 @@ class GPUTruncatedSVD:
             result_lower = scaled_matrix.T @ vector_u
             final_result = cupy.concatenate([result_upper, result_lower])
             if not cupy.isfinite(final_result).all():
+                max_val = float(cupy.abs(final_result[cupy.isfinite(final_result)]).max()) if cupy.isfinite(final_result).any() else 0
+                logger.error(
+                    f"Non-finite values in final result. "
+                    f"Max finite value: {max_val:.2e}, "
+                    f"Num NaN: {int(cupy.isnan(final_result).sum())}, "
+                    f"Num Inf: {int(cupy.isinf(final_result).sum())}"
+                )
                 raise FloatingPointError("NaN or Inf generated during matrix-vector product.")
+            # Check for values that are getting too large (early warning)
+            max_abs_val = float(cupy.abs(final_result).max())
+            if max_abs_val > 1e6:
+                logger.warning(f"Large values detected in matvec result: max={max_abs_val:.2e}")
             return final_result
 
         augmented_operator = LinearOperator(
