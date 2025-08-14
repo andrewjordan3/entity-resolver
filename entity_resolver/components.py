@@ -171,6 +171,24 @@ class GPUTruncatedSVD:
         matrix_to_prune.eliminate_zeros()
         logger.debug(f"Pruned microscopic values below {pruning_threshold:.1e}.")
 
+        # Step 1b: Zero-out lower-tail tiny values (bottom 0.1%)
+        if matrix_to_prune.nnz > 0:
+            # Percentile expects q in [0, 100]; use 0.1 for the 0.1th percentile
+            lb = cupy.percentile(matrix_to_prune.data, 0.1)
+
+            # If the percentile threshold is above the microscopic threshold, apply it
+            # (otherwise this step is redundant with the 1e-15 prune)
+            if float(lb) > pruning_threshold:
+                mask = matrix_to_prune.data < lb
+                n_zeroed = int(mask.sum().item())
+                if n_zeroed:
+                    matrix_to_prune.data[mask] = 0
+                    matrix_to_prune.eliminate_zeros()
+                    logger.debug(
+                        f"Zeroed bottom 0.1% values (< {float(lb):.3e}); "
+                        f"removed {n_zeroed:,} entries."
+                    )
+
         # Step 2: Prune columns by document frequency and energy
         doc_frequency = cupy.bincount(matrix_to_prune.indices, minlength=n_features)
         max_df_ratio = 0.98
@@ -252,6 +270,28 @@ class GPUTruncatedSVD:
 
         if n_components >= n_aug - 1:
             raise ValueError(f"n_components ({n_components}) must be < n_samples + n_features_pruned - 1 ({n_aug-1})")
+
+        # --- Robust upper-tail clipping BEFORE alpha ---
+        # Winsorize only the top tail to tame rare heavy entries; do NOT raise small ones.
+        # Choose a conservative percentile (e.g., 99.9) so you only touch true outliers.
+        winsor_p = 99.9
+        if processed_matrix.nnz > 0:
+            ub = cupy.percentile(processed_matrix.data, winsor_p)
+            # Skip if ub is non-finite or non-positive (shouldn't happen for TF-IDF)
+            if cupy.isfinite(ub) and float(ub) > 0.0:
+                # Cap only the upper tail in-place
+                cupy.minimum(processed_matrix.data, ub, out=processed_matrix.data)
+
+                # Optionally log how much was clipped
+                clipped_frac = float((processed_matrix.data == ub).sum()) / float(processed_matrix.nnz)
+                logger.debug(f"Winsorized upper tail at {winsor_p}th pct: "
+                             f"{clipped_frac:.4%} of nonzeros clipped to {float(ub):.3e}")
+
+                # Remove any explicit zeros that may have appeared
+                processed_matrix.eliminate_zeros()
+
+                # Re-normalize rows to restore unit length (spherical geometry)
+                processed_matrix = self._l2_normalize_rows(processed_matrix)
 
         # Step 2: Global Scaling by Frobenius norm
         frobenius_norm_sq = float((processed_matrix.data ** 2).sum())
