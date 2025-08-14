@@ -7,9 +7,10 @@ that are optimized for GPU execution and sparse matrix operations.
 """
 
 import logging
+from typing import Tuple, Optional
 
-from typing import Tuple
 import cupy
+from cupyx.scipy.sparse import csr_matrix
 from cupyx.scipy.sparse.linalg import svds, eigsh, LinearOperator
 
 # Set up module-level logger
@@ -64,6 +65,50 @@ class GPUTruncatedSVD:
             f"svds_kwargs={svds_kwargs}"
         )
 
+    def _l2_normalize_rows(self, matrix: csr_matrix) -> csr_matrix:
+        """
+        Applies row-wise L2 normalization to a sparse CSR matrix.
+
+        This helper function ensures each row vector has a Euclidean norm of 1,
+        a standard pre-processing step for algorithms based on cosine similarity.
+
+        Args:
+            matrix: The input CSR matrix to normalize.
+
+        Returns:
+            The row-normalized CSR matrix.
+        """
+        logger.debug("Performing row-wise L2 normalization.")
+        # Calculate the L2 norm for each row.
+        row_norms = cupy.sqrt(matrix.power(2).sum(axis=1)).ravel()
+        
+        # Create scale factors, guarding against division by zero for empty rows.
+        eps = 1e-12
+        scale_factors = cupy.where(row_norms > eps, 1.0 / row_norms, 0.0)
+
+        # Apply scaling efficiently to the non-zero data of the CSR matrix.
+        # This 'searchsorted' trick maps each non-zero element in `matrix.data`
+        # to its corresponding row index, allowing us to apply the correct
+        # scale factor without iterating or creating a dense diagonal matrix.
+        data_row_ids = cupy.searchsorted(
+            matrix.indptr,
+            cupy.arange(matrix.nnz, dtype=matrix.indptr.dtype),
+            side="right"
+        ) - 1
+        
+        normalized_matrix = matrix.copy()
+        cupy.multiply(
+            normalized_matrix.data, 
+            scale_factors[data_row_ids], 
+            out=normalized_matrix.data
+        )
+        
+        logger.debug(
+            f"Row-normalized matrix: {int(cupy.sum(row_norms > eps))}/{matrix.shape[0]} "
+            "non-zero rows processed."
+        )
+        return normalized_matrix
+
     def _prepare_input_matrix(self, sparse_matrix: cupy.sparse.spmatrix) -> cupy.sparse.csr_matrix:
         """
         Validates and prepares the input sparse matrix for SVD.
@@ -87,7 +132,7 @@ class GPUTruncatedSVD:
             raise ValueError("Input sparse matrix contains infinity values.")
             
         # Ensure CSR format for efficient row slicing and matrix multiplication
-        if not isinstance(sparse_matrix, cupy.sparse.csr_matrix):
+        if not isinstance(sparse_matrix, csr_matrix):
             sparse_matrix = sparse_matrix.tocsr()
             
         # Ensure float64 for high-precision SVD and variance calculations
@@ -97,473 +142,364 @@ class GPUTruncatedSVD:
         logger.debug(f"Prepared matrix: shape={sparse_matrix.shape}, dtype={sparse_matrix.dtype}")
         return sparse_matrix
 
-    def _eigsh_augmented_tsvd(
-            self, 
-            sparse_matrix: cupy.sparse.csr_matrix, 
-            n_components: int, 
-            ncv: int = None, 
-            tol: float = 1.0e-8, 
-            maxiter: int = 20000
-        ) -> Tuple[None, cupy.ndarray, cupy.ndarray]:
+    def _prune_and_normalize_matrix(
+        self, sparse_matrix: csr_matrix
+    ) -> Tuple[csr_matrix, cupy.ndarray]:
         """
-        Computes the exact top-k singular values/vectors of the 
-        row-L2-normalized input (spherical TF-IDF) via the augmented operator.
-        
-        Computes SVD of X by finding eigenvalues of the augmented matrix:
-            B = [[0,   αX ],
-                [αXᵀ, 0  ]]
-        where α = 1/‖X‖_F for numerical stability.
-        
-        The eigenvalues are ±ασ (where σ are singular values of X).
-        Using 'LA' returns the positive eigenvalues directly.
-        
+        Prunes and normalizes a sparse matrix to improve numerical stability for SVD.
+
+        This helper function applies a series of steps to condition the matrix:
+        1.  Removes microscopic values that are likely numerical noise.
+        2.  Filters out columns (features) that are either too common or contribute very little.
+        3.  Applies row-wise L2 normalization via a dedicated helper.
+
         Args:
-            sparse_matrix: Input CSR matrix (already float64 from _prepare_input_matrix).
-            n_components: Number of singular values to compute.
-            ncv: Number of Lanczos vectors (must satisfy k+1 < ncv < n_aug).
-            tol: Convergence tolerance.
-            maxiter: Maximum iterations.
-        
+            sparse_matrix: The input CSR matrix to be processed.
+
         Returns:
-            (None, singular_values, V_transpose) matching svds format.
+            A tuple containing:
+            - The pruned and row-normalized sparse matrix.
+            - A 1D CuPy array containing the indices of the columns that were kept.
+        """
+        logger.debug("Starting matrix pruning and normalization for SVD fallback.")
+        n_samples, n_features = sparse_matrix.shape
+        matrix_to_prune = sparse_matrix.copy()
+
+        # Step 1: Prune microscopic values
+        pruning_threshold = 1e-15
+        matrix_to_prune.data[cupy.abs(matrix_to_prune.data) < pruning_threshold] = 0
+        matrix_to_prune.eliminate_zeros()
+        logger.debug(f"Pruned microscopic values below {pruning_threshold:.1e}.")
+
+        # Step 2: Prune columns by document frequency and energy
+        doc_frequency = cupy.bincount(matrix_to_prune.indices, minlength=n_features)
+        max_df_ratio = 0.98
+        df_mask = doc_frequency <= int(max_df_ratio * n_samples)
+
+        col_energy = cupy.bincount(
+            matrix_to_prune.indices,
+            weights=(matrix_to_prune.data ** 2),
+            minlength=n_features
+        )
+        total_energy = float(col_energy.sum())
+        if total_energy == 0.0:
+            raise ValueError("All columns have zero energy after microscopic pruning; cannot proceed.")
+        
+        energy_cutoff_ratio = 0.999
+        energy_desc_order = cupy.argsort(col_energy)[::-1]
+        cumulative_energy = cupy.cumsum(col_energy[energy_desc_order])
+        num_cols_for_cutoff = int(cupy.searchsorted(
+            cumulative_energy, energy_cutoff_ratio * cumulative_energy[-1]
+        ) + 1)
+        energy_cols_to_keep = energy_desc_order[:num_cols_for_cutoff]
+        energy_mask = cupy.zeros(n_features, dtype=bool)
+        energy_mask[energy_cols_to_keep] = True
+
+        final_keep_mask = df_mask & energy_mask
+        kept_column_indices = cupy.where(final_keep_mask)[0]
+
+        if kept_column_indices.size == 0:
+            raise ValueError("Matrix pruning removed all columns. Cannot proceed.")
+
+        logger.debug(
+            f"Pruned columns: kept {len(kept_column_indices)}/{n_features} "
+            f"(DF ratio < {max_df_ratio}, Energy ratio > {energy_cutoff_ratio})."
+        )
+        pruned_matrix = matrix_to_prune[:, kept_column_indices]
+        pruned_matrix.eliminate_zeros()
+
+        # Step 3: Row-wise L2 Normalization
+        normalized_matrix = self._l2_normalize_rows(pruned_matrix)
+
+        return normalized_matrix, kept_column_indices
+
+    def _eigsh_augmented_tsvd(
+        self,
+        sparse_matrix: csr_matrix,
+        n_components: int,
+        ncv: int = None,
+        tol: float = 1.0e-8,
+        maxiter: int = 20000
+    ) -> Tuple[cupy.ndarray, cupy.ndarray, cupy.ndarray]:
+        """
+        Numerically stable SVD using an augmented matrix approach. Fallback for when svds fails.
+
+        This method computes the SVD by finding the eigenpairs of a larger,
+        symmetric "augmented matrix" B = [[0, X], [X.T, 0]]. This avoids forming
+        X.T @ X, which can be unstable.
+
+        Args:
+            sparse_matrix: The input data matrix (X).
+            n_components: The number of singular values to compute (k).
+            ncv: Number of Lanczos vectors for the eigsh solver.
+            tol: Tolerance for convergence for the eigsh solver.
+            maxiter: Maximum iterations for the eigsh solver.
+
+        Returns:
+            A tuple (U, s, V_T) containing the SVD components.
         """
         logger.warning(
-            "Standard svds failed. Using exact augmented matrix method (eigsh). "
-            "This preserves mathematical exactness while improving stability."
+            "The standard 'svds' solver failed. Falling back to the numerically stable "
+            "augmented matrix (eigsh) method with pre-processing."
         )
-        
-        n_samples, n_features = sparse_matrix.shape
-        n_aug = n_samples + n_features
+        original_n_features = sparse_matrix.shape[1]
         dtype = cupy.float64
-        
-        # === Step 1: Check finiteness of input ===
-        if not cupy.isfinite(sparse_matrix.data).all():
-            raise ValueError("Input sparse matrix contains non-finite values")
-        
-        # === Step 2: Row L2-normalize (unconditional for cosine similarity) ===
-        # Create a copy to preserve original
-        X_norm = sparse_matrix.copy()
-        
-        # Compute row norms
-        row_norms_sq = X_norm.power(2).sum(axis=1).ravel()
-        row_norms = cupy.sqrt(row_norms_sq)
-        
-        # Find rows with non-zero norm (use small epsilon for numerical safety)
-        # 0 for rows with ‖x‖ ≤ eps, 1/‖x‖ for rows with ‖x‖ > eps
-        eps = 1e-12
-        scale_factors = cupy.where(row_norms > eps, 1.0 / row_norms, 0.0)
-        
-        # Apply scaling to sparse matrix data via CSR structure
-        num_non_zeros = X_norm.nnz
-        # For each nonzero position j (0..nnz-1), find its row r such that indptr[r] <= j < indptr[r+1]
-        data_row_ids = cupy.searchsorted(
-            X_norm.indptr, 
-            cupy.arange(num_non_zeros, dtype=X_norm.indptr.dtype), 
-            side="right"
-        ) - 1
-        # Scale: X_norm.data[j] *= scale_factors[data_row_ids[j]]
-        cupy.multiply(X_norm.data, scale_factors[data_row_ids], out=X_norm.data)
-        
-        logger.debug(f"Row-normalized matrix: {int(cupy.sum(row_norms > eps))}/{n_samples} non-zero rows")
-        
-        # === Step 3: Global scaling by α = 1/‖X‖_F (always applied) ===
-        frobenius_norm_sq = float((X_norm.data ** 2).sum())
-        if frobenius_norm_sq <= 0:
-            raise ValueError("Matrix has zero Frobenius norm after row normalization")
-        
-        frobenius_norm = cupy.sqrt(frobenius_norm_sq)
-        alpha = 1.0 / frobenius_norm
-        
-        # Apply global scaling
-        scaled_matrix = X_norm * alpha
-        
-        logger.debug(f"Applied global scaling α = {alpha:.2e} (‖X‖_F = {frobenius_norm:.2e})")
-        
-        # === Step 4: Define exact augmented matrix operator ===
-        def augmented_matvec(v: cupy.ndarray) -> cupy.ndarray:
-            """
-            Exact matrix-vector product for B = [[0, αX], [αXᵀ, 0]].
-            No diagonal regularization - preserves exactness.
-            """
-            v = cupy.asarray(v, dtype=dtype)
-            
-            # Check input validity
-            if not cupy.isfinite(v).all():
-                raise ValueError("augmented_matvec received non-finite input")
-            
-            # Split vector
-            v_upper = v[:n_samples]
-            v_lower = v[n_samples:]
-            
-            # Exact block matrix multiplication (no regularization!)
-            result_upper = scaled_matrix @ v_lower       # αX @ v_lower
-            result_lower = scaled_matrix.T @ v_upper     # αXᵀ @ v_upper
-            
-            result = cupy.concatenate([result_upper, result_lower])
-            
-            # Verify output is finite
-            if not cupy.isfinite(result).all():
-                raise ValueError("augmented_matvec produced non-finite output")
-            
-            return result
-        
-        # === Step 5: Set ncv with proper bounds ===
-        if ncv is None:
-            # Must satisfy: k+1 < ncv < n_aug
-            min_ncv = n_components + 2  # Strict lower bound
-            max_ncv = n_aug - 1          # Strict upper bound
-            
-            # Use generous ncv for better convergence (you have the GPU memory!)
-            desired_ncv = min(
-                max(n_components * 2, n_components + 50),  # At least 2x or +50
-                n_components + 200,                         # But not excessive
-                max_ncv                                      # Must fit bounds
-            )
-            
-            # Ensure bounds are satisfied
-            ncv = max(min_ncv, min(desired_ncv, max_ncv))
-            
-            logger.info(
-                f"Set ncv={ncv} (bounds: {min_ncv} < ncv < {max_ncv}, "
-                f"k={n_components}, matrix size={n_aug})"
-            )
-        else:
-            # Validate user-provided ncv
-            if ncv <= n_components + 1:
-                raise ValueError(f"ncv ({ncv}) must be > k+1 ({n_components + 1})")
-            if ncv >= n_aug:
-                raise ValueError(f"ncv ({ncv}) must be < matrix size ({n_aug})")
-        
-        # === Step 6: Create augmented operator and solve ===
-        augmented_operator = LinearOperator(
-            shape=(n_aug, n_aug),
-            matvec=augmented_matvec,
-            dtype=dtype
-        )
-        
-        try:
-            logger.debug(f"Starting eigsh: k={n_components}, ncv={ncv}, which='LA'")
-            
-            eigenvalues, eigenvectors = eigsh(
-                augmented_operator,
-                k=n_components,
-                which='LA',  # Largest algebraic → positive eigenvalues ασ
-                ncv=ncv,
-                tol=tol,
-                maxiter=maxiter,
-                return_eigenvectors=True
-            )
-            
-        except Exception as e:
-            logger.error(f"eigsh failed: {e}")
-            raise RuntimeError(f"Augmented matrix eigsh failed: {e}") from e
-        
-        # === Step 7: Validate and process results ===
-        # Check finiteness
-        if not cupy.isfinite(eigenvalues).all() or not cupy.isfinite(eigenvectors).all():
-            raise ValueError("eigsh returned non-finite values")
-        
-        # Handle complex (shouldn't happen for symmetric real matrix)
-        if cupy.iscomplexobj(eigenvalues):
-            max_imag = float(cupy.abs(eigenvalues.imag).max())
-            if max_imag > 1.0e-10:
-                raise ValueError(f"Eigenvalues have significant imaginary parts: {max_imag:.2e}")
-            eigenvalues = eigenvalues.real
-        
-        # Sort by magnitude (descending)
-        order = cupy.argsort(cupy.abs(eigenvalues))[::-1]
-        eigenvalues = eigenvalues[order]
-        eigenvectors = eigenvectors[:, order]
-        
-        # Extract singular values (undo α scaling)
-        singular_values = cupy.abs(eigenvalues) / alpha
-        
-        # Extract right singular vectors V from bottom block
-        V = eigenvectors[n_samples:, :]  # Shape: (n_features, n_components)
-        
-        # === Step 8: Normalize V columns to unit length ===
-        col_norms = cupy.linalg.norm(V, axis=0)
-        
-        # Check for zero norms
-        if cupy.any(col_norms < 1.0e-10):
-            raise ValueError(f"Found {cupy.sum(col_norms < 1.0e-10)} singular vectors with zero norm")
-        
-        V_normalized = V / col_norms[cupy.newaxis, :]
-        V_transpose = V_normalized.T
-        
-        # === Step 9: Validation - Check quality of decomposition ===
-        # 9a. Check orthonormality of V^T rows
-        VVT = V_transpose @ V_transpose.T
-        I_approx = VVT
-        I_exact = cupy.eye(n_components, dtype=dtype)
-        ortho_error = float(cupy.linalg.norm(I_approx - I_exact, 'fro'))
-        
-        if ortho_error > 1.0e-6:
-            logger.warning(f"V^T orthonormality error: {ortho_error:.2e}")
-            if ortho_error > 1.0e-3:
-                raise ValueError(f"V^T is not orthonormal (error: {ortho_error:.2e})")
-        
-        # 9b. Check residuals: X^T X v_i ≈ σ_i^2 v_i (sample a few)
-        n_check = min(3, n_components)
-        logger.debug(f"Checking SVD quality for first {n_check} components...")
-        
-        # We need X (unscaled but row-normalized) for this check
-        X_check = X_norm  
-        
-        for i in range(n_check):
-            v_i = V_normalized[:, i]
-            sigma_i = singular_values[i]
-            
-            # Compute X^T X v_i
-            Xv = X_check @ v_i
-            XTXv = X_check.T @ Xv
-            
-            # Expected: σ^2 v_i
-            expected = (sigma_i ** 2) * v_i
-            
-            # Relative residual
-            residual_norm = float(cupy.linalg.norm(XTXv - expected))
-            expected_norm = float(cupy.linalg.norm(expected))
-            
-            if expected_norm > 1.0e-10:
-                relative_residual = residual_norm / expected_norm
-                logger.debug(f"  Component {i}: σ={sigma_i:.2e}, relative residual={relative_residual:.2e}")
-                
-                if relative_residual > 0.1:  # 10% tolerance
-                    logger.warning(f"High residual for component {i}: {relative_residual:.2e}")
-        
-        # === Step 10: Final checks and logging ===
-        # Check all values are finite
-        if not cupy.isfinite(singular_values).all():
-            raise ValueError("Final singular values contain non-finite values")
-        if not cupy.isfinite(V_transpose).all():
-            raise ValueError("Final V^T contains non-finite values")
-        
-        # Check we got meaningful singular values
-        if cupy.all(singular_values < 1.0e-10):
-            raise ValueError("All singular values are near zero")
-        
-        # Compute condition number and variance explained
-        condition_number = singular_values[0] / (singular_values[-1] + 1.0e-12)
-        variance_explained = cupy.cumsum(singular_values ** 2) / cupy.sum(singular_values ** 2)
-        n_90_percent = int(cupy.searchsorted(variance_explained, 0.9) + 1)
-        
-        logger.info(
-            f"Augmented SVD successful:\n"
-            f"  - Computed {n_components} components\n"
-            f"  - Singular values: [{singular_values[-1]:.2e}, {singular_values[0]:.2e}]\n"
-            f"  - Condition number: {condition_number:.2e}\n"
-            f"  - 90% variance: {n_90_percent} components\n"
-            f"  - V^T orthonormality error: {ortho_error:.2e}"
-        )
-        
-        return None, singular_values, V_transpose
 
-    def fit(self, sparse_matrix_csr: cupy.sparse.csr_matrix) -> 'GPUTruncatedSVD':
+        # Step 1: Prune and Normalize the Matrix for stability
+        processed_matrix, kept_column_indices = self._prune_and_normalize_matrix(sparse_matrix)
+        n_samples, n_features_pruned = processed_matrix.shape
+        n_aug = n_samples + n_features_pruned
+
+        if n_components >= n_aug - 1:
+            raise ValueError(f"n_components ({n_components}) must be < n_samples + n_features_pruned - 1 ({n_aug-1})")
+
+        # Step 2: Global Scaling by Frobenius norm
+        frobenius_norm_sq = float((processed_matrix.data ** 2).sum())
+        if frobenius_norm_sq <= 1e-12:
+            raise ValueError("Matrix has zero Frobenius norm after processing.")
+        alpha = 1.0 / cupy.sqrt(frobenius_norm_sq)
+        scaled_matrix = processed_matrix * alpha
+        logger.debug(f"Applied global scaling alpha = {alpha:.2e}.")
+
+        # Step 3: Define Augmented Matrix Operator
+        def _augmented_matvec(vector_z):
+            vector_z = cupy.asarray(vector_z, dtype=dtype)
+            vector_u, vector_v = vector_z[:n_samples], vector_z[n_samples:]
+            result_upper = scaled_matrix @ vector_v
+            result_lower = scaled_matrix.T @ vector_u
+            final_result = cupy.concatenate([result_upper, result_lower])
+            if not cupy.isfinite(final_result).all():
+                raise FloatingPointError("NaN or Inf generated during matrix-vector product.")
+            return final_result
+
+        augmented_operator = LinearOperator(
+            shape=(n_aug, n_aug), matvec=_augmented_matvec, dtype=dtype
+        )
+
+        # Step 4: Configure and Run Eigsh Solver
+        if ncv is None:
+            max_ncv = n_aug - 1
+            desired_ncv = max(2 * n_components + 1, min(n_components + 50, n_components * 2))
+            ncv = min(max_ncv, desired_ncv)
+        logger.debug(f"Using ncv={ncv} for augmented matrix eigsh.")
+
+        rs = cupy.random.RandomState(0)
+        v0 = rs.standard_normal(n_aug, dtype=dtype)
+        v0 /= cupy.linalg.norm(v0)
+
+        try:
+            eigenvalues, eigenvectors = eigsh(
+                augmented_operator, k=n_components, which='LA',
+                ncv=ncv, tol=tol, maxiter=maxiter,
+                return_eigenvectors=True, v0=v0
+            )
+        except (FloatingPointError, Exception) as e:
+            logger.error(f"eigsh fallback failed with error: {e}", exc_info=True)
+            raise RuntimeError("SVD computation failed even with the robust fallback method.") from e
+
+        # Step 5: Process and Validate Results
+        if not cupy.isfinite(eigenvalues).all() or not cupy.isfinite(eigenvectors).all():
+            raise RuntimeError("eigsh fallback returned non-finite (NaN or Inf) eigenpairs.")
+
+        descending_indices = cupy.argsort(eigenvalues)[::-1]
+        eigenvalues = eigenvalues[descending_indices]
+        eigenvectors = eigenvectors[:, descending_indices]
+        
+        singular_values = eigenvalues / alpha
+
+        V_pruned = eigenvectors[n_samples:, :]
+        col_norms = cupy.linalg.norm(V_pruned, axis=0, keepdims=True)
+        V_pruned = V_pruned / cupy.maximum(col_norms, 1e-12)
+
+        Z = processed_matrix @ V_pruned
+        s_inv = 1.0 / cupy.maximum(singular_values, 1e-18)
+        U = Z * s_inv[None, :]
+
+        V_full = cupy.zeros((original_n_features, n_components), dtype=dtype)
+        V_full[kept_column_indices, :] = V_pruned
+        V_transpose = V_full.T
+
+        logger.info(
+            f"Augmented matrix SVD complete. Singular values range: "
+            f"[{float(singular_values[-1]):.2e}, {float(singular_values[0]):.2e}]"
+        )
+        # The U matrix from this method is not returned directly but is used
+        # to ensure the decomposition is valid. The final transform will still
+        # be X @ V.T.
+        return U, singular_values, V_transpose
+
+    def fit(self, X: csr_matrix, y=None) -> 'GPUTruncatedSVD':
         """
-        Compute singular value decomposition on the sparse matrix.
-        
-        This method decomposes the input matrix X into three matrices:
-        X ≈ U * S * V^T, where U and V are orthogonal and S is diagonal.
-        
+        Fit the model to the data X.
+
+        This is a convenience method that calls fit_transform and discards the
+        transformed matrix, returning the fitted estimator.
+
         Args:
-            sparse_matrix_csr: Input data as a CuPy CSR sparse matrix
-                              with shape (n_samples, n_features)
-        
+            X: Input data as a CuPy CSR sparse matrix.
+            y: Ignored. Present for API compatibility.
+
         Returns:
-            Self (fitted GPUTruncatedSVD instance)
-            
-        Raises:
-            ValueError: If n_components >= min(n_samples, n_features)
+            The fitted GPUTruncatedSVD instance.
         """
-        n_samples, n_features = sparse_matrix_csr.shape
-        
-        # Validate n_components
+        self.fit_transform(X)
+        return self
+
+    def fit_transform(self, X: csr_matrix, y=None) -> cupy.ndarray:
+        """
+        Fit the model and transform data to a lower-dimensional space.
+
+        This method centralizes the SVD computation. It decomposes the input
+        matrix X, stores the components, and returns the transformed data.
+
+        Args:
+            X: Input sparse matrix with shape (n_samples, n_features).
+            y: Ignored. Present for API compatibility.
+
+        Returns:
+            Dense array of transformed data with shape (n_samples, n_components).
+        """
+        logger.debug("Starting fit_transform on sparse matrix.")
+        prepared_matrix = self._prepare_input_matrix(X)
+        n_samples, n_features = prepared_matrix.shape
+
         max_components = min(n_samples, n_features) - 1
-        if self.n_components >= max_components:
+        if self.n_components > max_components:
             raise ValueError(
-                f"n_components ({self.n_components}) must be < "
+                f"n_components ({self.n_components}) must be <= "
                 f"min(n_samples, n_features) - 1 = {max_components}"
             )
-        
+
         logger.info(
-            f"Fitting GPUTruncatedSVD on sparse matrix with shape {sparse_matrix_csr.shape}, "
-            f"density={sparse_matrix_csr.nnz / (n_samples * n_features):.4f}"
+            f"Fitting GPUTruncatedSVD on sparse matrix with shape {prepared_matrix.shape}, "
+            f"density={prepared_matrix.nnz / (n_samples * n_features):.4f}"
         )
 
-        # --- Total variance of X (calculated efficiently for sparse matrices) ---
-        # Frobenius norm squared: sum of squares of all non-zero entries
-        sum_sq = float((sparse_matrix_csr.multiply(sparse_matrix_csr)).sum())
-
-        # Column means vector μ (length = n_features)
-        col_sum = sparse_matrix_csr.sum(axis=0)
-        mu = cupy.asarray(col_sum).ravel().astype(cupy.float64, copy=False) / float(n_samples)
-
-        # Squared L2 norm of the mean vector: ||μ||^2
-        mu_sq_norm = float(cupy.inner(mu, mu))
-
-        # Total variance = (||X||_F^2 - n * ||μ||^2) / (n - 1)
-        numerator = sum_sq - n_samples * mu_sq_norm
-        numerator = max(numerator, 0.0) # Guard against tiny negative from roundoff
-        total_variance = numerator / max(n_samples - 1, 1)
-        
-        # Perform sparse SVD using ARPACK solver
-        # Note: cupyx.scipy.sparse.linalg.svds is deterministic (no random_state needed)
-        _, singular_values, V_transpose = svds(
-            sparse_matrix_csr,
-            k=self.n_components,
-            return_singular_vectors=True,
-            **self.svds_kwargs
-        )
-        
-        # If the solver fails to converge, it may return zeros instead of raising
-        # an error. We check for this explicitly and use the stable fallback method if needed.
-        if cupy.all(singular_values == 0):
+        try:
+            U, s, V_T = svds(
+                prepared_matrix,
+                k=self.n_components,
+                return_singular_vectors=True,
+                **self.svds_kwargs
+            )
+            # Check for svds convergence failure (often returns zeros)
+            if cupy.all(s == 0):
+                raise RuntimeError("svds solver failed to converge (returned all zeros).")
+        except Exception as e:
+            logger.warning(f"Standard svds failed: {e}. Attempting fallback.")
             fallback_maxiter = min(n_samples * 10, 50_000)
-            _, singular_values, V_transpose = self._eigsh_augmented_tsvd(
-                sparse_matrix_csr,
+            U, s, V_T = self._eigsh_augmented_tsvd(
+                prepared_matrix,
                 n_components=self.n_components,
                 tol=self.svds_kwargs.get('tol', 1.0e-8),
                 maxiter=self.svds_kwargs.get('maxiter', fallback_maxiter),
                 ncv=self.svds_kwargs.get('ncv')
             )
 
-        # Sort singular values in descending order (svds doesn't guarantee order)
-        # Guard small values with float64
-        sorted_values = cupy.asarray(singular_values, dtype=cupy.float64)
-        sorted_values = cupy.abs(sorted_values)
-        descending_indices = cupy.argsort(sorted_values)[::-1]
+        # Sort results in descending order of singular values
+        descending_indices = cupy.argsort(s)[::-1]
+        self.singular_values_ = s[descending_indices]
+        self.components_ = V_T[descending_indices, :]
+        U_sorted = U[:, descending_indices]
+
+        # --- Calculate Explained Variance ---
+        # This is the mathematically correct way to calculate total variance for
+        # a data matrix, accounting for the mean of each feature.
+        sum_sq = float((prepared_matrix.data ** 2).sum())
+        col_sum = prepared_matrix.sum(axis=0)
+        mu = cupy.asarray(col_sum).ravel().astype(cupy.float64, copy=False) / float(n_samples)
+        mu_sq_norm = float(cupy.inner(mu, mu))
         
-        self.singular_values_ = sorted_values[descending_indices]
-        self.components_ = V_transpose[descending_indices, :]
+        numerator = sum_sq - n_samples * mu_sq_norm
+        numerator = max(numerator, 0.0) # Guard against floating point inaccuracies
+        total_variance = numerator / max(n_samples - 1, 1)
         
-        # Calculate explained variance (singular values squared, normalized by n_samples)
         self.explained_variance_ = (self.singular_values_ ** 2) / max(n_samples - 1, 1)
         
-        # Calculate explained variance ratio
-        eps = 1e-18 # Guard for division by zero
+        eps = 1e-18
         if total_variance > eps:
             self.explained_variance_ratio_ = self.explained_variance_ / total_variance
         else:
             self.explained_variance_ratio_ = cupy.zeros_like(self.explained_variance_)
-        
-        # Log summary statistics
+
         cumulative_variance = float(cupy.sum(self.explained_variance_ratio_))
         logger.info(
             f"GPUTruncatedSVD fit complete. "
             f"Top singular value: {float(self.singular_values_[0]):.6e}, "
-            f"Explained variance ratio: {cumulative_variance:.4f}"
+            f"Total explained variance: {cumulative_variance:.4f}"
         )
-        
         if cumulative_variance < 0.8:
             logger.warning(
                 f"Only {cumulative_variance:.2%} of variance explained. "
-                f"Consider increasing n_components (current: {self.n_components})"
+                f"Consider increasing n_components (current: {self.n_components})."
             )
-        
-        return self
 
-    def fit_transform(self, sparse_matrix_csr: cupy.sparse.csr_matrix) -> cupy.ndarray:
-        """
-        Fit the model and transform data to lower-dimensional space.
-        
-        This is a convenience method that combines fit() and transform()
-        in a single call, which can be more efficient than calling them separately.
-        
-        Args:
-            sparse_matrix_csr: Input sparse matrix with shape (n_samples, n_features)
-        
-        Returns:
-            Dense array of transformed data with shape (n_samples, n_components) of dtype cupy.float64
-        """
-        logger.debug("Starting fit_transform on sparse matrix")
-
-        prepared_matrix = self._prepare_input_matrix(sparse_matrix_csr)
-        
-        # Fit the model
-        self.fit(prepared_matrix)
-        
-        # Transform the data: Z = X * V (where V = components_.T)
-        # This projects the original data onto the principal components
-        transformed_matrix = prepared_matrix @ self.components_.T
+        # The transformed matrix is U * Sigma
+        transformed_matrix = U_sorted * self.singular_values_
         
         logger.debug(
             f"fit_transform complete. Output shape: {transformed_matrix.shape}, "
             f"dtype: {transformed_matrix.dtype}"
         )
-        
         return transformed_matrix
 
-    def transform(self, sparse_matrix_csr: cupy.sparse.csr_matrix) -> cupy.ndarray:
+    def transform(self, X: csr_matrix) -> cupy.ndarray:
         """
         Transform data using the fitted model.
         
         Projects the input data onto the principal components learned during fit().
         
         Args:
-            sparse_matrix_csr: Input sparse matrix with shape (n_samples, n_features)
-                              Must have the same n_features as the data used in fit()
+            X: Input sparse matrix with shape (n_samples, n_features).
+               Must have the same n_features as the data used in fit().
         
         Returns:
-            Dense array of transformed data with shape (n_samples, n_components)
-            
-        Raises:
-            RuntimeError: If the model hasn't been fitted yet
-            ValueError: If input has wrong number of features
+            Dense array of transformed data with shape (n_samples, n_components).
         """
         if self.components_ is None:
             raise RuntimeError(
-                "GPUTruncatedSVD has not been fitted. "
-                "Call fit() or fit_transform() first."
+                "GPUTruncatedSVD has not been fitted. Call fit() or fit_transform() first."
             )
         
-        _, n_features = sparse_matrix_csr.shape
+        prepared_matrix = self._prepare_input_matrix(X)
+        n_samples, n_features = prepared_matrix.shape
         expected_features = self.components_.shape[1]
         
         if n_features != expected_features:
             raise ValueError(
                 f"Input has {n_features} features, but GPUTruncatedSVD "
-                f"was fitted with {expected_features} features"
+                f"was fitted with {expected_features} features."
             )
-        
-        prepared_matrix = self._prepare_input_matrix(sparse_matrix_csr)
 
-        logger.debug(
-            f"Transforming sparse matrix with shape {prepared_matrix.shape}"
-        )
+        logger.debug(f"Transforming sparse matrix with shape {prepared_matrix.shape}")
         
-        # Project data onto principal components
+        # Project data onto principal components: X @ V
         transformed_matrix = prepared_matrix @ self.components_.T
         
         return transformed_matrix
     
-    def get_params(self) -> dict:
+    def get_params(self, deep: bool = True) -> dict:
         """
         Get parameters for this estimator.
         
         Returns:
-            Dictionary of parameter names to values
+            Dictionary of parameter names to values.
         """
-        params = {
-            'n_components': self.n_components,
-            **self.svds_kwargs
-        }
-        return params
+        return {'n_components': self.n_components, **self.svds_kwargs}
     
     def set_params(self, **params) -> 'GPUTruncatedSVD':
         """
         Set parameters for this estimator.
         
         Args:
-            **params: Parameter names and values
+            **params: Parameter names and values.
             
         Returns:
-            Self
+            self
         """
-        if 'n_components' in params:
-            self.n_components = params.pop('n_components')
-        
-        # Remaining params go to svds_kwargs
-        self.svds_kwargs.update(params)
-        
+        for key, value in params.items():
+            if key == 'n_components':
+                self.n_components = value
+            else:
+                self.svds_kwargs[key] = value
         return self
