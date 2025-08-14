@@ -145,25 +145,26 @@ class GPUTruncatedSVD:
         X_norm = sparse_matrix.copy()
         
         # Compute row norms
-        row_norms_sq = cupy.asarray(X_norm.power(2).sum(axis=1)).ravel()
+        row_norms_sq = X_norm.power(2).sum(axis=1).ravel()
         row_norms = cupy.sqrt(row_norms_sq)
         
         # Find rows with non-zero norm (use small epsilon for numerical safety)
-        eps = 1.0e-12
-        nonzero_mask = row_norms > eps
-        
-        if not cupy.any(nonzero_mask):
-            raise ValueError("All rows have zero norm - cannot proceed with SVD")
-        
-        # Apply row normalization
-        scale_factors = cupy.zeros(n_samples, dtype=dtype)
-        scale_factors[nonzero_mask] = 1.0 / row_norms[nonzero_mask]
+        # 0 for rows with ‖x‖ ≤ eps, 1/‖x‖ for rows with ‖x‖ > eps
+        eps = 1e-12
+        scale_factors = cupy.where(row_norms > eps, 1.0 / row_norms, 0.0)
         
         # Apply scaling to sparse matrix data via CSR structure
-        row_indices = cupy.repeat(cupy.arange(n_samples), cupy.diff(X_norm.indptr))
-        X_norm.data *= scale_factors[row_indices]
+        num_non_zeros = X_norm.nnz
+        # For each nonzero position j (0..nnz-1), find its row r such that indptr[r] <= j < indptr[r+1]
+        data_row_ids = cupy.searchsorted(
+            X_norm.indptr, 
+            cupy.arange(num_non_zeros, dtype=X_norm.indptr.dtype), 
+            side="right"
+        ) - 1
+        # Scale: X_norm.data[j] *= scale_factors[data_row_ids[j]]
+        cupy.multiply(X_norm.data, scale_factors[data_row_ids], out=X_norm.data)
         
-        logger.debug(f"Row-normalized matrix: {cupy.sum(nonzero_mask)}/{n_samples} non-zero rows")
+        logger.debug(f"Row-normalized matrix: {int(cupy.sum(row_norms > eps))}/{n_samples} non-zero rows")
         
         # === Step 3: Global scaling by α = 1/‖X‖_F (always applied) ===
         frobenius_norm_sq = float((X_norm.data ** 2).sum())
@@ -174,7 +175,7 @@ class GPUTruncatedSVD:
         alpha = 1.0 / frobenius_norm
         
         # Apply global scaling
-        X_norm.data *= alpha
+        scaled_matrix = X_norm * alpha
         
         logger.debug(f"Applied global scaling α = {alpha:.2e} (‖X‖_F = {frobenius_norm:.2e})")
         
@@ -195,8 +196,8 @@ class GPUTruncatedSVD:
             v_lower = v[n_samples:]
             
             # Exact block matrix multiplication (no regularization!)
-            result_upper = X_norm @ v_lower       # αX @ v_lower
-            result_lower = X_norm.T @ v_upper     # αXᵀ @ v_upper
+            result_upper = scaled_matrix @ v_lower       # αX @ v_lower
+            result_lower = scaled_matrix.T @ v_upper     # αXᵀ @ v_upper
             
             result = cupy.concatenate([result_upper, result_lower])
             
