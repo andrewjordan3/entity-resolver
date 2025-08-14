@@ -65,6 +65,14 @@ class GPUTruncatedSVD:
             f"svds_kwargs={svds_kwargs}"
         )
 
+    def _ensure_finite(self, array: cupy.ndarray, context: str):
+        """Checks if all elements in a CuPy array are finite, raising an error if not."""
+        if not cupy.isfinite(array).all():
+            raise FloatingPointError(
+                f"Non-finite (NaN or Inf) values detected in '{context}'."
+            )
+        logger.debug(f"Confirmed all values are finite in '{context}'.")
+
     def _l2_normalize_rows(self, matrix: csr_matrix) -> csr_matrix:
         """
         Applies row-wise L2 normalization to a sparse CSR matrix.
@@ -231,6 +239,63 @@ class GPUTruncatedSVD:
 
         return normalized_matrix, kept_column_indices
 
+    def _run_eigsh_with_restarts(
+        self,
+        augmented_matrix_operator: LinearOperator,
+        n_components: int,
+        n_augmented_dims: int,
+        *,
+        which: str = 'LA',
+        ncv: int = None,
+        tol: float = 1e-8,
+        maxiter: int = 50000,
+        restarts: int = 3,
+        seed: int = 0,
+        dtype: cupy.dtype = cupy.float64
+    ) -> Tuple[cupy.ndarray, cupy.ndarray]:
+        """Run eigsh with safe restarts if the Lanczos algorithm breaks down."""
+
+        random_state = cupy.random.RandomState(seed)
+
+        def make_initial_vector():
+            """Build an initial v0 that is not aligned with trivial directions."""
+            initial_vector = random_state.standard_normal(n_augmented_dims, dtype=dtype)
+            # Orthogonalize against all-ones to avoid an easy pathology
+            ones = cupy.ones(n_augmented_dims, dtype=dtype) / cupy.sqrt(n_augmented_dims)
+            projection = (initial_vector @ ones).item()
+            initial_vector = initial_vector - projection * ones
+            norm = cupy.linalg.norm(initial_vector)
+            return initial_vector / (norm if norm > 0 else 1.0)
+
+        attempt = 0
+        current_ncv = ncv
+        current_tol = tol
+        current_maxiter = maxiter
+        last_error = None
+
+        while attempt < restarts:
+            try:
+                initial_vector = make_initial_vector()
+                eigenvalues, eigenvectors = eigsh(
+                    augmented_matrix_operator, k=n_components, which=which,
+                    ncv=current_ncv, tol=current_tol, maxiter=current_maxiter,
+                    return_eigenvectors=True, v0=initial_vector
+                )
+                return eigenvalues, eigenvectors
+            except FloatingPointError as e:
+                last_error = e
+                attempt += 1
+                # Gentle tweaks: reduce ncv, relax tol, give more iterations
+                current_ncv = min(max(n_components + 2, int(0.9 * current_ncv)), n_augmented_dims - 1)
+                current_tol = max(current_tol, 1e-7)  # Don’t go *tighter* on restart
+                current_maxiter = int(current_maxiter * 1.5)
+                logger.warning(
+                    f"eigsh breakdown (attempt {attempt}/{restarts}): {e}. "
+                    f"Restarting with ncv={current_ncv}, tol={current_tol}, maxiter={current_maxiter}."
+                )
+        # If we get here, all restarts failed
+        raise RuntimeError(f"eigsh failed after {restarts} restarts") from last_error
+
     def _eigsh_augmented_tsvd(
         self,
         sparse_matrix: csr_matrix,
@@ -293,12 +358,15 @@ class GPUTruncatedSVD:
                 # Re-normalize rows to restore unit length (spherical geometry)
                 processed_matrix = self._l2_normalize_rows(processed_matrix)
 
+        self._ensure_finite(processed_matrix.data, "processed_matrix after winsorizing")
+
         # Step 2: Global Scaling by Frobenius norm
         frobenius_norm_sq = float((processed_matrix.data ** 2).sum())
         if frobenius_norm_sq <= 1e-12:
             raise ValueError("Matrix has zero Frobenius norm after processing.")
         alpha = 1.0 / cupy.sqrt(frobenius_norm_sq)
         scaled_matrix = processed_matrix * alpha
+        self._ensure_finite(scaled_matrix.data, "scaled_matrix after global scaling")
         logger.debug(f"Applied global scaling alpha = {alpha:.2e}.")
 
         # Step 3: Define Augmented Matrix Operator
@@ -323,15 +391,14 @@ class GPUTruncatedSVD:
             ncv = min(max_ncv, desired_ncv)
         logger.debug(f"Using ncv={ncv} for augmented matrix eigsh.")
 
-        rs = cupy.random.RandomState(0)
-        v0 = rs.standard_normal(n_aug, dtype=dtype)
-        v0 /= cupy.linalg.norm(v0)
-
         try:
-            eigenvalues, eigenvectors = eigsh(
-                augmented_operator, k=n_components, which='LA',
-                ncv=ncv, tol=tol, maxiter=maxiter,
-                return_eigenvectors=True, v0=v0
+            eigenvalues, eigenvectors = self._run_eigsh_with_restarts(
+                augmented_matrix_operator=augmented_operator,
+                n_components=n_components,
+                n_augmented_dims=n_aug,
+                ncv=ncv,
+                tol=tol,
+                maxiter=maxiter
             )
         except (FloatingPointError, Exception) as e:
             logger.error(f"eigsh fallback failed with error: {e}", exc_info=True)
