@@ -110,7 +110,7 @@ class GPUTruncatedSVD:
             scale_factors[data_row_ids], 
             out=normalized_matrix.data
         )
-        self._ensure_finite(normalized_matrix, "L2 Normalized Rows")
+        self._ensure_finite(normalized_matrix.data, "L2 Normalized Rows")
         
         logger.debug(
             f"Row-normalized matrix: {int(cupy.sum(row_norms > eps))}/{matrix.shape[0]} "
