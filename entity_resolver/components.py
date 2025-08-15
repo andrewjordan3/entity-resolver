@@ -59,6 +59,7 @@ class GPUTruncatedSVD:
         self.singular_values_ = None  # Top k singular values
         self.explained_variance_ = None  # Variance explained by each component
         self.explained_variance_ratio_ = None  # Relative variance explained
+        self._target_matrix = None # To get attributes for variance calculations
         
         logger.debug(
             f"Initialized GPUTruncatedSVD with n_components={n_components}, "
@@ -392,6 +393,10 @@ class GPUTruncatedSVD:
 
         # Step 1: Prune and Normalize the Matrix for stability
         processed_matrix, kept_column_indices = self._prune_and_normalize_matrix(sparse_matrix)
+
+        # Store processed matrix for variance calculations
+        self._target_matrix = processed_matrix
+
         n_samples, n_features_pruned = processed_matrix.shape
         n_aug = n_samples + n_features_pruned
 
@@ -481,10 +486,12 @@ class GPUTruncatedSVD:
         if not cupy.isfinite(eigenvalues).all() or not cupy.isfinite(eigenvectors).all():
             raise RuntimeError("eigsh fallback returned non-finite (NaN or Inf) eigenpairs.")
 
+        eigenvalues = cupy.maximum(eigenvalues, 0.0)
         descending_indices = cupy.argsort(eigenvalues)[::-1]
         eigenvalues = eigenvalues[descending_indices]
         eigenvectors = eigenvectors[:, descending_indices]
         
+        # Reverse the scaling procedure
         singular_values = eigenvalues / alpha
 
         V_pruned = eigenvectors[n_samples:, :]
@@ -541,6 +548,10 @@ class GPUTruncatedSVD:
         """
         logger.debug("Starting fit_transform on sparse matrix.")
         prepared_matrix = self._prepare_input_matrix(X)
+
+        # Store processed matrix for variance calculations
+        self._target_matrix = prepared_matrix
+
         n_samples, n_features = prepared_matrix.shape
 
         max_components = min(n_samples, n_features) - 1
@@ -585,8 +596,8 @@ class GPUTruncatedSVD:
         # --- Calculate Explained Variance ---
         # This is the mathematically correct way to calculate total variance for
         # a data matrix, accounting for the mean of each feature.
-        sum_sq = float((prepared_matrix.data ** 2).sum())
-        col_sum = prepared_matrix.sum(axis=0)
+        sum_sq = float((self._target_matrix.data ** 2).sum())
+        col_sum = self._target_matrix.sum(axis=0)
         mu = cupy.asarray(col_sum).ravel().astype(cupy.float64, copy=False) / float(n_samples)
         mu_sq_norm = float(cupy.inner(mu, mu))
         

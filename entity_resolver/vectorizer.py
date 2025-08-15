@@ -199,7 +199,7 @@ class MultiStreamVectorizer:
         # Optionally append normalized address for richer context
         if self.config.use_address_in_encoding and 'addr_normalized_key' in gdf.columns:
             logger.debug("Appending normalized address to base text")
-            address_text = gdf['addr_normalized_key'].fillna('').astype(str)
+            address_text = gdf['addr_normalized_key'].fillna('').astype(str).str.replace(r'\d', '', regex=True)
             base_text = base_text + ' ' + address_text
             
             # Count how many records have address information
