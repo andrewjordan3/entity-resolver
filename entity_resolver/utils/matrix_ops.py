@@ -1,4 +1,24 @@
 # entity_resolver/utils/matrix_ops.py
+"""
+GPU-Accelerated Utility Functions for Dense and Sparse Matrix Operations.
+
+This module provides a collection of stateless, reusable utility functions for
+cleaning, normalizing, and conditioning CuPy matrices. These operations are
+fundamental pre-processing steps for numerical algorithms, particularly for
+improving the stability and performance of iterative solvers used in machine
+learning components like Singular Value Decomposition (SVD).
+
+The functions are designed to handle both dense `cupy.ndarray` and sparse
+`cupyx.scipy.sparse` matrices efficiently, performing all computations on the
+GPU. They serve as the core building blocks for the pre-processing pipelines
+in the entity resolution components.
+
+Key Functions:
+- ensure_finite_matrix: Validates and optionally cleans NaN/Inf values.
+- winsorize_matrix: Clips matrix values at specified quantiles to handle outliers.
+- scale_by_frobenius_norm: Normalizes the entire matrix to have a unit norm.
+- prune_sparse_matrix: Removes uninformative rows and columns to improve stability.
+"""
 
 import cupy
 import cupyx.scipy.sparse as cpx_sparse
