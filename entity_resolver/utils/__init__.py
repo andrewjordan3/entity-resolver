@@ -46,7 +46,8 @@ from .vector import (
     center_kernel_matrix,
     center_kernel_vector,
     get_top_k_positive_eigenpairs,
-    create_consensus_embedding
+    create_consensus_embedding,
+    create_initial_vector
 )
 
 # Graph operations
@@ -66,6 +67,14 @@ from .clustering import (
 from .validation import (
     validate_no_duplicates,
     validate_canonical_consistency
+)
+
+# Matrix operations
+from .matrix_ops import (
+    ensure_finite_matrix,
+    winsorize_matrix,
+    scale_by_frobenius_norm,
+    prune_sparse_matrix
 )
 
 # The public API of the 'utils' package.
@@ -90,6 +99,7 @@ __all__ = [
     'center_kernel_vector',
     'get_top_k_positive_eigenpairs',
     'create_consensus_embedding',
+    'create_initial_vector',
 
     # graph.py
     'create_edge_list',
@@ -102,5 +112,11 @@ __all__ = [
 
     # validation.py
     'validate_no_duplicates',
-    'validate_canonical_consistency'
+    'validate_canonical_consistency',
+
+    # matrix_ops.py
+    'ensure_finite_matrix',
+    'winsorize_matrix',
+    'scale_by_frobenius_norm',
+    'prune_sparse_matrix'
 ]
