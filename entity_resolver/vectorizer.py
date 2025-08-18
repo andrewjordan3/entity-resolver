@@ -369,15 +369,6 @@ class MultiStreamVectorizer:
             # Configure and fit new TF-IDF vectorizer
             tfidf_params = self.config.tfidf_params.copy()
             
-            # Safely get the dtype string, defaulting to 'float64' if not provided.
-            dtype_str = tfidf_params.get('dtype', 'float64')
-            
-            # Convert the string into the actual cupy type
-            if dtype_str == 'float64':
-                tfidf_params['dtype'] = cupy.float64
-            elif dtype_str == 'float32':
-                tfidf_params['dtype'] = cupy.float32
-            
             logger.debug(f"Fitting TF-IDF with params: {tfidf_params}")
             model = TfidfVectorizer(**tfidf_params)
             sparse_vectors = model.fit_transform(text_series)
@@ -624,7 +615,7 @@ class MultiStreamVectorizer:
         
         if is_training:
             logger.debug(f"Fitting TruncatedSVD for '{stream_name}' with params: {svd_params}")
-            svd_model = GPUTruncatedSVD(**svd_params)
+            svd_model = GPUTruncatedSVD(self.config.eigsh_fallback_params, **svd_params)
             dense_vectors = svd_model.fit_transform(sparse_vectors)
             self.reduction_models[svd_key] = svd_model
             

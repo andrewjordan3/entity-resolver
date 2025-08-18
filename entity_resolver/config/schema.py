@@ -18,8 +18,81 @@ of the entity resolution process, creating a single source of truth for all para
 """
 
 from pathlib import Path
-from typing import List, Dict, Set, Any, Optional, Literal, Union
+from typing import List, Dict, Set, Any, Optional, Literal, Union, Tuple
 from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
+import cupy
+
+class SvdEigshFallbackConfig(BaseModel):
+    """Parameters for the robust SVD fallback mechanism."""
+    # No arbitrary types allowed; all fields must be serializable.
+    model_config = ConfigDict(extra='forbid')
+
+    fallback_dtype: Any = Field(
+        default="float64",
+        description="String name of the CuPy dtype for the eigsh solver ('float64' is recommended for stability)."
+    )
+    eigsh_restarts: int = Field(
+        default=3,
+        ge=0,
+        description="Number of times to restart the eigsh solver on failure before raising an error."
+    )
+    prune_min_row_sum: float = Field(
+        default=1e-9,
+        ge=0.0,
+        description="Rows with a total sum of values less than this threshold will be removed before SVD."
+    )
+    prune_min_df: int = Field(
+        default=2,
+        ge=1,
+        description="Columns that appear in fewer than `min_df` documents (rows) will be removed."
+    )
+    prune_max_df_ratio: float = Field(
+        default=0.98,
+        gt=0.0,
+        le=1.0,
+        description="Columns that appear in more than `max_df_ratio * n_rows` documents will be removed."
+    )
+    prune_energy_cutoff: float = Field(
+        default=0.995,
+        gt=0.0,
+        le=1.0,
+        description="Keeps the smallest set of columns whose cumulative energy exceeds this ratio of the total."
+    )
+    winsorize_limits: Tuple[Optional[float], Optional[float]] = Field(
+        default=(None, 0.999),
+        description="Quantile limits for clipping extreme values. Use None to disable a limit on one side."
+    )
+
+    @field_validator('fallback_dtype', mode='before')
+    @classmethod
+    def validate_dtype_string(cls, v: Any) -> str:
+        """Ensures the input is a string and represents a valid CuPy dtype name."""
+        if not isinstance(v, str):
+            raise TypeError("fallback_dtype must be provided as a string (e.g., 'float64').")
+        try:
+            cupy.dtype(v)
+        except TypeError:
+            raise ValueError(f"'{v}' is not a valid cupy dtype name.")
+        return v
+
+    @field_validator('fallback_dtype', mode='after')
+    @classmethod
+    def convert_string_to_dtype(cls, v: str) -> Any:
+        """Converts the validated string into a cupy.dtype object."""
+        return cupy.dtype(v)
+
+    @field_validator('winsorize_limits')
+    @classmethod
+    def validate_winsorize_limits(cls, v: Tuple[Optional[float], Optional[float]]) -> Tuple[Optional[float], Optional[float]]:
+        """Validates the winsorize limits tuple."""
+        lower, upper = v
+        if lower is not None and not (0.0 <= lower <= 1.0):
+            raise ValueError(f"Lower winsorize limit must be between 0.0 and 1.0, got {lower}")
+        if upper is not None and not (0.0 <= upper <= 1.0):
+            raise ValueError(f"Upper winsorize limit must be between 0.0 and 1.0, got {upper}")
+        if lower is not None and upper is not None and lower >= upper:
+            raise ValueError(f"Lower limit ({lower}) cannot be >= upper limit ({upper})")
+        return v
 
 # === Core Data and I/O Configurations ===
 
@@ -427,6 +500,12 @@ class VectorizerConfig(BaseModel):
         )
     )
 
+    # === SVD Eigsh Fallback Configuration ===
+    eigsh_fallback_params: SvdEigshFallbackConfig = Field(
+        default_factory=SvdEigshFallbackConfig,
+        description="Parameters for the robust SVD fallback mechanism used when the standard solver fails."
+    )
+
     @field_validator('stream_proportions')
     @classmethod
     def validate_proportions_sum(cls, v: Dict[str, float]) -> Dict[str, float]:
@@ -437,6 +516,28 @@ class VectorizerConfig(BaseModel):
                 f"stream_proportions must sum to 1.0, but got {total:.6f}. "
                 f"Current values: {v}"
             )
+        return v
+    
+    @field_validator('tfidf_params', mode='before')
+    @classmethod
+    def validate_tfidf_dtype_string(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        """Validates that the dtype in tfidf_params is a valid string."""
+        if 'dtype' in v:
+            dtype_str = v['dtype']
+            if not isinstance(dtype_str, str):
+                raise TypeError(f"tfidf_params['dtype'] must be a string, but got {type(dtype_str)}")
+            try:
+                cupy.dtype(dtype_str)
+            except TypeError:
+                raise ValueError(f"'{dtype_str}' is not a valid cupy dtype name for tfidf_params.")
+        return v
+
+    @field_validator('tfidf_params', mode='after')
+    @classmethod
+    def convert_tfidf_dtype(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        """Converts the validated dtype string in tfidf_params to a cupy.dtype object."""
+        if 'dtype' in v:
+            v['dtype'] = cupy.dtype(v['dtype'])
         return v
 
 

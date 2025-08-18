@@ -7,12 +7,11 @@ that are optimized for GPU execution and sparse matrix operations.
 """
 
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union, Tuple
 
 import cupy
-from cupyx.scipy.sparse import csr_matrix
+from cupyx.scipy.sparse import csr_matrix, spmatrix, cpx_sparse
 from cupyx.scipy.sparse.linalg import svds, eigsh, LinearOperator
-import cupyx.scipy.sparse as cpx_sparse
 
 from .utils import (
     normalize_rows,
@@ -60,13 +59,29 @@ class GPUTruncatedSVD:
             computed components.
     """
 
-    def __init__(self, n_components: int = 256, **svds_kwargs: Any):
+    # --- Model State (populated during fit) ---
+    # Type hints for attributes that will be populated by fit()
+    components_: Optional[cupy.ndarray] = None
+    singular_values_: Optional[cupy.ndarray] = None
+    explained_variance_: Optional[cupy.ndarray] = None
+    explained_variance_ratio_: Optional[cupy.ndarray] = None
+    total_variance_: Optional[float] = None
+    true_explained_variance_ratio_: Optional[float] = None
+
+    def __init__(
+            self, 
+            n_components: int = 256, 
+            fallback_config: Optional[Dict[str, Any]] = None, 
+            **svds_kwargs: Any
+        ):
         """
         Initialize the GPUTruncatedSVD transformer.
 
         Args:
             n_components:
                 The target number of dimensions for the output (the 'k' in SVD).
+            fallback_config:
+                A dictionary of parameters to control the robust SVD fallback mechanism.
             **svds_kwargs:
                 Additional keyword arguments to pass to the primary `svds` solver.
                 Common arguments include 'tol' for tolerance and 'maxiter' for
@@ -75,27 +90,28 @@ class GPUTruncatedSVD:
         self.n_components = n_components
         self.svds_kwargs = svds_kwargs
 
+        # Ensure fallback_config is a dict to prevent errors on .get() if it's None
+        safe_fallback_config = fallback_config or {}
+
         # --- Solver & Pre-processing Parameters ---
-        # These attributes control the behavior of the robust fallback path. They are
-        # defined here for clarity, easy modification, and future configuration.
-        self.fallback_dtype = cupy.float64      # Use high precision for the stable solver.
-        self.eigsh_restarts = 3                 # Number of times to retry eigsh on failure.
-        self.prune_min_row_sum = 1e-9           # Threshold for removing near-empty rows.
-        self.prune_min_df = 2                   # Min document frequency for column pruning.
-        self.prune_max_df_ratio = 0.98          # Max document frequency ratio for column pruning.
-        self.prune_energy_cutoff = 0.995        # Preserve 99.5% of variance during column pruning.
-        self.winsorize_limits = (None, 0.999)   # Clip top 0.1% of values to handle extreme outliers.
+        # Use .get() to safely retrieve each parameter from the config dictionary,
+        # providing a hardcoded default value if the key is not present.
+        # Use high precision for the stable solver.
+        self.fallback_dtype = safe_fallback_config.get('fallback_dtype', cupy.float64)
+        # Number of times to retry eigsh on failure.
+        self.eigsh_restarts = safe_fallback_config.get('eigsh_restarts', 3)
+        # Threshold for removing near-empty rows.
+        self.prune_min_row_sum = safe_fallback_config.get('prune_min_row_sum', 1e-9)
+        # Min document frequency for column pruning.
+        self.prune_min_df = safe_fallback_config.get('prune_min_df', 2)
+        # Max document frequency ratio for column pruning.
+        self.prune_max_df_ratio = safe_fallback_config.get('prune_max_df_ratio', 0.98)
+        # Preserve 99.5% of variance during column pruning.
+        self.prune_energy_cutoff = safe_fallback_config.get('prune_energy_cutoff', 0.995)
+        # Clip top 0.1% of values to handle extreme outliers.
+        self.winsorize_limits: Tuple[Optional[float], Optional[float]] = safe_fallback_config.get('winsorize_limits', (None, 0.999))  
 
-        # --- Model State (populated during fit) ---
-        # These will be populated by the `fit` or `fit_transform` methods.
-        self.components_ = None
-        self.singular_values_ = None
-        self.explained_variance_ = None
-        self.explained_variance_ratio_ = None
-        self.total_variance_ = None             # For diagnostics: total variance of the decomposed matrix.
-        self.true_explained_variance_ratio_ = None # For diagnostics: ratio of captured vs. total variance.
-
-    def _prepare_input_matrix(self, X: cupy.sparse.spmatrix) -> csr_matrix:
+    def _prepare_input_matrix(self, X: spmatrix) -> csr_matrix:
         """
         Validates, cleans, and standardizes the input sparse matrix.
 
@@ -160,7 +176,7 @@ class GPUTruncatedSVD:
         )
         return {'ncv': new_ncv, 'tol': new_tol, 'maxiter': new_maxiter}
 
-    def fit(self, X: csr_matrix, y: Optional[Any] = None) -> 'GPUTruncatedSVD':
+    def fit(self, X: spmatrix, y: Optional[Any] = None) -> 'GPUTruncatedSVD':
         """
         Fit the model to the data X. This is a convenience method that calls
         `fit_transform` and returns the fitted instance.
@@ -168,7 +184,7 @@ class GPUTruncatedSVD:
         self.fit_transform(X)
         return self
 
-    def fit_transform(self, X: csr_matrix, y: Optional[Any] = None) -> cupy.ndarray:
+    def fit_transform(self, X: spmatrix, y: Optional[Any] = None) -> cupy.ndarray:
         """
         Fit the model to the data and perform dimensionality reduction.
 
@@ -289,7 +305,7 @@ class GPUTruncatedSVD:
 
         return transformed_matrix
 
-    def transform(self, X: csr_matrix) -> cupy.ndarray:
+    def transform(self, X: spmatrix) -> cupy.ndarray:
         """
         Transform a matrix using the fitted SVD components.
 
@@ -299,10 +315,9 @@ class GPUTruncatedSVD:
         if self.components_ is None:
             raise RuntimeError("This SVD instance has not been fitted yet. Call 'fit' or 'fit_transform' first.")
         
+        # Prepare matrix
         # Prepare the matrix for transformation (ensures correct dtype and no NaNs).
-        prepared_matrix = ensure_finite_matrix(X, copy=True)
-        if not cupy.issubdtype(prepared_matrix.dtype, cupy.floating):
-            prepared_matrix = prepared_matrix.astype(self.components_.dtype, copy=False)
+        prepared_matrix = self._prepare_input_matrix(X)
         
         # Validate that the number of features matches the fitted model.
         if prepared_matrix.shape[1] != self.components_.shape[1]:
@@ -312,7 +327,27 @@ class GPUTruncatedSVD:
         # The transformation is a matrix multiplication: X @ V, which is equivalent to X @ (V^T)^T.
         return prepared_matrix @ self.components_.T
 
-    def _calculate_variance_explained(self, original_matrix: csr_matrix, n_samples: int):
+    def reset(self) -> None:
+        """
+        Resets the fitted model state to its initial, unfitted condition.
+
+        This method clears all attributes that are populated during the `fit` or
+        `fit_transform` process, such as the SVD components and singular values.
+        After calling `reset`, the instance is ready to be refitted on new data.
+
+        Note: This method does NOT explicitly free GPU memory. For that, call
+        `cupy.get_default_memory_pool().free_all_blocks()` separately after you
+        are finished with the SVD object and other large CuPy arrays.
+        """
+        self.components_ = None
+        self.singular_values_ = None
+        self.explained_variance_ = None
+        self.explained_variance_ratio_ = None
+        self.total_variance_ = None
+        self.true_explained_variance_ratio_ = None
+        logger.debug("Model state has been reset.")
+
+    def _calculate_variance_explained(self, original_matrix: csr_matrix, n_samples: int) -> None:
         """
         Calculate variance explained by the SVD components.
         
@@ -328,16 +363,19 @@ class GPUTruncatedSVD:
         # Total variance is simply ||X||_F^2 / (n-1)
         # where ||X||_F is the Frobenius norm
         
+        # Safeguard against edge cases
+        n_samples_adjusted = max(n_samples - 1, 1)
+
         # Calculate Frobenius norm squared efficiently for sparse matrix
         frobenius_norm_squared = float((original_matrix.data ** 2).sum())
         
         # Total variance estimate
         # Note: This is the total variance of the matrix we actually decomposed
         # If we pruned columns or normalized, this reflects that processed matrix
-        total_variance = frobenius_norm_squared / max(n_samples - 1, 1)
+        total_variance = frobenius_norm_squared / n_samples_adjusted
         
         # Component variance: s_i^2 / (n-1)
-        self.explained_variance_ = (self.singular_values_ ** 2) / max(n_samples - 1, 1)
+        self.explained_variance_ = (self.singular_values_ ** 2) / n_samples_adjusted
         
         # For Truncated SVD, we can only explain variance up to the sum of
         # the k singular values we computed. The true total variance would require

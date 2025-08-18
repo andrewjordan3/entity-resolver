@@ -128,6 +128,17 @@ vectorizer:
   phonetic_pca_params:
     n_components: 256
 
+  # --- SVD Eigsh Fallback Configuration ---
+  # Parameters for the robust SVD fallback mechanism used when the standard solver fails.
+  eigsh_fallback_params:
+    fallback_dtype: 'float64'
+    eigsh_restarts: 3
+    prune_min_row_sum: 1.0e-9
+    prune_min_df: 2
+    prune_max_df_ratio: 0.98
+    prune_energy_cutoff: 0.995
+    winsorize_limits: [null, 0.999]
+
   # --- Stream Balancing ---
   # Defines the desired final variance contribution of each stream. Must sum to 1.0.
   stream_proportions:

@@ -7,6 +7,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import cupy
+
 import yaml
 from pydantic import ValidationError
 
@@ -92,6 +94,34 @@ def load_config(config_path: Optional[Path | str] = None) -> ResolverConfig:
     # Always validate the loaded data and return a ResolverConfig object.
     return _validate_and_create_config(user_config_data)
 
+def _prepare_config_for_saving(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Recursively converts non-serializable objects in a config dict to strings.
+
+    This helper traverses the configuration dictionary and specifically looks for
+    `cupy.dtype` objects, converting them to their string names (e.g., 'float64')
+    to ensure the entire configuration can be safely written to YAML.
+
+    Args:
+        data: The configuration dictionary from `model_dump`.
+
+    Returns:
+        A deep copy of the dictionary with all `cupy.dtype` objects
+        converted to strings.
+    """
+    # Create a copy to avoid modifying the original dictionary in place.
+    serializable_data = {}
+    for key, value in data.items():
+        if isinstance(value, dict):
+            # Recurse into nested dictionaries.
+            serializable_data[key] = _prepare_config_for_saving(value)
+        elif isinstance(value, cupy.dtype):
+            # Convert cupy.dtype object to its string name.
+            serializable_data[key] = value.name
+        else:
+            # Keep all other serializable types as they are.
+            serializable_data[key] = value
+    return serializable_data
 
 def save_config(config: ResolverConfig, path: Path | str) -> None:
     """
@@ -115,10 +145,13 @@ def save_config(config: ResolverConfig, path: Path | str) -> None:
     # `_log_level_int` field as it's a derived value not meant for user config.
     config_dict = config.model_dump(exclude={'_log_level_int'})
 
+    # Convert any non-serializable objects (e.g., cupy.dtype) to strings.
+    serializable_config_dict = _prepare_config_for_saving(config_dict)
+
     logger.info(f"Saving configuration to: {output_path}")
     with open(output_path, 'w') as f:
         yaml.safe_dump(
-            config_dict,
+            serializable_config_dict,
             f,
             default_flow_style=False,
             sort_keys=False,
