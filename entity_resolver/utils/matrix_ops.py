@@ -408,7 +408,7 @@ def prune_sparse_matrix(
     # Find the smallest number of these columns that meet the energy cutoff
     cumulative_energy = cupy.cumsum(energy_in_keepable_cols[order])
     cutoff_point = energy_cutoff_ratio * total_energy_in_subset
-    num_cols_for_cutoff = int(cupy.searchsorted(cumulative_energy, cutoff_point)) + 1
+    num_cols_for_cutoff = int(cupy.searchsorted(cumulative_energy, cupy.asarray(cutoff_point))) + 1
 
     # Final indices are the top-energy columns from the DF-filtered set
     kept_column_indices = df_keepable_cols[order[:num_cols_for_cutoff]]
