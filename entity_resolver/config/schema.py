@@ -1090,55 +1090,6 @@ class ResolverConfig(BaseModel):
             self.clusterer.umap_params["random_state"] = self.random_state
         
         return self
-    
-    @classmethod
-    def from_yaml(cls, path: Union[str, 'Path']) -> 'ResolverConfig':
-        """
-        Load configuration from a YAML file.
-        
-        Args:
-            path: Path to YAML configuration file
-            
-        Returns:
-            Validated ResolverConfig instance
-            
-        Example:
-            config = ResolverConfig.from_yaml('custom_config.yaml')
-        """
-        import yaml
-        from pathlib import Path
-        
-        config_path = Path(path)
-        if not config_path.exists():
-            raise FileNotFoundError(f"Configuration file not found: {config_path}")
-        
-        with open(config_path, 'r') as f:
-            data = yaml.safe_load(f) or {}
-        
-        return cls.model_validate(data)
-    
-    def to_yaml(self, path: Union[str, 'Path']) -> None:
-        """
-        Save configuration to a YAML file.
-        
-        Args:
-            path: Output path for YAML file
-            
-        Example:
-            config.to_yaml('my_config.yaml')
-        """
-        import yaml
-        from pathlib import Path
-        
-        output_path = Path(path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Convert to dict and handle special types
-        config_dict = self.model_dump()
-        
-        with open(output_path, 'w') as f:
-            yaml.safe_dump(config_dict, f, default_flow_style=False, sort_keys=False)
-
 
 # === Public API ===
 __all__ = [
