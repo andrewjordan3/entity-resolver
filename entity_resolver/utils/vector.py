@@ -158,20 +158,17 @@ def normalize_rows(
         logger.debug(f"Sparse path: {n_valid}/{matrix.shape[0]} rows will be normalized; "
                      f"{matrix.shape[0] - n_valid} will be zeroed.")
 
-        # This is the key to efficient row-wise scaling of a CSR matrix.
-        # 1. `cupy.diff(csr_matrix.indptr)` calculates the number of non-zero
-        #    elements in each row. `indptr` stores the cumulative count.
-        row_element_counts = cupy.diff(csr_matrix.indptr)
+        # Apply the scaling to the matrix data using the most efficient GPU-native method.
+        nnz = csr_matrix.data.size
         
-        # 2. `cupy.repeat` expands the `scale_factors` array. Each row's scale
-        #    factor is repeated N times, where N is the number of non-zero
-        #    elements in that row. The result is an array of shape (nnz,).
-        data_scale_factors = cupy.repeat(scale_factors, row_element_counts)
-        
-        # 3. Finally, scale the non-zero data elements directly. This applies
-        #    the correct row-specific scale factor to each element without
-        #    creating any large intermediate matrices.
-        csr_matrix.data *= data_scale_factors
+        # Find the row index for every non-zero element. `indptr` is a sorted
+        # array marking where each row's data begins. `searchsorted` uses this
+        # to efficiently map every element in `.data` back to its original row.
+        row_idx = cupy.searchsorted(csr_matrix.indptr, cupy.arange(nnz), side="right") - 1
+
+        # Use fancy indexing to expand `scale_factors` to match the `.data` array,
+        # then perform a direct element-wise multiplication.
+        csr_matrix.data *= scale_factors[row_idx]
         
         # If a row was scaled by 0.0, its data elements are now zero.
         # `eliminate_zeros()` removes these explicit zeros from the sparse structure.
