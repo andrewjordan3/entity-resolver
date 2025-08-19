@@ -10,7 +10,7 @@ import logging
 from typing import Optional, Dict, Any, Union, Tuple
 
 import cupy
-from cupyx.scipy.sparse import csr_matrix, spmatrix, cpx_sparse
+from cupyx.scipy.sparse import csr_matrix, spmatrix, isspmatrix_csr
 from cupyx.scipy.sparse.linalg import svds, eigsh, LinearOperator
 
 from .utils import (
@@ -133,7 +133,7 @@ class GPUTruncatedSVD:
         clean_matrix = ensure_finite_matrix(X, replace_non_finite=True, copy=True)
         
         # Ensure CSR format for efficient row slicing and matrix multiplication.
-        if not cpx_sparse.isspmatrix_csr(clean_matrix):
+        if not isspmatrix_csr(clean_matrix):
             clean_matrix = clean_matrix.tocsr(copy=False)
             
         # Ensure a floating-point dtype for all subsequent calculations.
