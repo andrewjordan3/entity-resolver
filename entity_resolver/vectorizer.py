@@ -615,7 +615,7 @@ class MultiStreamVectorizer:
         
         if is_training:
             logger.debug(f"Fitting TruncatedSVD for '{stream_name}' with params: {svd_params}")
-            svd_model = GPUTruncatedSVD(self.config.eigsh_fallback_params, **svd_params)
+            svd_model = GPUTruncatedSVD(self.config.eigsh_fallback_params, svd_params)
             dense_vectors = svd_model.fit_transform(sparse_vectors)
             self.reduction_models[svd_key] = svd_model
             

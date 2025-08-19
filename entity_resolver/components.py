@@ -70,9 +70,8 @@ class GPUTruncatedSVD:
 
     def __init__(
             self, 
-            n_components: int = 256, 
             fallback_config: Optional[Dict[str, Any]] = None, 
-            **svds_kwargs: Any
+            svds_kwargs: Optional[Dict[str, Any]] = None
         ):
         """
         Initialize the GPUTruncatedSVD transformer.
@@ -87,8 +86,8 @@ class GPUTruncatedSVD:
                 Common arguments include 'tol' for tolerance and 'maxiter' for
                 maximum iterations.
         """
-        self.n_components = n_components
         self.svds_kwargs = svds_kwargs
+        self.n_components = self.svds_kwargs.pop('n_components', 256)
 
         # Ensure fallback_config is a dict to prevent errors on .get() if it's None
         safe_fallback_config = fallback_config or {}
