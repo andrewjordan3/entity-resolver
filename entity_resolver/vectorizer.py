@@ -179,13 +179,14 @@ class MultiStreamVectorizer:
         )
         
         return gdf, combined_vectors
-    
+
     def _prepare_base_text(self, gdf: cudf.DataFrame) -> cudf.Series:
         """
         Prepare base text for vectorization by combining entity and address data.
 
-        This method creates a unified text representation that can include both
-        the entity name and address information for richer vectorization.
+        This method creates a unified text representation that weights the entity
+        name more heavily by repeating it and adds context tags ([N], [A]) to
+        distinguish between name and address features.
 
         Args:
             gdf: DataFrame containing normalized_text and optionally address columns
@@ -193,21 +194,37 @@ class MultiStreamVectorizer:
         Returns:
             cudf.Series containing prepared text for vectorization
         """
-        # Start with normalized entity text
-        base_text = gdf['normalized_text'].astype(str)
+        # Ensure the base name text is a string
+        name_text = gdf['normalized_text'].astype(str)
+
+        # Create a tagged block for the name and repeat it to increase its weight
+        name_block = "[N] " + name_text + " [/N]"
+        weighted_name = name_block + " " + name_block + " " + name_block
+
+        # Start with the weighted name as the base text
+        base_text = weighted_name
         
-        # Optionally append normalized address for richer context
+        # Optionally append a tagged and normalized address for richer context
         if self.config.use_address_in_encoding and 'addr_normalized_key' in gdf.columns:
-            logger.debug("Appending normalized address to base text")
-            address_text = gdf['addr_normalized_key'].fillna('').astype(str).str.replace(r'\d', '', regex=True)
-            base_text = base_text + ' ' + address_text
+            logger.debug("Appending tagged and normalized address to base text")
             
-            # Count how many records have address information
+            # Clean and prepare the address text
+            address_text = gdf['addr_normalized_key'].fillna('').astype(str)
+            
+            # Create a tagged block for the address
+            address_block = "[A] " + address_text + " [/A]"
+            
+            # Use a non-printable ASCII unit separator for a robust boundary
+            separator = '\x1F' * 8
+            base_text = weighted_name + separator + address_block
+            
+            # Count how many records have non-empty address information
             non_empty_addresses = (address_text != '').sum()
             logger.debug(
                 f"Added address information to {non_empty_addresses:,}/{len(gdf):,} records"
             )
         
+        logger.debug("Prepared base text for %d records", len(gdf))
         return base_text
     
     def _encode_tfidf_stream(

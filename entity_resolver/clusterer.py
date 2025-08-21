@@ -283,9 +283,14 @@ class EntityClusterer:
         logger.info("Running HDBSCAN for core clustering")
         logger.debug(f"HDBSCAN parameters: {self.config.hdbscan_params}")
         
-        # Fit HDBSCAN
-        clusterer = HDBSCAN(**self.config.hdbscan_params)
-        clusterer.fit(reduced_vectors)
+        try:
+            # Fit HDBSCAN
+            clusterer = HDBSCAN(**self.config.hdbscan_params)
+            clusterer.fit(reduced_vectors)
+            
+        except Exception as e:
+            logger.error(f"HDBSCAN failed: {e}")
+            raise RuntimeError(f"HDBSCAN clustering failed: {e}")
         
         # Store fitted model for later use
         self.cluster_model = clusterer
@@ -311,6 +316,7 @@ class EntityClusterer:
                 f"Cluster sizes: min={cluster_sizes.min()}, "
                 f"max={cluster_sizes.max()}, "
                 f"mean={cluster_sizes.mean():.1f}"
+                f"median={cluster_sizes.median():.0f}"
             )
         
         # Warn if noise rate is too high

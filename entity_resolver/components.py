@@ -275,7 +275,7 @@ class GPUTruncatedSVD:
             augmented_matrix_dimension = n_pruned_samples + n_pruned_features
 
             # --- Step 3b: Define the Regularized Augmented Matrix Operator ---
-            alpha_regularization = 1e-3
+            alpha_regularization = 0.01
             regularization_term = self.calculate_initial_regularization(normalized_row_matrix, alpha=alpha_regularization)
 
             # Create a LinearOperator. This object encapsulates the matrix-vector product function.
