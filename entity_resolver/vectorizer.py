@@ -483,9 +483,16 @@ class MultiStreamVectorizer:
             for word in words:
                 if word:  # Skip empty strings
                     try:
-                        phonetic = phonetics.dmetaphone(word)
-                        if phonetic:  # Metaphone can return empty string
-                            phonetic_words.append(phonetic)
+                        # dmetaphone returns a tuple (primary, alternate)
+                        primary, alternate = phonetics.dmetaphone(word)
+                        
+                        # Add the primary code if it exists
+                        if primary:
+                            phonetic_words.append(primary)
+                        
+                        # Add the alternate code if it exists and is different
+                        if alternate and alternate != primary:
+                            phonetic_words.append(alternate)
                     except Exception as e:
                         logger.debug(f"Phonetic conversion failed for '{word}': {e}")
                         # Use original word if phonetic conversion fails

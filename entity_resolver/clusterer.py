@@ -93,9 +93,18 @@ class EntityClusterer:
         """
         Fit clustering models and transform data.
         
+        This method performs the complete training pipeline:
+        1. Ensemble UMAP for robust dimensionality reduction
+        2. HDBSCAN for core density-based clustering
+        3. SNN graph clustering for noise rescue
+        4. Ensemble combination for final cluster assignments
+        
         Args:
-            gdf: Input DataFrame to add cluster labels to
-            vectors: High-dimensional feature vectors to cluster
+            gdf: Input DataFrame to add cluster labels to.
+                 Must not contain 'cluster' or 'cluster_probability' columns.
+            vectors: High-dimensional feature vectors to cluster.
+                    Shape: (n_samples, n_features).
+                    Should be normalized if using cosine similarity.
             
         Returns:
             Tuple of (DataFrame with cluster labels, reduced vectors)
@@ -104,8 +113,9 @@ class EntityClusterer:
             ValueError: If inputs are invalid
             RuntimeError: If clustering fails
         """
-        logger.info(f"Starting fit_transform with {len(gdf):,} records")
+        logger.info(f"Starting fit_transform with {len(gdf):,} records, {vectors.shape[1]} features")
         self._validate_inputs(gdf, vectors)
+
         return self._process_clustering(gdf, vectors, is_training=True)
 
     def transform(
@@ -116,20 +126,36 @@ class EntityClusterer:
         """
         Transform new data using fitted models.
         
+        This method applies the trained UMAP and HDBSCAN models to new data,
+        assigning cluster memberships based on the learned structure.
+        
         Args:
             gdf: Input DataFrame to add cluster predictions to
-            vectors: Feature vectors to assign to clusters
+            vectors: Feature vectors to assign to clusters.
+                    Must have same number of features as training data.
             
         Returns:
             Tuple of (DataFrame with cluster predictions, reduced vectors)
             
         Raises:
-            RuntimeError: If models haven't been fitted
-            ValueError: If inputs are invalid
+            RuntimeError: If models haven't been fitted (call fit_transform first)
+            ValueError: If inputs are invalid or dimensions don't match training
         """
         logger.info(f"Starting transform with {len(gdf):,} records")
+        
+        # Check models are fitted
+        if not self.umap_ensemble or not self.cluster_model:
+            raise RuntimeError(
+                "Models not fitted. Call fit_transform() before transform()."
+            )
+        
+        # Validate inputs
         self._validate_inputs(gdf, vectors)
-        return self._process_clustering(gdf, vectors, is_training=False)
+        
+        # Process clustering in inference mode
+        result_df, reduced_vectors = self._process_clustering(gdf, vectors, is_training=False)
+
+        return result_df, reduced_vectors
 
     # ========================================================================
     # CORE ORCHESTRATION
