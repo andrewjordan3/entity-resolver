@@ -9,6 +9,15 @@ This module implements a sophisticated clustering approach that combines:
 
 The ensemble approach balances precision (HDBSCAN) with recall (SNN) to achieve
 robust entity resolution even with challenging data distributions.
+
+Mathematical Foundation:
+- UMAP ensemble: Creates multiple manifold projections with diverse parameters,
+  then combines them via kernel PCA consensus for stability
+- HDBSCAN: Finds dense regions in the reduced space as core clusters
+- SNN rescue: Builds a mutual k-NN graph to recover noise points and find
+  additional structure missed by density-based methods
+- Purity-based ensemble: Maps SNN clusters to HDBSCAN clusters based on
+  overlap purity, ensuring high precision while improving recall
 """
 
 import logging
@@ -433,7 +442,7 @@ class EntityClusterer:
                 # Generate diverse parameters for this run
                 umap_params = self._generate_run_parameters(run_index=run_idx, rng=rng)
                 
-                logger.debug(f"UMAP run {run_idx + 1}/{n_runs}")
+                logger.debug(f"UMAP run {run_idx + 1}/{n_runs} with umap parameters {umap_params}")
                 
                 try:
                     reducer = UMAP(**umap_params)
@@ -710,25 +719,30 @@ class EntityClusterer:
     
     def _sample_min_dist_and_spread(self, rng: np.random.Generator) -> Tuple[float, float]:
         """
-        Sample correlated (min_dist, spread) pair for UMAP.
+        Sample correlated (min_dist, spread) parameters for UMAP.
         
-        For entity resolution, we prefer tighter local structure, so we bias
-        toward smaller min_dist values.
+        These parameters control the balance between local and global structure:
+        - min_dist: Minimum distance between points in low-dimensional space
+        - spread: Effective scale of embedded points
+        
+        Constraint: spread > min_dist (always)
+        
+        For entity resolution, we prefer tighter local structure (smaller min_dist).
         
         Args:
-            rng: Random number generator
+            rng: Random number generator for reproducible sampling
             
         Returns:
-            Tuple of (min_dist, spread) values
+            Tuple of (min_dist, spread) values satisfying constraints
         """
         sampling_config = self.config.umap_ensemble_sampling_config
-        min_dist_low, min_dist_high = sampling_config['min_dist']
-        spread_low, spread_high = sampling_config['spread']
+        min_dist_low, min_dist_high = sampling_config.get('min_dist', [0.0, 0.15])
+        spread_low, spread_high = sampling_config.get('spread', [0.5, 2.0])
 
         # Use log-uniform sampling for min_dist for better hyperparameter search.
         # Add a small epsilon to the lower bound if it's zero to avoid log(0).
-        log_min_dist_low = np.log10(min_dist_low + 1e-9)
-        log_min_dist_high = np.log10(min_dist_high)
+        log_min_dist_low = np.log10(abs(min_dist_low) + 1.0e-9)
+        log_min_dist_high = np.log10(abs(min_dist_high) + 1.0e-9)
         
         log_min_dist = rng.uniform(log_min_dist_low, log_min_dist_high)
         min_dist = 10.0 ** log_min_dist
@@ -736,12 +750,12 @@ class EntityClusterer:
         # To ensure spread > min_dist, the valid lower bound for spread must
         # be at least min_dist. We take the maximum of the configured lower
         # bound and the sampled min_dist.
-        valid_spread_low = max(spread_low, min_dist + 1e-5)
+        valid_spread_low = max(spread_low, min_dist + 1.0e-4)
 
         # If the calculated lower bound for spread is already higher than
         # the configured upper bound, we simply use the upper bound.
         if valid_spread_low >= spread_high:
-            spread = spread_high
+            spread = valid_spread_low
         else:
             # Sample spread from its valid, constrained range
             spread = rng.uniform(valid_spread_low, spread_high)
@@ -754,28 +768,42 @@ class EntityClusterer:
         rng: np.random.Generator
     ) -> Dict[str, Any]:
         """
-        Generate UMAP parameters for ensemble run.
+        Generate diverse UMAP parameters for ensemble run.
         
-        Run 0 uses stable base parameters; subsequent runs use randomized
-        parameters to diversify the ensemble.
+        Strategy:
+        - Run 0: Uses stable base parameters as anchor
+        - Runs 1+: Randomized parameters for diversity
+        
+        Diversity includes:
+        - Bimodal n_neighbors (local vs global structure)
+        - Correlated min_dist/spread sampling
+        - Varied optimization parameters
+        - Different initialization strategies
         
         Args:
-            run_index: Index of current ensemble run
-            rng: Random number generator
+            run_index: Index of current ensemble run (0-based)
+            rng: Random number generator for reproducibility
             
         Returns:
-            Dictionary of UMAP parameters
+            Dictionary of UMAP parameters for this run
         """
         umap_params = self.config.umap_params.copy()
         sampling = self.config.umap_ensemble_sampling_config
         
         if run_index == 0:
+            # First run uses stable base parameters
             logger.debug("UMAP run 1: Using base parameters as stable anchor")
+            # Only modify random state for reproducibility
+            umap_params["random_state"] = self._get_run_seed(run_index)
         else:
+            # Subsequent runs use diverse parameters
+
             # Sample n_neighbors (bimodal for local/global views)
             if rng.random() < sampling["local_view_ratio"]:
+                # Local view: fewer neighbors
                 n_low, n_high = sampling["n_neighbors_local"]
             else:
+                # Global view: more neighbors
                 n_low, n_high = sampling["n_neighbors_global"]
             
             umap_params["n_neighbors"] = int(
@@ -784,8 +812,8 @@ class EntityClusterer:
             
             # Sample correlated min_dist/spread
             min_dist, spread = self._sample_min_dist_and_spread(rng)
-            umap_params["min_dist"] = float(min_dist)
-            umap_params["spread"] = float(spread)
+            umap_params["min_dist"] = min_dist
+            umap_params["spread"] = spread
             
             # Sample other parameters
             umap_params.update({
@@ -811,9 +839,27 @@ class EntityClusterer:
             })
         
         # Ensure unique but deterministic seed per run
-        umap_params["random_state"] = int(self.random_state + run_index * 104729)
+        umap_params["random_state"] = self._get_run_seed(run_index)
         
         return umap_params
+
+    def _get_run_seed(self, run_index: int) -> int:
+        """
+        Generate deterministic seed for a specific run.
+        
+        Uses a large prime multiplier to ensure seeds are well-separated
+        in the random number space.
+        
+        Args:
+            run_index: Index of the run
+            
+        Returns:
+            Unique seed for this run
+        """
+        # Use large prime to ensure good separation
+        prime_multiplier = 104729
+        seed = int(self.random_state + run_index * prime_multiplier) % (2**31)
+        return seed
 
     # ========================================================================
     # UTILITY METHODS
@@ -829,18 +875,33 @@ class EntityClusterer:
             
         Raises:
             ValueError: If inputs are invalid
+            TypeError: If inputs are wrong type
         """
+        # Type validation
+        if not isinstance(gdf, cudf.DataFrame):
+            raise TypeError(f"gdf must be cudf.DataFrame, got {type(gdf)}")
+        
+        if not isinstance(vectors, cp.ndarray):
+            raise TypeError(f"vectors must be cupy.ndarray, got {type(vectors)}")
+        
+        # Shape validation
         if len(gdf) != vectors.shape[0]:
             raise ValueError(
                 f"DataFrame length ({len(gdf)}) doesn't match "
                 f"vector rows ({vectors.shape[0]})"
             )
         
+        if vectors.ndim != 2:
+            raise ValueError(f"Vectors must be 2D, got shape {vectors.shape}")
         if vectors.shape[1] == 0:
             raise ValueError("Feature vectors have zero dimensions")
         
         if cp.isnan(vectors).any():
-            raise ValueError("Feature vectors contain NaN values")
+            n_nan = int(cp.isnan(vectors).sum())
+            raise ValueError(f"Feature vectors contain {n_nan} NaN values")
+        if cp.isinf(vectors).any():
+            n_inf = int(cp.isinf(vectors).sum())
+            raise ValueError(f"Feature vectors contain {n_inf} Inf values")
     
     def _log_clustering_stats(self, gdf: cudf.DataFrame) -> None:
         """
