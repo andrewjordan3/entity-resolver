@@ -680,11 +680,12 @@ class GPUTruncatedSVD:
         # Lower bound: A very small number to prevent underflow and maintain numerical stability.
         # Upper bound: A fraction (10%) of the average singular value to avoid overly
         # biasing the results, which would suppress the true smaller singular values.
-        clamped_lambda = float(cupy.clip(
-            regularization_lambda,
-            1e-12 if matrix.dtype == cupy.float64 else 1e-7,
-            0.1 * estimated_average_singular_value
-        ))
+        lower_bound = 1e-12 if matrix.dtype == cupy.float64 else 1e-7
+        upper_bound = 0.1 * estimated_average_singular_value
+
+        # Use standard Python's max() and min() for clamping a scalar float.
+        # This is the correct approach and avoids the cupy.clip type error.
+        clamped_lambda = float(max(lower_bound, min(regularization_lambda, upper_bound)))
 
         logger.debug(
             f"Calculated regularization={clamped_lambda:.2e} from ||A||_F="

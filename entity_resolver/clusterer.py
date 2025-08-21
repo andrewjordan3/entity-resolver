@@ -266,12 +266,19 @@ class EntityClusterer:
         """
         Run HDBSCAN density-based clustering.
         
+        HDBSCAN finds dense regions in the reduced space as core clusters,
+        leaving sparse regions as noise. This provides high-precision clusters
+        but may have lower recall.
+        
         Args:
             gdf: DataFrame to add cluster labels to
-            reduced_vectors: Low-dimensional embeddings
+            reduced_vectors: Low-dimensional embeddings from UMAP
             
         Returns:
             DataFrame with HDBSCAN cluster labels and probabilities
+            
+        Raises:
+            RuntimeError: If HDBSCAN fails to find any clusters
         """
         logger.info("Running HDBSCAN for core clustering")
         logger.debug(f"HDBSCAN parameters: {self.config.hdbscan_params}")
@@ -939,7 +946,13 @@ class EntityClusterer:
         
         Returns:
             Dictionary containing cluster_model and UMAP ensemble
+        
+        Raises:
+            RuntimeError: If models haven't been fitted
         """
+        if not self.cluster_model or not self.umap_ensemble:
+            raise RuntimeError("Models not fitted. Call fit_transform() first.")
+        
         return {
             "cluster_model": self.cluster_model,
             "umap_reducer_ensemble": self.umap_ensemble
@@ -956,7 +969,16 @@ class EntityClusterer:
         Args:
             cluster_model: Fitted HDBSCAN model
             umap_reducer_ensemble: List of fitted UMAP models
+
+        Raises:
+            ValueError: If models are invalid
         """
+        if not cluster_model or not umap_reducer_ensemble:
+            raise ValueError("Both cluster_model and umap_ensemble required")
+        
+        if not isinstance(umap_reducer_ensemble, list):
+            raise ValueError("umap_reducer_ensemble must be a list")
+        
         self.cluster_model = cluster_model
         self.umap_ensemble = umap_reducer_ensemble
         logger.info(
