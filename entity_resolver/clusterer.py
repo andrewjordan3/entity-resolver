@@ -508,7 +508,7 @@ class EntityClusterer:
         
         final_vectors = utils.create_consensus_embedding(
             embeddings_list=umap_embeddings,
-            n_samples=self.config.cosine_consensus_n_samples,
+            n_anchor_samples=self.config.cosine_consensus_n_samples,
             batch_size=self.config.cosine_consensus_batch_size,
             random_state=self.random_state
         )
