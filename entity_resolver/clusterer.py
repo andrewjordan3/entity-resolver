@@ -181,6 +181,9 @@ class EntityClusterer:
         operation_mode = "Training" if is_training else "Inference"
         logger.info(f"Processing clustering in {operation_mode} mode")
         
+        # Work on a copy to avoid mutating input
+        gdf = gdf.copy()
+
         # Ensure proper dtype and memory layout for GPU operations
         vectors = self._prepare_vectors(vectors)
         
@@ -191,7 +194,7 @@ class EntityClusterer:
         if is_training:
             # Training path: Full clustering pipeline
             logger.info("Step 2: Core clustering with HDBSCAN")
-            gdf_clustered = self._run_hdbscan(gdf.copy(), reduced_vectors)
+            gdf_clustered = self._run_hdbscan(gdf, reduced_vectors)
             
             logger.info("Step 3: SNN graph clustering for noise rescue")
             snn_labels = self._run_snn_engine(reduced_vectors)
@@ -205,7 +208,7 @@ class EntityClusterer:
         else:
             # Inference path: Predict using fitted models
             logger.info("Step 2: Predicting cluster assignments")
-            gdf_final = self._predict_clusters(gdf.copy(), reduced_vectors)
+            gdf_final = self._predict_clusters(gdf, reduced_vectors)
         
         return gdf_final, reduced_vectors
     
@@ -213,11 +216,15 @@ class EntityClusterer:
         """
         Prepare vectors for GPU operations (float32, C-contiguous).
         
+        Ensures vectors are in the optimal format for GPU computation:
+        - float32 dtype for efficiency
+        - C-contiguous memory layout for coalesced memory access
+        
         Args:
-            vectors: Input vectors
+            vectors: Input vectors of any dtype/layout
             
         Returns:
-            Properly formatted vectors
+            Properly formatted vectors (may be same object if already optimal)
         """
         # Convert to float32 if needed
         if vectors.dtype != cp.float32:
@@ -253,7 +260,7 @@ class EntityClusterer:
         """
         if not self.cluster_model:
             raise RuntimeError(
-                "HDBSCAN model not fitted. Call fit_transform first."
+                "HDBSCAN model not fitted. Call fit_transform() first."
             )
         
         # Check if predict is available
@@ -263,7 +270,8 @@ class EntityClusterer:
                 "Consider using approximate predict or nearest-centroid assignment."
             )
         
-        # Predict cluster assignments
+        # Assign default confidence for predictions
+        # (HDBSCAN predict doesn't provide probabilities)
         gdf["cluster"] = self.cluster_model.predict(reduced_vectors)
         
         # Assign default confidence for predictions

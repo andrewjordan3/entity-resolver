@@ -45,8 +45,8 @@ def calculate_similarity_gpu(
     logger.debug(f"Calculating row-wise similarity for two series of length {len(series_a)}.")
     
     # Ensure consistent data types and handle nulls before processing.
-    series_a = series_a.fillna('').astype(str)
-    series_b = series_b.fillna('').astype(str)
+    series_a = series_a.fillna('').astype(str).str.strip()
+    series_b = series_b.fillna('').astype(str).str.strip()
 
     # Initialize the final result series with a default similarity of 0.0.
     # This ensures that any rows we skip will have a defined, logical similarity score.

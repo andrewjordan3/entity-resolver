@@ -536,6 +536,7 @@ class MultiStreamVectorizer:
         
         # Cast all balanced streams to float32 before concatenation
         final_streams = [vec.astype(cupy.float32, copy=False) for vec in balanced_vectors_list]
+        logger.dbug(f"All streams cast to float32")
         
         # Concatenate the final streams
         combined_vectors = cupy.concatenate(final_streams, axis=1)
