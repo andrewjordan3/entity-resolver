@@ -730,7 +730,7 @@ class ClustererConfig(BaseModel):
     merge_sample_size: int = Field(
         default=32, 
         ge=5,
-        le=100,
+        le=2048,
         description=(
             "Number of points to sample from large clusters for merge checks. "
             "Prevents O(n²) comparison complexity. Higher = more accurate but slower."
