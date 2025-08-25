@@ -763,51 +763,122 @@ class EntityClusterer:
     # ========================================================================
     # PARAMETER GENERATION
     # ========================================================================
-    
-    def _sample_min_dist_and_spread(self, rng: np.random.Generator) -> Tuple[float, float]:
+    @staticmethod
+    def _get_sub_range(
+        full_range: Tuple[float, float],
+        start_percent: float,
+        end_percent: float,
+        use_log_scale: bool = False
+    ) -> Tuple[float, float]:
         """
-        Sample correlated (min_dist, spread) parameters for UMAP.
+        Extract a sub-range from a full parameter range using linear or logarithmic scaling.
         
-        These parameters control the balance between local and global structure:
-        - min_dist: Minimum distance between points in low-dimensional space
-        - spread: Effective scale of embedded points
+        This utility method enables consistent sub-range selection across different UMAP
+        hyperparameters. Logarithmic scaling is essential for parameters with multiplicative
+        effects (like min_dist), while linear scaling suits parameters with additive effects.
         
-        Constraint: spread > min_dist (always)
+        Args:
+            full_range: The complete (min, max) range to select from.
+            start_percent: Starting position in the range as a fraction (0.0 to 1.0).
+            end_percent: Ending position in the range as a fraction (0.0 to 1.0).
+            use_log_scale: If True, calculations are performed in log10 space, which is
+                        appropriate for parameters where relative differences matter more
+                        than absolute differences.
         
-        For entity resolution, we prefer tighter local structure (smaller min_dist).
+        Returns:
+            A new (min, max) tuple representing the specified sub-range.
+            
+        Raises:
+            ValueError: If percentages are invalid (not in [0,1] or start >= end).
+        """
+        if not (0.0 <= start_percent < end_percent <= 1.0):
+            raise ValueError("Percentages must be between 0.0 and 1.0, with start < end.")
+        
+        lower_bound, upper_bound = full_range
+        
+        if use_log_scale:
+            # Logarithmic scaling for multiplicative parameters
+            # Add epsilon to prevent log(0) errors
+            epsilon = 1e-9
+            log_lower = np.log10(lower_bound + epsilon)
+            log_upper = np.log10(upper_bound + epsilon)
+            log_range_size = log_upper - log_lower
+            
+            new_log_lower = log_lower + (log_range_size * start_percent)
+            new_log_upper = log_lower + (log_range_size * end_percent)
+            
+            return (10**new_log_lower, 10**new_log_upper)
+        else:
+            # Linear scaling for additive parameters
+            range_size = upper_bound - lower_bound
+            
+            new_lower = lower_bound + (range_size * start_percent)
+            new_upper = lower_bound + (range_size * end_percent)
+            
+            return (new_lower, new_upper)
+
+    def _sample_min_dist_and_spread(
+        self, 
+        rng: np.random.Generator,
+        min_dist_range: Tuple[float, float],
+        spread_range: Tuple[float, float]
+    ) -> Tuple[float, float]:
+        """
+        Sample correlated (min_dist, spread) parameters for UMAP with constraint enforcement.
+        
+        These parameters control the balance between local and global structure in the embedding:
+        - min_dist: Minimum distance between points in the low-dimensional embedding space.
+                    Controls how tightly UMAP packs connected points together.
+                    Smaller values create tighter clumps; larger values create more even distribution.
+        - spread: The effective scale/dispersion of embedded points around each other.
+                Controls how spread out the embedding is overall.
+        
+        Mathematical constraint: spread must always be > min_dist to ensure valid UMAP behavior.
+        
+        For entity resolution, the relationship between these parameters is critical:
+        - Tight packing (small min_dist) helps group name variants together
+        - But sufficient spread prevents over-compression that loses discriminative power
         
         Args:
             rng: Random number generator for reproducible sampling
+            min_dist_range: Tuple of (lower_bound, upper_bound) for min_dist parameter
+            spread_range: Tuple of (lower_bound, upper_bound) for spread parameter
             
         Returns:
-            Tuple of (min_dist, spread) values satisfying constraints
+            Tuple of (min_dist, spread) values satisfying the spread > min_dist constraint
         """
-        sampling_config = self.config.umap_ensemble_sampling_config
-        min_dist_low, min_dist_high = sampling_config.get('min_dist', [0.0, 0.15])
-        spread_low, spread_high = sampling_config.get('spread', [0.5, 2.0])
-
-        # Use log-uniform sampling for min_dist for better hyperparameter search.
-        # Add a small epsilon to the lower bound if it's zero to avoid log(0).
-        log_min_dist_low = np.log10(abs(min_dist_low) + 1.0e-9)
-        log_min_dist_high = np.log10(abs(min_dist_high) + 1.0e-9)
+        min_dist_lower_bound, min_dist_upper_bound = min_dist_range
+        spread_lower_bound, spread_upper_bound = spread_range
         
-        log_min_dist = rng.uniform(log_min_dist_low, log_min_dist_high)
-        min_dist = 10.0 ** log_min_dist
-
-        # To ensure spread > min_dist, the valid lower bound for spread must
-        # be at least min_dist. We take the maximum of the configured lower
-        # bound and the sampled min_dist.
-        valid_spread_low = max(spread_low, min_dist + 1.0e-4)
-
-        # If the calculated lower bound for spread is already higher than
-        # the configured upper bound, we simply use the upper bound.
-        if valid_spread_low >= spread_high:
-            spread = valid_spread_low
+        # Use log-uniform sampling for min_dist to better explore the parameter space.
+        # This is crucial because min_dist effects are multiplicative rather than additive:
+        # the difference between 0.001 and 0.01 is more significant than 0.1 and 0.11.
+        # We add epsilon to handle the edge case where lower bound is exactly 0.
+        epsilon_for_log_safety = 1.0e-9
+        log_min_dist_lower = np.log10(abs(min_dist_lower_bound) + epsilon_for_log_safety)
+        log_min_dist_upper = np.log10(abs(min_dist_upper_bound) + epsilon_for_log_safety)
+        
+        # Sample in log space then transform back to linear space
+        log_sampled_min_dist = rng.uniform(log_min_dist_lower, log_min_dist_upper)
+        sampled_min_dist = 10.0 ** log_sampled_min_dist
+        
+        # To satisfy the mathematical constraint spread > min_dist, we must adjust
+        # the valid sampling range for spread based on the sampled min_dist value.
+        # We add a small buffer (1e-4) to avoid numerical edge cases where spread ≈ min_dist.
+        constraint_buffer = 1.0e-4
+        constrained_spread_lower = max(spread_lower_bound, sampled_min_dist + constraint_buffer)
+        
+        # Handle the edge case where our constraint pushes the lower bound above the upper bound.
+        # This can happen when min_dist is sampled near its upper range and spread range is tight.
+        if constrained_spread_lower >= spread_upper_bound:
+            # In this case, we set spread to the minimum valid value
+            sampled_spread = constrained_spread_lower
         else:
-            # Sample spread from its valid, constrained range
-            spread = rng.uniform(valid_spread_low, spread_high)
-            
-        return float(min_dist), float(spread)
+            # Normal case: sample spread uniformly from the valid constrained range.
+            # Linear sampling is appropriate here as spread effects are more linear.
+            sampled_spread = rng.uniform(constrained_spread_lower, spread_upper_bound)
+        
+        return float(sampled_min_dist), float(sampled_spread)
 
     def _generate_run_parameters(
         self, 
@@ -815,78 +886,178 @@ class EntityClusterer:
         rng: np.random.Generator
     ) -> Dict[str, Any]:
         """
-        Generate diverse UMAP parameters for ensemble run.
+        Generate diverse yet correlated UMAP parameters for ensemble run with view-based coupling.
         
-        Strategy:
-        - Run 0: Uses stable base parameters as anchor
-        - Runs 1+: Randomized parameters for diversity
+        This method implements a sophisticated parameter generation strategy that creates
+        two distinct "modes" of UMAP embeddings:
+        1. Local view: Emphasizes fine-grained structure, good for capturing entity variants
+        2. Global view: Emphasizes broad structure, good for maintaining entity boundaries
         
-        Diversity includes:
-        - Bimodal n_neighbors (local vs global structure)
-        - Correlated min_dist/spread sampling
-        - Varied optimization parameters
-        - Different initialization strategies
+        Parameter Correlation Strategy:
+        - Core parameters (n_neighbors, min_dist, spread) define the view type
+        - Supporting parameters are adjusted to reinforce the chosen view
+        - Parameters with multiplicative effects use logarithmic scaling
+        - Parameters with additive effects use linear scaling
+        
+        The first run (index 0) always uses stable base parameters as an anchor point,
+        ensuring at least one consistent embedding in the ensemble.
         
         Args:
             run_index: Index of current ensemble run (0-based)
             rng: Random number generator for reproducibility
             
         Returns:
-            Dictionary of UMAP parameters for this run
+            Dictionary of UMAP parameters optimized for the chosen view type
         """
+        # Start with base UMAP parameters as template
         umap_params = self.config.umap_params.copy()
-        sampling = self.config.umap_ensemble_sampling_config
+        sampling_config = self.config.umap_ensemble_sampling_config
         
         if run_index == 0:
-            # First run uses stable base parameters
+            # First run: Use stable base parameters as anchor for ensemble.
+            # This provides a consistent reference point across different random seeds
+            # and helps prevent the ensemble from being too unstable.
             logger.debug("UMAP run 1: Using base parameters as stable anchor")
-            # Only modify random state for reproducibility
             umap_params["random_state"] = self._get_run_seed(run_index)
-        else:
-            # Subsequent runs use diverse parameters
-
-            # Sample n_neighbors (bimodal for local/global views)
-            if rng.random() < sampling["local_view_ratio"]:
-                # Local view: fewer neighbors
-                n_low, n_high = sampling["n_neighbors_local"]
-            else:
-                # Global view: more neighbors
-                n_low, n_high = sampling["n_neighbors_global"]
+            return umap_params
+        
+        # For subsequent runs, generate diverse parameters with view-based correlation
+        
+        # Determine view type using configured probability
+        local_view_probability = sampling_config["local_view_ratio"]
+        is_local_view = rng.random() < local_view_probability
+        view_type = "LOCAL" if is_local_view else "GLOBAL"
+        
+        # Define the sub-range percentages for each view type
+        # Local view uses lower portions of ranges for tighter embeddings
+        # Global view uses upper portions for better separation
+        if is_local_view:
+            # Local view parameter range selections
+            n_neighbors_range = sampling_config["n_neighbors_local"]
             
-            umap_params["n_neighbors"] = int(
-                rng.integers(low=n_low, high=n_high, endpoint=True)
+            # Use lower 60% of min_dist range (logarithmic scale for multiplicative effect)
+            min_dist_range = self._get_sub_range(
+                sampling_config.get("min_dist", [0.001, 0.1]),
+                start_percent=0.0,
+                end_percent=0.6,
+                use_log_scale=True
             )
             
-            # Sample correlated min_dist/spread
-            min_dist, spread = self._sample_min_dist_and_spread(rng)
-            umap_params["min_dist"] = min_dist
-            umap_params["spread"] = spread
+            # Use lower 60% of spread range (linear scale for additive effect)
+            spread_range = self._get_sub_range(
+                sampling_config.get("spread", [0.5, 1.5]),
+                start_percent=0.0,
+                end_percent=0.6,
+                use_log_scale=False
+            )
             
-            # Sample other parameters
-            umap_params.update({
-                "n_epochs": int(rng.integers(
-                    low=sampling["n_epochs"][0],
-                    high=sampling["n_epochs"][1],
-                    endpoint=True
-                )),
-                "learning_rate": float(rng.uniform(
-                    low=sampling["learning_rate"][0],
-                    high=sampling["learning_rate"][1]
-                )),
-                "repulsion_strength": float(rng.uniform(
-                    low=sampling["repulsion_strength"][0],
-                    high=sampling["repulsion_strength"][1]
-                )),
-                "negative_sample_rate": int(rng.integers(
-                    low=sampling["negative_sample_rate"][0],
-                    high=sampling["negative_sample_rate"][1],
-                    endpoint=True
-                )),
-                "init": rng.choice(sampling["init_strategies"]).item(),
-            })
+            # Supporting parameters: use lower halves to reinforce local structure
+            repulsion_percent_range = (0.0, 0.5)
+            negative_sample_percent_range = (0.0, 0.5)
+            epochs_percent_range = (0.0, 0.5)
+            
+        else:
+            # Global view parameter range selections
+            n_neighbors_range = sampling_config["n_neighbors_global"]
+            
+            # Use upper 60% of min_dist range (starting at 40%)
+            min_dist_range = self._get_sub_range(
+                sampling_config.get("min_dist", [0.001, 0.1]),
+                start_percent=0.4,
+                end_percent=1.0,
+                use_log_scale=True
+            )
+            
+            # Use upper 60% of spread range
+            spread_range = self._get_sub_range(
+                sampling_config.get("spread", [0.5, 1.5]),
+                start_percent=0.4,
+                end_percent=1.0,
+                use_log_scale=False
+            )
+            
+            # Supporting parameters: use upper halves to reinforce global structure
+            repulsion_percent_range = (0.5, 1.0)
+            negative_sample_percent_range = (0.5, 1.0)
+            epochs_percent_range = (0.5, 1.0)
         
-        # Ensure unique but deterministic seed per run
+        # --- Sample Core Parameters ---
+        
+        # n_neighbors: uniformly sampled within the view-specific range
+        umap_params["n_neighbors"] = int(
+            rng.integers(low=n_neighbors_range[0], high=n_neighbors_range[1], endpoint=True)
+        )
+        
+        # min_dist and spread: sampled with constraint enforcement
+        min_dist, spread = self._sample_min_dist_and_spread(rng, min_dist_range, spread_range)
+        umap_params["min_dist"] = min_dist
+        umap_params["spread"] = spread
+        
+        # --- Sample Supporting Parameters ---
+        
+        # Repulsion strength: linear scaling (additive force effect)
+        repulsion_sub_range = self._get_sub_range(
+            sampling_config["repulsion_strength"],
+            start_percent=repulsion_percent_range[0],
+            end_percent=repulsion_percent_range[1],
+            use_log_scale=False
+        )
+        umap_params["repulsion_strength"] = float(
+            rng.uniform(repulsion_sub_range[0], repulsion_sub_range[1])
+        )
+        
+        # Negative sample rate: logarithmic scaling (multiplicative optimization effect)
+        negative_sample_sub_range = self._get_sub_range(
+            sampling_config["negative_sample_rate"],
+            start_percent=negative_sample_percent_range[0],
+            end_percent=negative_sample_percent_range[1],
+            use_log_scale=True
+        )
+        umap_params["negative_sample_rate"] = int(
+            rng.uniform(negative_sample_sub_range[0], negative_sample_sub_range[1])
+        )
+        
+        # Number of epochs: linear scaling (additive iteration effect)
+        epochs_sub_range = self._get_sub_range(
+            sampling_config["n_epochs"],
+            start_percent=epochs_percent_range[0],
+            end_percent=epochs_percent_range[1],
+            use_log_scale=False
+        )
+        # Use integers for epoch count
+        epochs_sub_range_int = (int(epochs_sub_range[0]), int(epochs_sub_range[1]))
+        umap_params["n_epochs"] = int(
+            rng.integers(epochs_sub_range_int[0], epochs_sub_range_int[1], endpoint=True)
+        )
+        
+        # --- Sample Independent Parameters ---
+        # These benefit from full-range random variation regardless of view type
+        
+        # Learning rate: controls optimization step size
+        # Full range sampling for diverse convergence behavior
+        learning_rate_range = sampling_config["learning_rate"]
+        umap_params["learning_rate"] = float(
+            rng.uniform(learning_rate_range[0], learning_rate_range[1])
+        )
+        
+        # Initialization strategy: starting point for optimization
+        # Random selection helps explore different local optima
+        init_strategies = sampling_config["init_strategies"]
+        umap_params["init"] = rng.choice(init_strategies).item()
+        
+        # Set unique but deterministic random seed for this run
         umap_params["random_state"] = self._get_run_seed(run_index)
+        
+        # Log the parameter choices for debugging and analysis
+        logger.debug(
+            f"UMAP run {run_index}: {view_type} view with "
+            f"n_neighbors={umap_params['n_neighbors']}, "
+            f"min_dist={umap_params['min_dist']:.4f}, "
+            f"spread={umap_params['spread']:.3f}, "
+            f"repulsion={umap_params['repulsion_strength']:.2f}, "
+            f"neg_samples={umap_params['negative_sample_rate']}, "
+            f"epochs={umap_params['n_epochs']}"
+        )
         
         return umap_params
 
