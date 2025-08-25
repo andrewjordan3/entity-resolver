@@ -319,7 +319,7 @@ class GPUTruncatedSVD:
 
             # --- Step 3d: Reconstruct SVD Components from Eigenpairs ---
             adjusted_eigenvalues = cupy.maximum(eigenvalues - regularization_term, 0.0)
-            singular_values = cupy.sqrt(adjusted_eigenvalues) / frobenius_scale_factor
+            singular_values = adjusted_eigenvalues
             right_singular_vectors_pruned = eigenvectors[n_pruned_samples:, :]
             right_singular_vectors_pruned /= cupy.linalg.norm(right_singular_vectors_pruned, axis=0, keepdims=True)
             right_singular_vectors_full = cupy.zeros((number_of_features, self.n_components), dtype=self.fallback_dtype)
