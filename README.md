@@ -69,6 +69,13 @@ Creates rich entity embeddings by combining three complementary approaches:
 
 ## 📦 Installation
 
+This project can be set up in two primary environments: locally using Conda (for machines with NVIDIA GPUs) or on the cloud using Google Colab.
+
+---
+### Local / On-Premise Installation
+
+This method is for setting up the project on your own machine with a compatible NVIDIA GPU.
+
 ### Step 1: Install RAPIDS
 
 Conda is recommended:
@@ -82,9 +89,11 @@ conda create -n rapids-24.12 -c rapidsai -c conda-forge -c nvidia \
 conda activate rapids-24.12
 ```
 
-For detailed instructions, see the RAPIDS installation guide.
+For more detailed instructions, please refer to the official [RAPIDS installation guide](https://rapids.ai/start.html).
 
 ### Step 2: Install the Package
+
+Once your environment is active, you can install the `entity-resolver` package.
 
 ```bash
 # Option A: Install directly from GitHub (Recommended)
@@ -95,6 +104,31 @@ git clone https://github.com/andrewjordan3/entity-resolver.git
 cd entity-resolver
 pip install .
 ```
+---
+### Google Colab Installation
+This method uses a setup script to prepare the Google Colab environment automatically.
+
+### Step 1: Run the Setup Script
+Copy and paste the following code into a single cell in your Colab notebook and run it. This will clone the repository and install all dependencies.
+
+```bash
+# Clone the project repository
+!git clone https://github.com/andrewjordan3/entity-resolver.git
+
+# Navigate into the project directory
+%cd entity-resolver
+
+# Make the setup script executable and run it
+# This will install RAPIDS and other dependencies.
+!chmod +x setup_colab.sh
+!./setup_colab.sh
+```
+### Step 2: Restart the Runtime
+After the script finishes, you **must** restart the Colab runtime for the newly installed libraries (like cuDF) to be loaded correctly.
+
+> **Go to `Runtime` > `Restart runtime` in the Colab menu.**
+
+Your environment is now ready. You can proceed to import and use the `entity-resolver` package in the subsequent cells.
 
 ### Step 3: Verify Installation
 
@@ -203,7 +237,7 @@ for i in range(0, len(large_df), chunk_size):
 
 final_df = pd.concat(chunks, ignore_index=True)
 ```
-**Note**: The fit() or fit_transform() methods must be trained on a dataset that can fit into GPU memory, as they build global models (e.g., vectorizer vocabularies). Once the resolver is fitted, the transform() method can be used to process new, unseen data in chunks
+**Note**: The fit() or fit_transform() methods must be trained on a dataset that can fit into GPU memory, as they build global models (e.g., vectorizer vocabularies). Once the resolver is fitted, the transform() method can be used to process new, unseen data in chunks.
 
 ## ⚙️ Configuration
 
@@ -217,8 +251,6 @@ The `ResolverConfig` object controls all aspects of the pipeline:
 | `clusterer`    | `umap_params`, `hdbscan_params`     | Clustering hyperparameters          |
 | `validation`   | `name_fuzz_ratio`, `address_fuzz_ratio` | Match validation thresholds     |
 | `output`       | `review_confidence_threshold`       | Output formatting options           |
-
-See the **Configuration Guide** for detailed documentation.
 
 ## 🏗️ Pipeline Architecture
 
@@ -303,8 +335,6 @@ python -c "import cudf; print(cudf.__version__)"
 config.clusterer.hdbscan_params['min_cluster_size'] = 2
 config.validation.name_fuzz_ratio = 80
 ```
-
-See the **Troubleshooting Guide** for more solutions.
 
 ## 🤝 Contributing
 
