@@ -390,7 +390,7 @@ class EntityClusterer:
         k_neighbors = self.config.snn_clustering_params["k_neighbors"]
         logger.debug(f"Building mutual rank graph with k={k_neighbors}")
         
-        snn_graph, _ = utils.build_mutual_rank_graph(vectors_norm, k_neighbors==k_neighbors)
+        snn_graph, _ = utils.build_mutual_rank_graph(vectors_norm, k_neighbors)
         
         if snn_graph.number_of_edges() == 0:
             logger.warning("SNN graph has no edges. All points treated as noise.")
