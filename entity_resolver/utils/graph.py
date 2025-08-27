@@ -1,8 +1,23 @@
 # entity_resolver/utils/graph.py
 """
-This module provides GPU-accelerated utilities for graph construction and
-analysis using cuDF, cuGraph, and cuML. It includes functions for creating
-graphs from nearest neighbor data and finding connected components.
+GPU-Accelerated Graph Construction and Analysis Utilities
+
+This module provides high-performance graph operations using the RAPIDS ecosystem,
+including cuDF for GPU DataFrames, cuGraph for graph algorithms, and cuML for
+machine learning operations. The module is designed for large-scale entity
+resolution and clustering tasks where performance is critical.
+
+Key Features:
+    - Efficient edge list construction from k-nearest neighbor searches
+    - Connected component detection for graph partitioning
+    - Mutual rank graph construction with hybrid weighting schemes
+    - Full GPU acceleration for all operations
+
+Dependencies:
+    - cupy: GPU-accelerated NumPy-like arrays
+    - cudf: GPU-accelerated Pandas-like DataFrames
+    - cugraph: GPU-accelerated graph algorithms
+    - cuml: GPU-accelerated machine learning algorithms
 """
 
 import cupy
@@ -10,211 +25,525 @@ import cudf
 import cugraph
 from cuml.neighbors import NearestNeighbors
 import logging
+from typing import Optional, Tuple
 
 # Set up a logger for this module.
 logger = logging.getLogger(__name__)
 
 
 def create_edge_list(
-    indices: cupy.ndarray,
-    distances: cupy.ndarray,
-    threshold: float
+    neighbor_indices: cupy.ndarray,
+    neighbor_distances: cupy.ndarray,
+    distance_threshold: float,
+    include_weights: bool = False
 ) -> cudf.DataFrame:
     """
-    Creates a cuDF DataFrame of graph edges from NearestNeighbors output.
+    Transforms k-nearest neighbor results into a graph edge list DataFrame.
 
-    This function transforms the 2D arrays of neighbor indices and distances
-    into a "long" format edge list DataFrame, filtering out edges that exceed
-    a specified distance threshold and any self-loops.
+    This function converts the dense matrix representation of k-nearest neighbors
+    (as produced by scikit-learn style APIs) into a sparse edge list format
+    suitable for graph construction. It filters edges based on distance threshold
+    and removes self-loops to ensure a valid simple graph.
 
     Args:
-        indices: The CuPy array of neighbor indices from kneighbors().
-        distances: The CuPy array of neighbor distances from kneighbors().
-        threshold: The distance threshold below which a pair is considered an edge.
+        neighbor_indices: A 2D CuPy array of shape (n_samples, n_neighbors)
+            containing the indices of nearest neighbors for each sample.
+        neighbor_distances: A 2D CuPy array of shape (n_samples, n_neighbors)
+            containing the distances to nearest neighbors for each sample.
+        distance_threshold: Maximum distance for an edge to be included in the graph.
+            Edges with distances >= this threshold are filtered out.
+        include_weights: If True, includes distance as an edge weight column.
+            Useful for weighted graph algorithms.
 
     Returns:
-        A cuDF DataFrame with 'source', 'destination', and 'distance' columns.
+        A cuDF DataFrame with columns:
+            - 'source': Index of the source node (int32)
+            - 'destination': Index of the destination node (int32)
+            - 'distance': Distance between nodes (float32, optional based on include_weights)
+
+    Raises:
+        ValueError: If input arrays have incompatible shapes or invalid dimensions.
+
+    Example:
+        >>> indices = cupy.array([[0, 1, 2], [1, 0, 2], [2, 1, 0]])
+        >>> distances = cupy.array([[0.0, 0.5, 0.8], [0.0, 0.5, 0.7], [0.0, 0.6, 0.8]])
+        >>> edge_list = create_edge_list(indices, distances, threshold=0.75)
     """
-    n_rows, n_neighbors = indices.shape
-    logger.debug(f"Creating edge list from neighbors matrix of shape ({n_rows}, {n_neighbors}).")
+    # Validate input dimensions
+    if neighbor_indices.ndim != 2 or neighbor_distances.ndim != 2:
+        raise ValueError(f"Expected 2D arrays, got shapes: indices={neighbor_indices.shape}, "
+                         f"distances={neighbor_distances.shape}")
+    
+    if neighbor_indices.shape != neighbor_distances.shape:
+        raise ValueError(f"Shape mismatch: indices={neighbor_indices.shape} vs "
+                         f"distances={neighbor_distances.shape}")
+    
+    num_samples, num_neighbors_per_sample = neighbor_indices.shape
+    logger.debug(f"Processing k-NN matrix with {num_samples} samples and "
+                 f"{num_neighbors_per_sample} neighbors per sample")
 
-    # Flatten the 2D matrices into 1D Series.
-    source_nodes = cupy.arange(n_rows, dtype='int32').repeat(n_neighbors)
-    destination_nodes = indices.flatten()
-    distance_values = distances.flatten()
+    # Create source indices by repeating each sample index k times
+    # This creates the "from" node for each edge
+    source_node_indices = cupy.arange(num_samples, dtype=cupy.int32).repeat(num_neighbors_per_sample)
+    
+    # Flatten the neighbor indices to create destination nodes
+    # This creates the "to" node for each edge
+    destination_node_indices = neighbor_indices.flatten().astype(cupy.int32)
+    
+    # Flatten the distances for edge weights
+    edge_distances = neighbor_distances.flatten().astype(cupy.float32)
 
-    # Create the initial edge list DataFrame.
-    edge_list = cudf.DataFrame({
-        'source': source_nodes,
-        'destination': destination_nodes,
-        'distance': distance_values
+    # Construct the initial edge list DataFrame
+    edge_list_df = cudf.DataFrame({
+        'source': source_node_indices,
+        'destination': destination_node_indices,
+        'distance': edge_distances
     })
 
-    # Filter for valid edges: distance must be below the threshold and the
-    # source cannot be the same as the destination (no self-loops).
-    valid_edges = edge_list[
-        (edge_list['distance'] < threshold) &
-        (edge_list['source'] != edge_list['destination'])
-    ]
-    logger.info(f"Created edge list with {len(valid_edges)} edges after filtering.")
-    return valid_edges
+    # Apply filtering criteria:
+    # 1. Distance must be below threshold (ensures meaningful connections)
+    # 2. No self-loops allowed (source != destination)
+    valid_edges_mask = (
+        (edge_list_df['distance'] < distance_threshold) &
+        (edge_list_df['source'] != edge_list_df['destination'])
+    )
+    filtered_edge_list = edge_list_df[valid_edges_mask]
+    
+    # Remove distance column if not needed to save memory
+    if not include_weights:
+        filtered_edge_list = filtered_edge_list[['source', 'destination']]
+    
+    num_edges = len(filtered_edge_list)
+    num_possible_edges = num_samples * num_neighbors_per_sample
+    retention_rate = (num_edges / num_possible_edges) * 100 if num_possible_edges > 0 else 0
+    
+    logger.info(f"Created edge list with {num_edges:,} edges from {num_possible_edges:,} "
+                f"possible edges (retention rate: {retention_rate:.1f}%)")
+    
+    return filtered_edge_list
 
 
 def find_graph_components(
-    edge_list: cudf.DataFrame,
-    source_col: str = 'source',
-    destination_col: str = 'destination',
-    vertex_col_name: str = 'vertex',
-    component_col_name: str = 'component_id'
+    edge_list_df: cudf.DataFrame,
+    source_column: str = 'source',
+    destination_column: str = 'destination',
+    directed: bool = False,
+    output_vertex_column: str = 'vertex',
+    output_component_column: str = 'component_id'
 ) -> cudf.DataFrame:
     """
-    Finds connected components in a graph from an edge list using cuGraph.
+    Identifies connected components in a graph using GPU-accelerated algorithms.
 
-    This function encapsulates the boilerplate for creating a cuGraph Graph
-    object and running the weakly connected components algorithm.
+    This function wraps cuGraph's connected components algorithms, providing
+    a clean interface for component detection in both directed and undirected
+    graphs. Components are useful for identifying clusters or groups of
+    related entities in the graph.
 
     Args:
-        edge_list: A cuDF DataFrame representing graph edges.
-        source_col: The name of the source column in the edge_list.
-        destination_col: The name of the destination column in the edge_list.
-        vertex_col_name: The desired name for the output vertex column.
-        component_col_name: The desired name for the output component ID column.
+        edge_list_df: A cuDF DataFrame containing the graph edges with at minimum
+            source and destination columns.
+        source_column: Name of the column containing source node indices.
+        destination_column: Name of the column containing destination node indices.
+        directed: If True, treats the graph as directed and finds weakly connected
+            components. If False, treats as undirected.
+        output_vertex_column: Name for the vertex column in the output DataFrame.
+        output_component_column: Name for the component ID column in the output DataFrame.
 
     Returns:
-        A cuDF DataFrame mapping each vertex to its component ID.
+        A cuDF DataFrame with columns:
+            - output_vertex_column: The vertex/node ID (matches indices from edge list)
+            - output_component_column: The component ID this vertex belongs to
+
+    Raises:
+        ValueError: If the edge list is empty or required columns are missing.
+
+    Notes:
+        - Component IDs are arbitrary integers starting from 0
+        - Isolated nodes (not present in edge list) will not appear in output
+        - For directed graphs, uses weakly connected components
     """
-    if edge_list.empty:
-        logger.warning("find_graph_components received an empty edge list.")
-        return cudf.DataFrame({vertex_col_name: [], component_col_name: []})
+    # Validate input
+    if edge_list_df.empty:
+        logger.warning("Received empty edge list for component detection")
+        return cudf.DataFrame({
+            output_vertex_column: cupy.array([], dtype=cupy.int32),
+            output_component_column: cupy.array([], dtype=cupy.int32)
+        })
+    
+    required_columns = {source_column, destination_column}
+    missing_columns = required_columns - set(edge_list_df.columns)
+    if missing_columns:
+        raise ValueError(f"Missing required columns in edge list: {missing_columns}")
 
-    logger.debug(f"Finding components for graph with {len(edge_list)} edges.")
-    graph = cugraph.Graph()
+    num_edges = len(edge_list_df)
+    logger.debug(f"Finding connected components for graph with {num_edges:,} edges "
+                 f"(directed={directed})")
+    
+    # Create and populate the cuGraph Graph object
+    graph = cugraph.Graph(directed=directed)
     graph.from_cudf_edgelist(
-        edge_list,
-        source=source_col,
-        destination=destination_col
+        edge_list_df,
+        source=source_column,
+        destination=destination_column,
+        renumber=True  # Allow cuGraph to optimize vertex numbering internally
     )
+    
+    num_vertices = graph.number_of_vertices()
+    logger.debug(f"Graph contains {num_vertices:,} unique vertices")
 
-    # Run the weakly connected components algorithm.
-    components = cugraph.weakly_connected_components(graph)
+    # Run the appropriate connected components algorithm
+    if directed:
+        components_df = cugraph.weakly_connected_components(graph)
+        component_type = "weakly connected"
+    else:
+        components_df = cugraph.connected_components(graph)
+        component_type = "connected"
 
-    # Rename columns to the desired generic output names for consistency.
-    components = components.rename(columns={
-        'labels': component_col_name,
-        'vertex': vertex_col_name
+    # Standardize output column names
+    components_df = components_df.rename(columns={
+        'labels': output_component_column,
+        'vertex': output_vertex_column
     })
     
-    num_components = len(components[component_col_name].unique())
-    logger.info(f"Found {num_components} connected components.")
-    return components
+    # Calculate and log component statistics
+    num_components = components_df[output_component_column].nunique()
+    component_sizes = components_df.groupby(output_component_column).size()
+    largest_component_size = component_sizes.max()
+    avg_component_size = component_sizes.mean()
+    
+    logger.info(f"Found {num_components:,} {component_type} components. "
+                f"Largest: {largest_component_size:,} vertices, "
+                f"Average: {avg_component_size:.1f} vertices")
+    
+    return components_df
 
 
 # --- Mutual Rank Graph Helper Functions ---
 
-def _get_directed_knn_edges(vectors: cupy.ndarray, k: int) -> cudf.DataFrame:
-    """Finds k-nearest neighbors and formats them as a directed edge list."""
-    logger.debug(f"Finding {k}-nearest neighbors for {vectors.shape[0]} vectors.")
-    nn_model = NearestNeighbors(n_neighbors=k, metric='cosine').fit(vectors)
-    distances, indices = nn_model.kneighbors(vectors)
-
-    source_nodes = cupy.repeat(cupy.arange(vectors.shape[0]), k)
-    destination_nodes = indices.ravel()
-    
-    # Create the DataFrame with ranks and similarities for each directed edge.
-    directed_edges = cudf.DataFrame({
-        'source': source_nodes,
-        'destination': destination_nodes,
-        'rank': cupy.tile(cupy.arange(k), vectors.shape[0]),
-        'similarity': 1 - distances.ravel()
-    })
-    
-    # Filter out self-loops, which can occur if k is larger than the number of unique points.
-    directed_edges = directed_edges[directed_edges['source'] != directed_edges['destination']]
-    logger.debug(f"Created {len(directed_edges)} directed k-NN edges.")
-    return directed_edges
-
-
-def _find_mutual_edges(directed_edges: cudf.DataFrame) -> cudf.DataFrame:
-    """Identifies mutual neighbors by performing a self-merge."""
-    # To find mutual neighbors, we need to know the rank in both directions.
-    # We rename columns to prepare for a merge that finds reciprocal pairs.
-    edges_renamed = directed_edges.rename(columns={
-        'source': 'destination',
-        'destination': 'source',
-        'rank': 'rank_of_source_for_dest',
-        'similarity': 'similarity_of_source_for_dest'
-    })
-    
-    # Merge the original directed edges with the renamed (swapped) version.
-    # An inner merge ensures that we only keep pairs where (i -> j) and (j -> i) both exist.
-    mutual_edges = directed_edges.merge(
-        edges_renamed,
-        on=['source', 'destination']
-    ).rename(columns={'rank': 'rank_of_dest_for_source', 'similarity': 'similarity_of_dest_for_source'})
-    
-    logger.info(f"Found {len(mutual_edges)} mutual edges from directed k-NN graph.")
-    return mutual_edges
-
-
-def _calculate_hybrid_weight(mutual_edges: cudf.DataFrame) -> cudf.Series:
-    """Calculates a hybrid weight combining mutual rank and cosine similarity."""
-    # 1. Rank-based component: This is robust to variations in data density.
-    # The '+ 2' ensures the denominator is never zero and scales the weight.
-    rank_weight = 1.0 / (
-        mutual_edges['rank_of_dest_for_source'] +
-        mutual_edges['rank_of_source_for_dest'] + 2
-    )
-    
-    # 2. Similarity component: This is sensitive to the actual distance.
-    # We average the two directional similarities to maintain symmetry.
-    similarity_weight = (
-        mutual_edges['similarity_of_dest_for_source'] +
-        mutual_edges['similarity_of_source_for_dest']
-    ) / 2.0
-    
-    # 3. Hybrid weight: The final weight is high only if points are both
-    # highly ranked for each other AND are very close in the vector space.
-    return rank_weight * similarity_weight
-
-
-def build_mutual_rank_graph(vectors: cupy.ndarray, k: int) -> cugraph.Graph:
+def _compute_directed_knn_edges(
+    embedding_vectors: cupy.ndarray,
+    k_neighbors: int,
+    distance_metric: str = 'cosine'
+) -> cudf.DataFrame:
     """
-    Builds a k-NN graph with a hybrid weighting scheme.
+    Computes k-nearest neighbors and formats results as directed edges with ranks.
 
-    This method creates a robust graph where edge weights are high only for
-    pairs of points that are mutually close (i.e., each is one of the other's
-    k-nearest neighbors) and have high cosine similarity.
+    This internal function finds the k-nearest neighbors for each point in the
+    embedding space and creates a directed edge list where each edge includes
+    the rank of the neighbor (1st nearest, 2nd nearest, etc.) and the similarity
+    score.
 
     Args:
-        vectors: The embedding vectors for all data points.
-        k: The number of nearest neighbors to consider for the graph.
+        embedding_vectors: A 2D CuPy array of shape (n_samples, n_features)
+            containing the embedding vectors for all data points.
+        k_neighbors: Number of nearest neighbors to find for each point.
+        distance_metric: Distance metric to use ('cosine', 'euclidean', etc.).
 
     Returns:
-        A cugraph.Graph object with weighted, undirected edges.
+        A cuDF DataFrame with directed edges containing:
+            - 'source': Source node index
+            - 'destination': Destination node index  
+            - 'rank': Rank of destination as neighbor of source (0 to k-1)
+            - 'similarity': Similarity score (1 - distance for cosine)
+
+    Raises:
+        ValueError: If k_neighbors exceeds the number of samples.
     """
-    # Step 1: Find all directed k-NN edges (i -> j).
-    directed_edges = _get_directed_knn_edges(vectors, k)
+    num_samples, num_features = embedding_vectors.shape
     
-    # Step 2: Identify which of those edges are mutual (i <-> j).
-    mutual_edges = _find_mutual_edges(directed_edges)
+    if k_neighbors > num_samples:
+        raise ValueError(f"k_neighbors ({k_neighbors}) cannot exceed number of samples ({num_samples})")
     
-    if mutual_edges.empty:
-        logger.warning("No mutual edges found; returning an empty graph.")
-        return cugraph.Graph()
+    logger.debug(f"Computing {k_neighbors}-NN for {num_samples:,} vectors with "
+                 f"{num_features} dimensions using {distance_metric} distance")
+    
+    # Fit k-NN model and find neighbors
+    knn_model = NearestNeighbors(
+        n_neighbors=k_neighbors,
+        metric=distance_metric,
+        algorithm='brute'  # Brute force is often fastest on GPU for high-dim data
+    )
+    knn_model.fit(embedding_vectors)
+    distances_matrix, indices_matrix = knn_model.kneighbors(embedding_vectors)
 
-    # Step 3: Calculate the hybrid weight for each mutual edge.
-    mutual_edges['weight'] = _calculate_hybrid_weight(mutual_edges)
+    # Create source indices (each point repeated k times)
+    source_indices = cupy.repeat(
+        cupy.arange(num_samples, dtype=cupy.int32),
+        k_neighbors
+    )
+    
+    # Flatten neighbor indices to create destination indices
+    destination_indices = indices_matrix.ravel().astype(cupy.int32)
+    
+    # Create rank array (0 to k-1 repeated for each source)
+    neighbor_ranks = cupy.tile(
+        cupy.arange(k_neighbors, dtype=cupy.int32),
+        num_samples
+    )
+    
+    # Convert distances to similarities (higher is better)
+    if distance_metric == 'cosine':
+        similarity_scores = 1.0 - distances_matrix.ravel()
+    else:
+        # For other metrics, use inverse distance
+        # Add small epsilon to avoid division by zero
+        epsilon = 1e-10
+        similarity_scores = 1.0 / (distances_matrix.ravel() + epsilon)
+    
+    # Construct the directed edge DataFrame
+    directed_edges_df = cudf.DataFrame({
+        'source': source_indices,
+        'destination': destination_indices,
+        'rank': neighbor_ranks,
+        'similarity': similarity_scores.astype(cupy.float32)
+    })
+    
+    # Remove self-loops (can occur when k > number of unique points)
+    directed_edges_df = directed_edges_df[
+        directed_edges_df['source'] != directed_edges_df['destination']
+    ]
+    
+    num_directed_edges = len(directed_edges_df)
+    logger.debug(f"Created {num_directed_edges:,} directed k-NN edges "
+                 f"(excluding self-loops)")
+    
+    return directed_edges_df
 
-    # Step 4: Construct the final, undirected cugraph Graph object.
-    snn_graph = cugraph.Graph(directed=False)
-    # Set renumber=False to ensure vertex IDs are preserved, which is critical
-    # for mapping graph analysis results back to the original data.
-    snn_graph.from_cudf_edgelist(
-        mutual_edges,
+
+def _identify_mutual_edges(directed_edges_df: cudf.DataFrame) -> cudf.DataFrame:
+    """
+    Identifies bidirectional (mutual) edges from a directed edge list.
+
+    A mutual edge exists when both (i→j) and (j→i) are present in the directed
+    graph. This function finds such pairs and combines their information,
+    preserving ranks and similarities from both directions.
+
+    Args:
+        directed_edges_df: DataFrame with directed edges containing columns:
+            'source', 'destination', 'rank', 'similarity'
+
+    Returns:
+        DataFrame with mutual edges containing:
+            - 'source', 'destination': Node pair (source < destination)
+            - 'source_to_dest_rank': Rank of destination in source's k-NN
+            - 'dest_to_source_rank': Rank of source in destination's k-NN
+            - 'source_to_dest_similarity': Similarity from source perspective
+            - 'dest_to_source_similarity': Similarity from destination perspective
+    """
+    # Create a reversed version of edges for matching
+    reversed_edges_df = directed_edges_df.rename(columns={
+        'source': 'destination',
+        'destination': 'source',
+        'rank': 'reverse_rank',
+        'similarity': 'reverse_similarity'
+    })
+    
+    # Inner join to find mutual connections
+    # This keeps only edges where both directions exist
+    mutual_edges_df = directed_edges_df.merge(
+        reversed_edges_df,
+        on=['source', 'destination'],
+        how='inner'
+    )
+    
+    # Rename columns for clarity
+    mutual_edges_df = mutual_edges_df.rename(columns={
+        'rank': 'source_to_dest_rank',
+        'reverse_rank': 'dest_to_source_rank',
+        'similarity': 'source_to_dest_similarity',
+        'reverse_similarity': 'dest_to_source_similarity'
+    })
+    
+    num_mutual_edges = len(mutual_edges_df)
+    num_directed_edges = len(directed_edges_df)
+    mutual_percentage = (num_mutual_edges / num_directed_edges * 100) if num_directed_edges > 0 else 0
+    
+    logger.info(f"Found {num_mutual_edges:,} mutual edges from {num_directed_edges:,} "
+                f"directed edges ({mutual_percentage:.1f}% mutual)")
+    
+    return mutual_edges_df
+
+
+def _compute_hybrid_edge_weight(
+    mutual_edges_df: cudf.DataFrame,
+    rank_weight_factor: float = 1.0,
+    similarity_weight_factor: float = 1.0
+) -> cudf.Series:
+    """
+    Calculates hybrid edge weights combining mutual rank and similarity scores.
+
+    This weighting scheme creates robust edge weights that are high only when:
+    1. Both nodes rank each other highly (low rank numbers)
+    2. The nodes have high similarity in the embedding space
+
+    The combination helps filter out spurious connections that might arise from
+    only considering one factor.
+
+    Args:
+        mutual_edges_df: DataFrame with mutual edges containing rank and
+            similarity information for both directions.
+        rank_weight_factor: Scaling factor for the rank component (default=1.0).
+        similarity_weight_factor: Scaling factor for the similarity component (default=1.0).
+
+    Returns:
+        A cuDF Series containing the computed hybrid weights for each edge.
+
+    Notes:
+        - Lower ranks (closer neighbors) produce higher weights
+        - The '+2' in rank calculation prevents division by zero and provides scaling
+        - Final weight is the product of rank and similarity components
+    """
+    # Calculate rank-based weight component
+    # This is inversely proportional to the sum of mutual ranks
+    # Adding 2 prevents division by zero and scales appropriately
+    rank_sum = (
+        mutual_edges_df['source_to_dest_rank'] +
+        mutual_edges_df['dest_to_source_rank']
+    )
+    rank_based_weight = rank_weight_factor / (rank_sum + 2.0)
+    
+    # Calculate similarity-based weight component
+    # Average the bidirectional similarities for symmetry
+    avg_similarity = (
+        mutual_edges_df['source_to_dest_similarity'] +
+        mutual_edges_df['dest_to_source_similarity']
+    ) / 2.0
+    similarity_based_weight = similarity_weight_factor * avg_similarity
+    
+    # Combine components multiplicatively
+    # High weight requires BOTH high rank AND high similarity
+    hybrid_weight = rank_based_weight * similarity_based_weight
+    
+    # Log weight statistics for monitoring
+    weight_stats = {
+        'min': float(hybrid_weight.min()),
+        'max': float(hybrid_weight.max()),
+        'mean': float(hybrid_weight.mean()),
+        'std': float(hybrid_weight.std())
+    }
+    logger.debug(f"Hybrid weight statistics: min={weight_stats['min']:.4f}, "
+                 f"max={weight_stats['max']:.4f}, mean={weight_stats['mean']:.4f}, "
+                 f"std={weight_stats['std']:.4f}")
+    
+    return hybrid_weight
+
+
+def build_mutual_rank_graph(
+    embedding_vectors: cupy.ndarray,
+    k_neighbors: int,
+    distance_metric: str = 'cosine',
+    min_edge_weight: Optional[float] = None,
+    rank_weight_factor: float = 1.0,
+    similarity_weight_factor: float = 1.0
+) -> Tuple[cugraph.Graph, cudf.DataFrame]:
+    """
+    Constructs a mutual k-nearest neighbor graph with hybrid edge weighting.
+
+    This function creates a robust similarity graph where edges exist only between
+    mutually close points (each point is in the other's k-nearest neighbors).
+    Edge weights combine both rank information and similarity scores to provide
+    a nuanced measure of connection strength.
+
+    The resulting graph is particularly useful for:
+    - Clustering in high-dimensional spaces
+    - Entity resolution and deduplication
+    - Community detection in embedding spaces
+    - Outlier detection (isolated nodes)
+
+    Args:
+        embedding_vectors: A 2D CuPy array of shape (n_samples, n_features)
+            containing embedding vectors for all data points.
+        k_neighbors: Number of nearest neighbors to consider. Higher values
+            create denser graphs but increase computation time.
+        distance_metric: Distance metric for k-NN search ('cosine', 'euclidean', etc.).
+            'cosine' is recommended for normalized embeddings.
+        min_edge_weight: Optional minimum weight threshold. Edges with weights
+            below this value are removed. None keeps all mutual edges.
+        rank_weight_factor: Scaling factor for rank-based weight component.
+        similarity_weight_factor: Scaling factor for similarity-based weight component.
+
+    Returns:
+        A tuple containing:
+            - cugraph.Graph: The constructed mutual k-NN graph with weighted edges
+            - cudf.DataFrame: Edge list with columns 'source', 'destination', 'weight'
+
+    Raises:
+        ValueError: If input vectors are not 2D or k_neighbors is invalid.
+
+    Example:
+        >>> embeddings = cupy.random.randn(1000, 128)  # 1000 samples, 128 dimensions
+        >>> graph, edges = build_mutual_rank_graph(embeddings, k_neighbors=10)
+        >>> components = cugraph.connected_components(graph)
+    """
+    # Validate inputs
+    if embedding_vectors.ndim != 2:
+        raise ValueError(f"Expected 2D embedding array, got shape {embedding_vectors.shape}")
+    
+    num_samples, num_features = embedding_vectors.shape
+    if k_neighbors <= 0 or k_neighbors > num_samples:
+        raise ValueError(f"k_neighbors must be between 1 and {num_samples}, got {k_neighbors}")
+    
+    logger.info(f"Building mutual rank graph for {num_samples:,} samples with "
+                f"k={k_neighbors}, metric='{distance_metric}'")
+    
+    # Step 1: Compute directed k-NN edges
+    directed_edges_df = _compute_directed_knn_edges(
+        embedding_vectors,
+        k_neighbors,
+        distance_metric
+    )
+    
+    # Step 2: Identify mutual (bidirectional) edges
+    mutual_edges_df = _identify_mutual_edges(directed_edges_df)
+    
+    if mutual_edges_df.empty:
+        logger.warning("No mutual edges found. Consider increasing k_neighbors or "
+                       "checking data distribution.")
+        empty_graph = cugraph.Graph(directed=False)
+        empty_edges = cudf.DataFrame({'source': [], 'destination': [], 'weight': []})
+        return empty_graph, empty_edges
+    
+    # Step 3: Calculate hybrid weights for mutual edges
+    mutual_edges_df['weight'] = _compute_hybrid_edge_weight(
+        mutual_edges_df,
+        rank_weight_factor,
+        similarity_weight_factor
+    )
+    
+    # Step 4: Apply optional weight threshold
+    if min_edge_weight is not None:
+        original_edge_count = len(mutual_edges_df)
+        mutual_edges_df = mutual_edges_df[mutual_edges_df['weight'] >= min_edge_weight]
+        filtered_count = original_edge_count - len(mutual_edges_df)
+        
+        if filtered_count > 0:
+            logger.info(f"Filtered {filtered_count:,} edges below weight threshold {min_edge_weight}")
+        
+        if mutual_edges_df.empty:
+            logger.warning(f"All edges removed by weight threshold {min_edge_weight}")
+            empty_graph = cugraph.Graph(directed=False)
+            empty_edges = cudf.DataFrame({'source': [], 'destination': [], 'weight': []})
+            return empty_graph, empty_edges
+    
+    # Step 5: Prepare final edge list (keeping only necessary columns)
+    final_edge_list = mutual_edges_df[['source', 'destination', 'weight']].copy()
+    
+    # Step 6: Construct the undirected cuGraph Graph object
+    mutual_knn_graph = cugraph.Graph(directed=False)
+    mutual_knn_graph.from_cudf_edgelist(
+        final_edge_list,
         source='source',
         destination='destination',
         edge_attr='weight',
-        renumber=False
+        renumber=False  # Preserve original vertex IDs for mapping back to data
     )
-    logger.info(f"Successfully built mutual rank graph with {snn_graph.number_of_edges()} edges.")
-    return snn_graph
+    
+    # Log final graph statistics
+    num_vertices = mutual_knn_graph.number_of_vertices()
+    num_edges = mutual_knn_graph.number_of_edges()
+    avg_degree = (2 * num_edges) / num_vertices if num_vertices > 0 else 0
+    
+    logger.info(f"Successfully built mutual rank graph: {num_vertices:,} vertices, "
+                f"{num_edges:,} edges, average degree: {avg_degree:.1f}")
+    
+    return mutual_knn_graph, final_edge_list

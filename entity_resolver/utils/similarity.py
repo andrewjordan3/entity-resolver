@@ -160,9 +160,9 @@ def find_similar_pairs(
     # Step 3: Use the dedicated graph utility to convert the k-NN results
     # into a filtered edge list based on the distance threshold.
     matched_pairs = create_edge_list(
-        indices=indices,
-        distances=distances,
-        threshold=distance_threshold
+        neighbor_indices=indices,
+        neighbor_distances=distances,
+        distance_threshold=distance_threshold
     )
 
     # Return only the source and destination columns, which correspond to the

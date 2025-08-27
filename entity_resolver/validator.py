@@ -631,8 +631,8 @@ class ClusterValidator:
         # Use a weighted combination of match score and cluster average probability
         # For reassigned entities, use the match score weighted by cluster probability
         reassigned_prob = (
-            gdf_with_new.loc[has_new_assignment, 'match_score'] *
-            gdf_with_new.loc[has_new_assignment, 'new_avg_prob']
+            gdf_with_new['match_score'] *
+            gdf_with_new['new_avg_prob']
         )
         # Only update probabilities for rows that got a new assignment
         gdf_with_new['cluster_probability'] = gdf_with_new['cluster_probability'].mask(

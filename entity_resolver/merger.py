@@ -114,7 +114,12 @@ class ClusterMerger:
         # --- Step 3: Find connected components to identify merge groups ---
         # Each component in the graph represents a group of clusters that should be merged.
         components = utils.find_graph_components(
-            final_edges, 'source', 'dest', 'profile_idx', 'component_id'
+            edge_list_df=final_edges, 
+            source_column='source', 
+            destination_column='dest', 
+            directed=False, 
+            output_vertex_column='profile_idx', 
+            output_component_column='component_id'
         )
         
         profiles_with_components = cluster_profiles_gdf.reset_index().merge(

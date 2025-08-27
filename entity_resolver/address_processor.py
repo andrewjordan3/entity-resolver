@@ -492,9 +492,9 @@ class AddressProcessor:
         # Find connected components in similarity graph
         logger.debug("Finding connected components in similarity graph")
         components = utils.find_graph_components(
-            edge_list=matched_pairs,
-            vertex_col_name="unique_addr_idx",
-            component_col_name="component_id",
+            edge_list_df=matched_pairs,
+            output_vertex_column="unique_addr_idx",
+            output_component_column="component_id"
         )
         
         n_components = components["component_id"].nunique()

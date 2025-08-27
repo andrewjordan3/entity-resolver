@@ -452,20 +452,25 @@ class TextNormalizer:
             'addr_normalized_key': list(address_to_canonical_map.keys()),
             'canonical_name': list(address_to_canonical_map.values())
         })
-        
-        # Store original names for comparison
-        original_names = gdf['normalized_text'].copy()
+
+        # Store original names as a temporary column to prevent index misalignment after merge
+        gdf['original_names_temp'] = gdf['normalized_text']
         
         # Merge and update normalized_text
         gdf = gdf.merge(consolidation_map_gdf, on='addr_normalized_key', how='left')
         gdf['normalized_text'] = gdf['canonical_name'].fillna(gdf['normalized_text'])
+
+        affected_mask = gdf['canonical_name'].notna()
+
+        # Authoritative denominator: rows that actually had a canonical available
+        self._consolidation_stats['records_affected'] = int(affected_mask.sum())
         
         # Count changes
-        names_changed = (gdf['normalized_text'] != original_names).sum()
+        names_changed = (gdf['normalized_text'] != gdf['original_names_temp']).sum()
         self._consolidation_stats['names_changed'] = int(names_changed)
         
         # Clean up temporary column
-        gdf = gdf.drop(columns=['canonical_name'])
+        gdf = gdf.drop(columns=['canonical_name', 'original_names_temp'])
         
         return gdf
     
@@ -496,7 +501,7 @@ class TextNormalizer:
             # Calculate effectiveness
             if stats['addresses_with_multiple_names'] > 0:
                 effectiveness = (stats['names_changed'] / stats['records_affected']) * 100 if stats['records_affected'] > 0 else 0
-                logger.info(f"Consolidation effectiveness: {effectiveness:.1f}% of affected records were consolidated")
+                logger.info(f"Consolidation effectiveness: {effectiveness:.1f}% of affected records were changed to the canonical name")
         else:
             logger.info("No consolidation performed")
         

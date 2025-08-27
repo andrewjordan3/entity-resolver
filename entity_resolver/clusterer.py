@@ -390,7 +390,7 @@ class EntityClusterer:
         k_neighbors = self.config.snn_clustering_params["k_neighbors"]
         logger.debug(f"Building mutual rank graph with k={k_neighbors}")
         
-        snn_graph = utils.build_mutual_rank_graph(vectors_norm, k=k_neighbors)
+        snn_graph, _ = utils.build_mutual_rank_graph(vectors_norm, k_neighbors==k_neighbors)
         
         if snn_graph.number_of_edges() == 0:
             logger.warning("SNN graph has no edges. All points treated as noise.")
@@ -1050,7 +1050,7 @@ class EntityClusterer:
         
         # Log the parameter choices for debugging and analysis
         logger.debug(
-            f"UMAP run {run_index}: {view_type} view with "
+            f"UMAP run {run_index + 1}: {view_type} view with "
             f"n_neighbors={umap_params['n_neighbors']}, "
             f"min_dist={umap_params['min_dist']:.4f}, "
             f"spread={umap_params['spread']:.3f}, "
