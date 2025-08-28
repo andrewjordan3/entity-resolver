@@ -45,8 +45,10 @@ def calculate_similarity_gpu(
     logger.debug(f"Calculating row-wise similarity for two series of length {len(series_a)}.")
     
     # Ensure consistent data types and handle nulls before processing.
-    series_a = series_a.fillna('').astype(str).str.strip()
-    series_b = series_b.fillna('').astype(str).str.strip()
+    series_a = series_a.fillna('').astype(str).str.strip().str.normalize_spaces()
+    series_b = series_b.fillna('').astype(str).str.strip().str.normalize_spaces()
+    series_a = series_a.str.replace(r'[\u00A0\u2000-\u200B\u2060\uFEFF]+', '', regex=True)
+    series_b = series_b.str.replace(r'[\u00A0\u2000-\u200B\u2060\uFEFF]+', '', regex=True)
 
     # Initialize the final result series with a default similarity of 0.0.
     # This ensures that any rows we skip will have a defined, logical similarity score.
@@ -57,7 +59,7 @@ def calculate_similarity_gpu(
     # This logic is only necessary if the analyzer is character-based.
     min_n = 0
     if tfidf_params.get('analyzer') in ['char', 'char_wb']:
-        min_n, _ = tfidf_params.get('ngram_range', (1, 1))
+        min_n = min(tfidf_params.get('ngram_range', (1, 1)))
 
     # Create a mask to identify rows where BOTH strings are long enough for n-gram generation.
     # If not using character n-grams (min_n=0), all rows are considered valid initially.
