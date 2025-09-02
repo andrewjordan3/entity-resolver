@@ -373,5 +373,5 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 Maintained by: **Andrew Jordan**  
 Contact: **andrewjordan3@gmail.com**  
-Last Updated: **August 2025**
+Last Updated: **September 2025**
 
