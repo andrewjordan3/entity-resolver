@@ -197,7 +197,7 @@ class EntityClusterer:
             gdf_clustered = self._run_hdbscan(gdf, reduced_vectors)
             
             logger.info("Step 3: SNN graph clustering for noise rescue")
-            snn_labels = self._run_snn_engine(reduced_vectors)
+            snn_labels = self._run_snn_engine(reduced_vectors, gdf_clustered["cluster"].values)
             
             logger.info("Step 4: Ensemble HDBSCAN and SNN results")
             gdf_final = self._ensemble_cluster_labels(gdf_clustered, snn_labels)
@@ -363,7 +363,7 @@ class EntityClusterer:
         
         return gdf
 
-    def _run_snn_engine(self, reduced_vectors: cp.ndarray) -> cp.ndarray:
+    def _run_snn_engine(self, reduced_vectors: cp.ndarray, hdbscan_labels: cp.ndarray = None) -> cp.ndarray:
         """
         Run SNN graph clustering for noise rescue.
         
@@ -380,10 +380,9 @@ class EntityClusterer:
         """
         logger.info("Starting SNN Graph Clustering Engine")
         
-        # Normalize vectors for cosine similarity
+        # Normalize vectors for cosine similarity - UMAP output is not normalized
         logger.debug("Normalizing vectors for cosine similarity")
-        row_norms = cp.linalg.norm(reduced_vectors, axis=1, keepdims=True)
-        vectors_norm = reduced_vectors / (row_norms + 1e-8)
+        vectors_norm = utils.normalize_rows(reduced_vectors, copy=True)
         
         # Stage 1: Community detection
         logger.info("SNN Stage 1: Building graph and finding communities")
@@ -416,11 +415,17 @@ class EntityClusterer:
         
         # Stage 2: Attach noise points
         logger.info("SNN Stage 2: Attaching noise points to communities")
-        initial_noise = int((initial_labels == -1).sum())
+        # If we have HDBSCAN labels, use those as the starting point
+        if hdbscan_labels is not None:
+            labels_to_use = hdbscan_labels.copy()
+        else:
+            labels_to_use = initial_labels
+
+        initial_noise = int((labels_to_use == -1).sum())
         
         labels_after_attachment = utils.attach_noise_points(
             vectors_norm, 
-            initial_labels, 
+            labels_to_use, 
             **self.config.noise_attachment_params
         )
         
@@ -581,6 +586,8 @@ class EntityClusterer:
         Returns:
             DataFrame with ensembled cluster labels
         """
+        assert len(gdf_hdbscan) == len(snn_labels), f"Length mismatch: {len(gdf_hdbscan)} vs {len(snn_labels)}"
+
         params = self.config.ensemble_params
         logger.info("Ensembling HDBSCAN (precision) with SNN (recall)")
         

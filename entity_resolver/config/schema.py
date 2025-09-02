@@ -690,17 +690,17 @@ class ClustererConfig(BaseModel):
     
     noise_attachment_params: Dict[str, Any] = Field(
         default_factory=lambda: {
-            'k': 15,
-            'tau': 0.82,
-            'min_matching': 2,
-            'ratio_threshold': 1.5
+            'k_neighbors': 15,
+            'similarity_threshold': 0.82,
+            'min_neighbor_matches': 2,
+            'ambiguity_ratio_threshold': 1.5
         },
         description=(
             "Parameters for attaching noise points to clusters:\n"
-            "- k: Number of neighbors to check for attachment\n"
-            "- tau: Similarity threshold for attachment (0.7-0.9 typical)\n"
-            "- min_matching: Minimum shared neighbors required\n"
-            "- ratio_threshold: Ratio test for confident attachment"
+            "- k_neighbors: Number of neighbors to check for attachment\n"
+            "- similarity_threshold: Similarity threshold for attachment (0.7-0.9 typical)\n"
+            "- min_neighbor_matches: Minimum shared neighbors required\n"
+            "- ambiguity_ratio_threshold: Ratio test for confident attachment"
         )
     )
     

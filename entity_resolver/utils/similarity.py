@@ -90,30 +90,44 @@ def calculate_similarity_gpu(
     # combined vocabulary of both series. This guarantees that the same words
     # map to the same feature indices and have consistent IDF weights.
     combined_series = cudf.concat([series_a_valid, series_b_valid]).unique()
+
+    # It's possible for strings that are too short to make it through.
+    # Filter combined series for minimum length
+    if min_n > 0:
+        combined_series = combined_series[combined_series.str.len() >= min_n]
     
     # The combined series could be empty if the inputs only contained empty strings.
     if combined_series.empty:
         logger.debug("Combined series for fitting TF-IDF is empty. Returning.")
         return result_series
 
-    vectorizer = TfidfVectorizer(**tfidf_params)
-    vectorizer.fit(combined_series)
-    logger.debug(f"TF-IDF vectorizer fitted on a combined vocabulary of size {len(combined_series)}.")
+    try:
+        vectorizer = TfidfVectorizer(**tfidf_params)
+        vectorizer.fit(combined_series)
+        logger.debug(f"TF-IDF vectorizer fitted on a combined vocabulary of size {len(combined_series)}.")
 
-    # Transform each valid series into a TF-IDF matrix with L2 normalization (the default).
-    vectors_a = vectorizer.transform(series_a_valid)
-    vectors_b = vectorizer.transform(series_b_valid)
+        # Transform each valid series into a TF-IDF matrix with L2 normalization (the default).
+        vectors_a = vectorizer.transform(series_a_valid)
+        vectors_b = vectorizer.transform(series_b_valid)
 
-    # A key property of L2-normalized vectors is that their cosine similarity
-    # is equivalent to their dot product. This is a highly efficient operation.
-    # We multiply element-wise and then sum across the feature dimension (axis=1).
-    similarities_valid = vectors_a.multiply(vectors_b).sum(axis=1)
+        # A key property of L2-normalized vectors is that their cosine similarity
+        # is equivalent to their dot product. This is a highly efficient operation.
+        # We multiply element-wise and then sum across the feature dimension (axis=1).
+        similarities_valid = vectors_a.multiply(vectors_b).sum(axis=1)
 
-    # Create a cuDF Series from the calculated similarities, using the correct index.
-    similarities_series = cudf.Series(cupy.asarray(similarities_valid).flatten(), index=series_a_valid.index)
+        # Create a cuDF Series from the calculated similarities, using the correct index.
+        similarities_series = cudf.Series(cupy.asarray(similarities_valid).flatten(), index=series_a_valid.index)
 
-    # Place the calculated similarities back into our full result series at the correct locations.
-    result_series.loc[valid_mask] = similarities_series
+        # Place the calculated similarities back into our full result series at the correct locations.
+        result_series.loc[valid_mask] = similarities_series
+
+    except RuntimeError as e:
+        if "Insufficient number of characters" in str(e):
+            logger.warning(f"N-gram generation failed despite checks. Returning zeros. Error: {e}")
+            # Return the zero-filled series
+            return result_series
+        else:
+            raise
 
     return result_series
 
