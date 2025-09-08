@@ -428,7 +428,7 @@ def center_kernel_vector(
                               If input was 1D, output maintains batch dimension of 1.
                               Properties:
                               - Consistent with training kernel centering
-                              - Row means approximately sum to training_kernel_grand_mean
+                              - Row sums ≈ 0 (equivalently, n*grand_mean - Σ row_means)
     
     Raises:
         ValueError: If dimensions are incompatible or inputs are invalid.
@@ -563,16 +563,58 @@ def center_kernel_vector(
             f"{float(centered_kernel_vector.max()):.4f}]"
         )
         
-        # Verify centering (sum of centered values should be close to zero for each row)
+        # This check verifies the mathematical integrity of the centering process,
+        # accounting for the nuances of floating-point arithmetic.
+
+        # Calculate the actual sum of each row in the centered matrix.
         row_sums = centered_kernel_vector.sum(axis=1)
-        expected_sum = n_train_samples * training_kernel_grand_mean
-        max_deviation = float(cupy.abs(row_sums - expected_sum).max())
-        
-        if max_deviation > 1e-3 * n_train_samples:
+
+        # In exact arithmetic, the sum of each centered row should equal this value,
+        # assuming the training statistics were computed from the UN-centered training kernel.
+        expected_sum = (n_train_samples * training_kernel_grand_mean -
+                        training_kernel_row_means.sum())
+
+        # The residual is the difference between the actual and theoretical sums.
+        # This value should be very close to zero.
+        residual = row_sums - expected_sum
+
+        # --- Data-Aware Tolerance Calculation ---
+        # Instead of a fixed tolerance, we compute a dynamic tolerance based on
+        # the properties of the input data, which is a more robust approach.
+
+        # Get the machine epsilon for the data's precision (e.g., float32 or float64).
+        eps = cupy.finfo(centered_kernel_vector.dtype).eps
+
+        # The potential for floating-point error accumulation is proportional to the
+        # sum of the absolute values of the numbers involved (L1 norm). We use the
+        # uncentered input vector for this scaling factor.
+        row_l1_norm = cupy.abs(kernel_vector).sum(axis=1)
+
+        # A safety constant, typically between 16 and 32 in numerical analysis,
+        # to provide a safe margin for the error estimation.
+        safety_constant = 16.0
+
+        # The per-row tolerance scales with the data type's precision and the row's magnitude.
+        per_row_tolerance = safety_constant * eps * row_l1_norm
+
+        # For rows with very small or zero values, the relative tolerance can become
+        # meaninglessly small. We enforce a small absolute floor to prevent this.
+        atol_floor = 1e-5 if centered_kernel_vector.dtype == cupy.float32 else 1e-8
+        per_row_tolerance = cupy.maximum(per_row_tolerance, atol_floor)
+
+        # Find the single largest deviation and the largest allowed tolerance in the batch.
+        max_deviation = float(cupy.max(cupy.abs(residual)))
+        max_allowed_tolerance = float(cupy.max(per_row_tolerance))
+
+        # Check if the largest observed deviation exceeds the largest allowed tolerance.
+        if max_deviation > max_allowed_tolerance:
+            # This log message provides clear, actionable information for debugging.
             logger.warning(
-                f"Large deviation from expected row sum: {max_deviation:.4f} "
-                f"(expected ~{expected_sum:.4f}). "
-                "Check training statistics computation."
+                "Large deviation in centered kernel row sum. "
+                f"Max Deviation: {max_deviation:.6f}, "
+                f"Expected Sum: {float(expected_sum):.6f}, "
+                f"Max Allowed Tolerance: {max_allowed_tolerance:.6f}. "
+                "Check that training statistics come from the UNcentered training kernel."
             )
     
     # Step 8: Return with original dimensionality

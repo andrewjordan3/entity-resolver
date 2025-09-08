@@ -13,7 +13,7 @@ import logging
 from typing import Optional, Dict, List
 
 import cudf
-import cupy as cp
+import re
 import pandas as pd
 
 # Local Package Imports
@@ -55,6 +55,18 @@ class AddressProcessor:
         self.validation_config = validation_config
         self.column_config = column_config
         self.vectorizer_config = vectorizer_config
+
+        # Pre-compile regex patterns for maximum efficiency. Compiling them once
+        # during initialization avoids the significant overhead of repeated
+        # compilation when processing large datasets.
+        # This pattern identifies and removes zero-width, control, and non-standard
+        # space characters that can be invisible but disrupt tokenization.
+        self.ZW_CTRL_PATTERN = re.compile(r'[\u00A0\u1680\u180E\u2000-\u200D\u202F\u205F\u2060\u3000\uFEFF\u0000-\u001F\u007F]+')
+        # This pattern finds common separators and is used to normalize them to a single space.
+        self.SEPS_PATTERN = re.compile(r'[,\|;/]+')
+        # This pattern is used to identify and discard address fragments that contain
+        # only punctuation and whitespace, which are effectively noise.
+        self.PUNCT_ONLY_PATTERN = re.compile(r'^[\s\.,;#\-_/\\]+$')
         
         logger.info("Initialized AddressProcessor")
         logger.debug(f"Address columns configured: {column_config.address_cols}")
@@ -180,61 +192,105 @@ class AddressProcessor:
     
     def _combine_address_columns(self, gdf: cudf.DataFrame) -> cudf.Series:
         """
-        Combine configured address columns into single string.
-        
+        Combine configured address columns into a single, clean string for libpostal.
+
+        This function applies a robust, multi-stage preprocessing pipeline to each
+        address component individually before concatenating them. This ensures a
+        high-quality, standardized input string, which significantly improves the
+        accuracy of libpostal's statistical parsing model.
+
+        Preprocessing Pipeline per Component:
+        1. Unicode Normalization (NFKC): Standardizes character representations.
+        2. Character Removal: Eliminates invisible control characters that break parsing.
+        3. Separator Normalization: Converts various separators to a standard space.
+        4. Lowercasing: Ensures case-insensitivity for uniform input.
+        5. Noise Filtering: Removes parts that contain only punctuation.
+
         Args:
-            gdf: DataFrame with address columns
-            
+            gdf: DataFrame with one or more address columns.
+
         Returns:
-            Series with combined address strings
+            A cuDF Series containing the combined and preprocessed address strings.
         """
         address_cols: List[str] = list(self.column_config.address_cols or [])
-        
+
         if not address_cols:
             logger.warning("No address columns specified; returning empty series")
             return cudf.Series([""] * len(gdf), index=gdf.index)
-        
-        # Check which columns are available
-        available_cols = []
-        missing_cols = []
-        
-        for col in address_cols:
-            if col in gdf.columns:
-                available_cols.append(col)
-            else:
-                missing_cols.append(col)
-        
+
+        # Check which of the configured address columns are actually in the DataFrame.
+        available_cols = [col for col in address_cols if col in gdf.columns]
+        missing_cols = [col for col in address_cols if col not in gdf.columns]
+
         if missing_cols:
-            logger.warning(f"Missing address columns: {missing_cols}")
-        
+            logger.warning(f"Missing address columns, they will be ignored: {missing_cols}")
+
         if not available_cols:
-            logger.error("No valid address columns found in DataFrame")
+            logger.error("No valid address columns found in DataFrame to combine.")
             return cudf.Series([""] * len(gdf), index=gdf.index)
-        
+
         logger.debug(f"Combining {len(available_cols)} address columns: {available_cols}")
-        
-        # Get address parts, handling nulls
+
+        # Process each address part with robust cleaning before concatenation.
         address_parts = []
         for col in available_cols:
-            part = gdf[col].fillna("").astype("str")
-            address_parts.append(part)
-        
-        # Combine parts
+            # Start with the raw column, filling nulls and ensuring string type.
+            address_part = gdf[col].fillna("").astype("str")
+
+            # Step 1: Unicode Normalization (NFKC). This is a critical first step. It
+            # standardizes character representations, converting full-width characters to
+            # half-width, handling ligatures (e.g., 'ﬁ' -> 'fi'), and collapsing
+            # combining marks. This creates a canonical text representation for parsing.
+            address_part = address_part.str.normalize_characters(form='NFKC')
+
+            # Step 2: Remove disruptive characters and normalize separators. Zero-width,
+            # control, and non-standard space characters can break tokenization logic
+            # and are often invisible. Removing them prevents hard-to-debug parsing errors.
+            # Common separators are then collapsed into a single space for consistency.
+            address_part = address_part.str.replace(self.ZW_CTRL_PATTERN.pattern, '', regex=True)
+            address_part = address_part.str.replace(self.SEPS_PATTERN.pattern, ' ', regex=True)
+
+            # Step 3: Convert to lowercase. libpostal is largely case-insensitive, but
+            # providing a consistently cased string is a best practice that removes
+            # any potential ambiguity for its statistical model.
+            address_part = address_part.str.lower()
+
+            # Step 4: Trim whitespace and filter out "empty" fragments. After cleaning,
+            # some parts might be left with only punctuation or spaces (e.g., a column
+            # that only contained "-"). These are effectively noise and should be
+            # treated as empty strings to avoid junk tokens in the final address.
+            address_part = address_part.str.strip()
+            # The `where` clause acts as a conditional replacement: if the part does NOT
+            # match the punctuation-only pattern, keep it; otherwise, replace it with ''.
+            address_part = address_part.where(~address_part.str.match(self.PUNCT_ONLY_PATTERN.pattern), other='')
+
+            address_parts.append(address_part)
+
+        # Combine the cleaned parts into a single string.
         if len(address_parts) == 1:
-            combined = address_parts[0]
+            combined_address = address_parts[0]
         else:
-            combined = address_parts[0].str.cat(others=address_parts[1:], sep=" ")
-        
-        # Clean up whitespace
-        combined = combined.str.normalize_spaces().str.strip()
-        
-        # Log sample for debugging
-        sample_size = min(3, len(combined))
-        if sample_size > 0:
-            sample = combined.head(sample_size).to_pandas().tolist()
+            # The `str.cat` method is highly efficient for this operation on the GPU.
+            combined_address = address_parts[0].str.cat(others=address_parts[1:], sep=" ")
+
+        # Step 5: Perform a final cleanup on the fully combined string. After joining,
+        # there might be residual separators at the boundaries or multiple spaces if
+        # an empty part was joined. This pass ensures the final output is clean,
+        # compact, and has no leading/trailing whitespace.
+        combined_address = (
+            combined_address
+            .str.replace(self.SEPS_PATTERN.pattern, ' ', regex=True)
+            .str.normalize_spaces()
+            .str.strip()
+        )
+
+        # Log a few samples for debugging and verification purposes.
+        sample_size = min(3, len(combined_address))
+        if sample_size > 0 and not combined_address.empty:
+            sample = combined_address.head(sample_size).to_pandas().tolist()
             logger.debug(f"Combined address samples: {sample}")
-        
-        return combined
+
+        return combined_address
     
     def _parse_address_series(self, address_series: cudf.Series) -> cudf.DataFrame:
         """

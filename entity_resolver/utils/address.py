@@ -184,31 +184,79 @@ def _ensure_address_columns(gdf: cudf.DataFrame) -> cudf.DataFrame:
     return gdf
 
 
-def create_address_key_gpu(gdf: cudf.DataFrame) -> cudf.Series:
+def create_address_key_gpu(address_dataframe: cudf.DataFrame) -> cudf.Series:
     """
-    Creates a normalized address key from component columns on the GPU.
+    Creates a robust, normalized address key from component columns on the GPU.
 
-    This function concatenates address components into a single, clean string
-    that can be used for grouping, joining, and creating a unique identifier
-    for an address.
+    This function is designed to produce a stable and consistent identifier for
+    each address, even when the source data has minor variations. It achieves this
+    by individually normalizing each critical component of the address before
+    concatenating them into a single key string. This component-wise approach
+    is far more reliable than cleaning the concatenated string.
+
+    The normalization pipeline includes:
+    1.  Standardizing street numbers (e.g., handling ranges like "123-125").
+    2.  Cleaning street names (e.g., removing inconsistent directional suffixes).
+    3.  Ensuring consistent ZIP code format (first 5 digits).
 
     Args:
-        gdf: A cuDF DataFrame containing the component address columns.
+        address_dataframe: A cuDF DataFrame containing the component address
+                           columns (e.g., 'addr_street_name', 'addr_city').
 
     Returns:
-        A cuDF Series containing the combined and normalized address key.
+        A cuDF Series containing the combined and highly normalized address key,
+        suitable for use in grouping, joining, or as a unique entity identifier.
     """
-    gdf = _ensure_address_columns(gdf.copy())
+    # Work on a copy of the DataFrame to prevent unintended side effects on the
+    # original DataFrame passed to the function. This is a safe practice.
+    address_dataframe_copy = _ensure_address_columns(address_dataframe.copy())
+    
+    # --- Component-wise Normalization ---
 
-    # Convert all component columns to string type after filling nulls.
-    key_components = [gdf[col].fillna('').astype(str) for col in ADDRESS_COMPONENT_COLUMNS]
+    # Normalize the street number.
+    # First, fill any nulls with an empty string and ensure it's a string type.
+    normalized_street_number = address_dataframe_copy['addr_street_number'].fillna('').astype(str)
+    # Then, remove any non-numeric characters that appear after the first sequence
+    # of numbers. This effectively handles ranges (e.g., "123-125" becomes "123")
+    # and extraneous text (e.g., "456 Apt B" becomes "456").
+    normalized_street_number = normalized_street_number.str.replace(r'[^0-9].*', '', regex=True)
+    
+    # Normalize the street name.
+    # Fill nulls, convert to string, and lowercase for case-insensitive matching.
+    standardized_street_name = address_dataframe_copy['addr_street_name'].fillna('').astype(str).str.lower()
+    # Remove common directional suffixes (e.g., n, s, e, w and their full-word
+    # counterparts). This is crucial because their usage can be inconsistent in
+    # source data ("Main St" vs "Main St N").
+    standardized_street_name = standardized_street_name.str.replace(r'\s+(n|s|e|w|north|south|east|west)$', '', regex=True)
+    
+    # Standardize the city name.
+    # Fill nulls, convert to string, and lowercase. City name abbreviations
+    # are handled by the upstream libpostal process, so no replacements are needed here.
+    standardized_city = address_dataframe_copy['addr_city'].fillna('').astype(str).str.lower()
+    
+    # --- Key Assembly ---
 
-    # Concatenate all components, separated by spaces.
-    normalized_key = key_components[0].str.cat(key_components[1:], sep=' ')
-
-    # Apply final cleaning: lowercase and collapse multiple spaces to ensure
-    # "123 Main St" and "123  MAIN   ST" produce the same key.
-    return normalized_key.str.lower().str.normalize_spaces()
+    # Create a list of the cleaned, standardized component Series.
+    # For state and zip, we perform a simple null fill, type conversion, and lowercase.
+    # The ZIP code is truncated to the first 5 digits to standardize formats like ZIP+4.
+    address_key_components = [
+        normalized_street_number,
+        standardized_street_name,
+        standardized_city,
+        address_dataframe_copy['addr_state'].fillna('').astype(str).str.lower(),
+        address_dataframe_copy['addr_zip'].fillna('').astype(str).str[:5]
+    ]
+    
+    # Concatenate all the processed components into a single string Series.
+    # A pipe character '|' is used as a delimiter. This is a robust choice
+    # because it is not a character that typically appears in address data,
+    # preventing ambiguity that a space or comma could cause.
+    final_address_key = address_key_components[0].str.cat(address_key_components[1:], sep='|')
+    
+    # As a final cleanup step, normalize all whitespace to single spaces and
+    # trim any leading/trailing whitespace. This handles any extraneous spaces
+    # that may have been introduced during the replacement steps.
+    return final_address_key.str.normalize_spaces()
 
 
 def calculate_address_score_gpu(gdf: cudf.DataFrame) -> cudf.Series:
