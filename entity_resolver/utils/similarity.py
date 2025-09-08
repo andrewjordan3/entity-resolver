@@ -5,6 +5,7 @@ similarity and finding similar pairs within a dataset using TF-IDF and
 Nearest Neighbors.
 """
 
+import gc
 import cudf
 import cupy
 import logging
@@ -45,10 +46,18 @@ def calculate_similarity_gpu(
     logger.debug(f"Calculating row-wise similarity for two series of length {len(series_a)}.")
     
     # Ensure consistent data types and handle nulls before processing.
-    series_a = series_a.fillna('').astype(str).str.strip().str.normalize_spaces()
-    series_b = series_b.fillna('').astype(str).str.strip().str.normalize_spaces()
-    series_a = series_a.str.replace(r'[\u00A0\u2000-\u200B\u2060\uFEFF]+', '', regex=True)
-    series_b = series_b.str.replace(r'[\u00A0\u2000-\u200B\u2060\uFEFF]+', '', regex=True)
+    # 1) Base sanitation
+    series_a = series_a.fillna('').astype(str).str.strip()
+    series_b = series_b.fillna('').astype(str).str.strip()
+
+    # 2) Unicode normalization (fold weird forms to standard ones)
+    series_a = series_a.str.normalize_characters(form='NFKC')
+    series_b = series_b.str.normalize_characters(form='NFKC')
+
+    # 3) Remove zero-widths & odd spaces, then collapse spaces
+    ZW_WEIRD = r'[\u00A0\u1680\u180E\u2000-\u200D\u202F\u205F\u2060\u3000\uFEFF]+'
+    series_a = series_a.str.replace(ZW_WEIRD, '', regex=True).str.normalize_spaces()
+    series_b = series_b.str.replace(ZW_WEIRD, '', regex=True).str.normalize_spaces()
 
     # Initialize the final result series with a default similarity of 0.0.
     # This ensures that any rows we skip will have a defined, logical similarity score.
@@ -106,6 +115,9 @@ def calculate_similarity_gpu(
         vectorizer.fit(combined_series)
         logger.debug(f"TF-IDF vectorizer fitted on a combined vocabulary of size {len(combined_series)}.")
 
+        # The combined series is no longer needed after fitting the vectorizer.
+        del combined_series
+
         # Transform each valid series into a TF-IDF matrix with L2 normalization (the default).
         vectors_a = vectorizer.transform(series_a_valid)
         vectors_b = vectorizer.transform(series_b_valid)
@@ -115,8 +127,15 @@ def calculate_similarity_gpu(
         # We multiply element-wise and then sum across the feature dimension (axis=1).
         similarities_valid = vectors_a.multiply(vectors_b).sum(axis=1)
 
+        # The large TF-IDF matrices are no longer needed.
+        del vectors_a
+        del vectors_b
+
         # Create a cuDF Series from the calculated similarities, using the correct index.
         similarities_series = cudf.Series(cupy.asarray(similarities_valid).flatten(), index=series_a_valid.index)
+
+        # The intermediate similarities array is no longer needed.
+        del similarities_valid
 
         # Place the calculated similarities back into our full result series at the correct locations.
         result_series.loc[valid_mask] = similarities_series
@@ -128,6 +147,14 @@ def calculate_similarity_gpu(
             return result_series
         else:
             raise
+
+    finally:
+        # --- Memory Management ---
+        # This block ensures cleanup happens regardless of success or failure.
+        # It's the most important part for preventing memory leaks over many calls.
+        gc.collect()
+        cupy.get_default_memory_pool().free_all_blocks()
+        logger.debug("GPU memory cleanup complete.")
 
     return result_series
 
@@ -160,7 +187,7 @@ def find_similar_pairs(
         logger.warning("find_similar_pairs requires at least two strings to compare.")
         return cudf.DataFrame({'source': [], 'destination': []})
 
-    logger.info(f"Finding similar pairs within a series of {len(string_series)} strings.")
+    logger.debug(f"Finding similar pairs within a series of {len(string_series)} strings.")
     logger.debug(f"Using distance threshold: {distance_threshold}")
 
     # Step 1: Vectorize the input strings into a TF-IDF matrix.
@@ -173,6 +200,9 @@ def find_similar_pairs(
     distances, indices = nn_model.kneighbors(tfidf_matrix)
     logger.debug(f"Found neighbors for {len(indices)} items.")
 
+    # We are now done with the large TF-IDF matrix, so we can delete it.
+    del tfidf_matrix
+
     # Step 3: Use the dedicated graph utility to convert the k-NN results
     # into a filtered edge list based on the distance threshold.
     matched_pairs = create_edge_list(
@@ -180,6 +210,14 @@ def find_similar_pairs(
         neighbor_distances=distances,
         distance_threshold=distance_threshold
     )
+
+    # We are now done with the large distance and index arrays.
+    del distances
+    del indices
+
+    # Step 4: Force cleanup before returning.
+    gc.collect()
+    cupy.get_default_memory_pool().free_all_blocks()
 
     # Return only the source and destination columns, which correspond to the
     # integer indices of the items in the original `string_series`.

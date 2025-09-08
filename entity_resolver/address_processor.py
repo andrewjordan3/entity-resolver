@@ -313,7 +313,7 @@ class AddressProcessor:
         out_gdf = cudf.concat([gdf, parsed_df_renamed], axis=1)
         
         # Ensure all expected columns exist and handle nulls
-        for original_col, new_col in rename_map.items():
+        for _, new_col in rename_map.items():
             if new_col not in out_gdf.columns:
                 out_gdf[new_col] = ""
                 logger.debug(f"Column '{new_col}' not found; adding empty column")

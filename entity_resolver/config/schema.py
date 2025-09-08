@@ -17,8 +17,7 @@ The main ResolverConfig class composes all subordinate configurations for each s
 of the entity resolution process, creating a single source of truth for all parameters.
 """
 
-from pathlib import Path
-from typing import List, Dict, Set, Any, Optional, Literal, Union, Tuple
+from typing import List, Dict, Set, Any, Optional, Literal, Tuple
 from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 import cupy
 
