@@ -73,7 +73,7 @@ class AddressProcessor:
         self.SEPS_PATTERN = re.compile(r'[,\|;/]+')
         # This pattern is used to identify and discard address fragments that contain
         # only punctuation and whitespace, which are effectively noise.
-        self.PUNCT_ONLY_PATTERN = re.compile(r'^[\s\.,;#\-_/\\]+$')
+        self.PUNCT_ONLY_PATTERN = re.compile(r'^[\s.,;#_/\\-]+$')
         
         logger.info("Initialized AddressProcessor")
         logger.debug(f"Address columns configured: {column_config.address_cols}")

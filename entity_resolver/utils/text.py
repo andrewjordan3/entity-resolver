@@ -61,6 +61,10 @@ _ASCII_COMPAT_MAP = {
     "\u00B7": " ",  # MIDDLE DOT → space (acts as separator)
     "\u2218": "o",  # RING OPERATOR → 'o' (seen in part numbers)
     "\u2026": "...",# HORIZONTAL ELLIPSIS → three periods
+    "\u00AE": "",   # REGISTERED SIGN (®) → remove
+    "\u2122": "",   # TRADE MARK SIGN (™) → remove
+    "\u00B0": "",   # DEGREE SIGN (°) → remove
+    "\u02DA": "",   # RING ABOVE (˚) → remove
 
     # --- Quotes and Primes (unify to ASCII) ---
     "\u2018": "'",  # LEFT SINGLE QUOTATION MARK
