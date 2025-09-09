@@ -77,19 +77,20 @@ class TextNormalizer:
         
         # Business abbreviation patterns - used frequently
         # These expand common abbreviations to their full forms
+        # Pattern: (boundary_start)abbrev.?(boundary_end) -> \1expansion\2
         business_abbreviations = {
-            'corp': (r'\bcorp\b\.?', 'corporation'),
-            'inc': (r'\binc\b\.?', 'incorporated'),
-            'ltd': (r'\bltd\b\.?', 'limited'),
-            'llc': (r'\bllc\b\.?', 'limited liability company'),
-            'co': (r'\bco\b\.?', 'company'),
-            'assoc': (r'\bassoc\b\.?', 'associates'),
-            'mfg': (r'\bmfg\b\.?', 'manufacturing'),
-            'intl': (r'\bintl\b\.?', 'international'),
-            'dist': (r'\bdist\b\.?', 'distribution'),
-            'svcs': (r'\bsvcs?\b\.?', 'services'),
-            'mgmt': (r'\bmgmt\b\.?', 'management'),
-            'grp': (r'\bgrp\b\.?', 'group')
+            'corp': (r'(^|[^a-zA-Z0-9_])corp\.?($|[^a-zA-Z0-9_])', r'\1corporation\2'),
+            'inc': (r'(^|[^a-zA-Z0-9_])inc\.?($|[^a-zA-Z0-9_])', r'\1incorporated\2'),
+            'ltd': (r'(^|[^a-zA-Z0-9_])ltd\.?($|[^a-zA-Z0-9_])', r'\1limited\2'),
+            'llc': (r'(^|[^a-zA-Z0-9_])llc\.?($|[^a-zA-Z0-9_])', r'\1limited liability company\2'),
+            'co': (r'(^|[^a-zA-Z0-9_])co\.?($|[^a-zA-Z0-9_])', r'\1company\2'),
+            'assoc': (r'(^|[^a-zA-Z0-9_])assoc\.?($|[^a-zA-Z0-9_])', r'\1associates\2'),
+            'mfg': (r'(^|[^a-zA-Z0-9_])mfg\.?($|[^a-zA-Z0-9_])', r'\1manufacturing\2'),
+            'intl': (r'(^|[^a-zA-Z0-9_])intl\.?($|[^a-zA-Z0-9_])', r'\1international\2'),
+            'dist': (r'(^|[^a-zA-Z0-9_])dist\.?($|[^a-zA-Z0-9_])', r'\1distribution\2'),
+            'svcs': (r'(^|[^a-zA-Z0-9_])svcs?\.?($|[^a-zA-Z0-9_])', r'\1services\2'),
+            'mgmt': (r'(^|[^a-zA-Z0-9_])mgmt\.?($|[^a-zA-Z0-9_])', r'\1management\2'),
+            'grp': (r'(^|[^a-zA-Z0-9_])grp\.?($|[^a-zA-Z0-9_])', r'\1group\2')
         }
         
         for abbrev_key, (pattern_str, expansion) in business_abbreviations.items():
@@ -122,7 +123,7 @@ class TextNormalizer:
         separator_patterns = {
             'ampersand': (r'&+', ' and '),              # One or more ampersands
             'plus': (r'[+]+', ' and '),                  # One or more plus signs
-            'n_word': (r'\bn\b', ' and '),              # Letter 'n' as word
+            'n_word': (r'(^|[^a-zA-Z0-9_])n($|[^a-zA-Z0-9_])', r'\1 and \2'),              # Letter 'n' as word
             'forward_slash': (r'/', ' '),               # Forward slashes
             'backslash': (r'\\', ' '),                  # Backslashes
             'pipe': (r'\|', ' '),                       # Pipe characters
@@ -133,7 +134,7 @@ class TextNormalizer:
         
         for sep_key, (pattern_str, replacement) in separator_patterns.items():
             pattern_name = f'separator_{sep_key}'
-            patterns[pattern_name] = re.compile(pattern_str)
+            patterns[pattern_name] = re.compile(pattern_str, re.IGNORECASE if sep_key == 'n_word' else 0)
             patterns[f'{pattern_name}_replacement'] = replacement
         
         logger.debug(f"  - Compiled {len(separator_patterns)} separator patterns")
@@ -148,12 +149,13 @@ class TextNormalizer:
         # OCR error correction patterns
         # These fix common character substitutions from OCR systems
         ocr_patterns = {
-            'zero_before_letter': (r'\b0(?=[a-z])', 'o'),    # 0 -> o before letters
-            'zero_after_letter': (r'(?<=[a-z])0\b', 'o'),    # 0 -> o after letters
-            'one_before_letter': (r'\b1(?=[a-z])', 'i'),     # 1 -> i before letters
-            'one_after_letter': (r'(?<=[a-z])1\b', 'i'),     # 1 -> i after letters
-            'five_before_letter': (r'\b5(?=[a-z])', 's'),    # 5 -> s before letters
-            'five_after_letter': (r'(?<=[a-z])5\b', 's')     # 5 -> s after letters
+            # Pattern captures the boundary + digit + letter, replaces with boundary + corrected letter + original letter
+            'zero_before_letter': (r'(^|[^a-zA-Z0-9])0([a-z])', r'\1o\2'),
+            'zero_after_letter': (r'([a-z])0($|[^a-zA-Z0-9])', r'\1o\2'),
+            'one_before_letter': (r'(^|[^a-zA-Z0-9])1([a-z])', r'\1i\2'),
+            'one_after_letter': (r'([a-z])1($|[^a-zA-Z0-9])', r'\1i\2'),
+            'five_before_letter': (r'(^|[^a-zA-Z0-9])5([a-z])', r'\1s\2'),
+            'five_after_letter': (r'([a-z])5($|[^a-zA-Z0-9])', r'\1s\2')
         }
         
         for ocr_key, (pattern_str, replacement) in ocr_patterns.items():
@@ -164,18 +166,20 @@ class TextNormalizer:
         logger.debug(f"  - Compiled {len(ocr_patterns)} OCR correction patterns")
         
         # Final cleanup patterns
-        patterns['possessive_s'] = re.compile(r"'s\b", re.IGNORECASE)
-        patterns['possessive_plural'] = re.compile(r"s'\b", re.IGNORECASE)
+        # Use capture groups to simulate word boundaries for possessives
+        patterns['possessive_s'] = re.compile(r"'s($|[^a-zA-Z0-9_])", re.IGNORECASE)
+        patterns['possessive_plural'] = re.compile(r"s'($|[^a-zA-Z0-9_])", re.IGNORECASE)
         patterns['non_alphanumeric'] = re.compile(r'[^\w\s]')
         patterns['trailing_numbers'] = re.compile(r'\s+\d+$')
-        patterns['single_chars'] = re.compile(r'\b(?![ai]\b)[a-z]\b', re.IGNORECASE)
+        # This is a clever and compatible way to handle single characters
+        patterns['single_chars'] = re.compile(r'(^|[^a-zA-Z0-9_])([b-hj-z])($|[^a-zA-Z0-9_])', re.IGNORECASE)
         patterns['multiple_spaces'] = re.compile(r'\s+')
         logger.debug("  - Compiled final cleanup patterns")
         
         # Compile suffix removal pattern if suffixes configured
         if self.config.suffixes_to_remove:
             escaped_suffixes = [re.escape(suffix) for suffix in self.config.suffixes_to_remove]
-            suffix_pattern_str = r'\b(?:' + '|'.join(escaped_suffixes) + r')(?:\b|$)'
+            suffix_pattern_str = r'(^|[^a-zA-Z0-9_])(?:' + '|'.join(escaped_suffixes) + r')($|[^a-zA-Z0-9_])'
             patterns['suffix_removal'] = re.compile(suffix_pattern_str, re.IGNORECASE)
             logger.debug(f"  - Compiled suffix removal pattern for {len(self.config.suffixes_to_remove)} suffixes")
         
@@ -185,10 +189,10 @@ class TextNormalizer:
                 # Create unique pattern name for each custom replacement
                 pattern_key = f'custom_replacement_{old_word}'
                 # Ensure word boundaries for accurate matching
-                pattern_str = r'\b' + re.escape(old_word) + r'\b'
+                pattern_str = r'(^|[^a-zA-Z0-9_])' + re.escape(old_word) + r'($|[^a-zA-Z0-9_])'
                 patterns[pattern_key] = re.compile(pattern_str, re.IGNORECASE)
                 # Store the replacement text
-                patterns[f'{pattern_key}_replacement'] = new_word
+                patterns[f'{pattern_key}_replacement'] = r'\1' + new_word + r'\2'
             
             logger.debug(f"  - Compiled {len(self.config.replacements)} custom replacement patterns")
         
