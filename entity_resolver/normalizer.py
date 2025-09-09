@@ -334,7 +334,7 @@ class TextNormalizer:
         qualifier_count = qualifier_mask.sum()
         
         # Use extracted name where qualifier found, keep original otherwise
-        normalized_series = extracted_business_names[0].fillna(normalized_series)
+        normalized_series = extracted_business_names.fillna(normalized_series)
         logger.info(f"  - Processed business qualifiers in {qualifier_count:,} records")
 
         # Step 7: Apply custom word replacements from configuration
