@@ -112,7 +112,7 @@ def _format_parsed_components(parsed_components: Dict[str, str], original_addres
         'address_line_1.street_number': street_number,
         'address_line_1.street_name': street_name,
         'city': parsed_components.get('city', ''),
-        'state': parsed_components.get('state', '').upper(),
+        'state': parsed_components.get('state', ''),
         # Standardize postal codes to the 5-digit US format.
         # Note: This may truncate non-US postal codes.
         'postal_code': parsed_components.get('postcode', '')[:5]

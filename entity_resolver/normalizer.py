@@ -79,18 +79,18 @@ class TextNormalizer:
         # These expand common abbreviations to their full forms
         # Pattern: (boundary_start)abbrev.?(boundary_end) -> \1expansion\2
         business_abbreviations = {
-            'corp': (r'(^|[^a-zA-Z0-9_])corp\.?($|[^a-zA-Z0-9_])', r'\1corporation\2'),
-            'inc': (r'(^|[^a-zA-Z0-9_])inc\.?($|[^a-zA-Z0-9_])', r'\1incorporated\2'),
-            'ltd': (r'(^|[^a-zA-Z0-9_])ltd\.?($|[^a-zA-Z0-9_])', r'\1limited\2'),
-            'llc': (r'(^|[^a-zA-Z0-9_])llc\.?($|[^a-zA-Z0-9_])', r'\1limited liability company\2'),
-            'co': (r'(^|[^a-zA-Z0-9_])co\.?($|[^a-zA-Z0-9_])', r'\1company\2'),
-            'assoc': (r'(^|[^a-zA-Z0-9_])assoc\.?($|[^a-zA-Z0-9_])', r'\1associates\2'),
-            'mfg': (r'(^|[^a-zA-Z0-9_])mfg\.?($|[^a-zA-Z0-9_])', r'\1manufacturing\2'),
-            'intl': (r'(^|[^a-zA-Z0-9_])intl\.?($|[^a-zA-Z0-9_])', r'\1international\2'),
-            'dist': (r'(^|[^a-zA-Z0-9_])dist\.?($|[^a-zA-Z0-9_])', r'\1distribution\2'),
-            'svcs': (r'(^|[^a-zA-Z0-9_])svcs?\.?($|[^a-zA-Z0-9_])', r'\1services\2'),
-            'mgmt': (r'(^|[^a-zA-Z0-9_])mgmt\.?($|[^a-zA-Z0-9_])', r'\1management\2'),
-            'grp': (r'(^|[^a-zA-Z0-9_])grp\.?($|[^a-zA-Z0-9_])', r'\1group\2')
+            'corp': (r'(^|[^a-zA-Z0-9_])corp\.?($|[^a-zA-Z0-9_])', r'$1corporation$2'),
+            'inc': (r'(^|[^a-zA-Z0-9_])inc\.?($|[^a-zA-Z0-9_])', r'$1incorporated$2'),
+            'ltd': (r'(^|[^a-zA-Z0-9_])ltd\.?($|[^a-zA-Z0-9_])', r'$1limited$2'),
+            'llc': (r'(^|[^a-zA-Z0-9_])llc\.?($|[^a-zA-Z0-9_])', r'$1limited liability company$2'),
+            'co': (r'(^|[^a-zA-Z0-9_])co\.?($|[^a-zA-Z0-9_])', r'$1company$2'),
+            'assoc': (r'(^|[^a-zA-Z0-9_])assoc\.?($|[^a-zA-Z0-9_])', r'$1associates$2'),
+            'mfg': (r'(^|[^a-zA-Z0-9_])mfg\.?($|[^a-zA-Z0-9_])', r'$1manufacturing$2'),
+            'intl': (r'(^|[^a-zA-Z0-9_])intl\.?($|[^a-zA-Z0-9_])', r'$1international$2'),
+            'dist': (r'(^|[^a-zA-Z0-9_])dist\.?($|[^a-zA-Z0-9_])', r'$1distribution$2'),
+            'svcs': (r'(^|[^a-zA-Z0-9_])svcs?\.?($|[^a-zA-Z0-9_])', r'$1services$2'),
+            'mgmt': (r'(^|[^a-zA-Z0-9_])mgmt\.?($|[^a-zA-Z0-9_])', r'$1management$2'),
+            'grp': (r'(^|[^a-zA-Z0-9_])grp\.?($|[^a-zA-Z0-9_])', r'$1group$2')
         }
         
         for abbrev_key, (pattern_str, expansion) in business_abbreviations.items():
@@ -123,7 +123,7 @@ class TextNormalizer:
         separator_patterns = {
             'ampersand': (r'&+', ' and '),              # One or more ampersands
             'plus': (r'[+]+', ' and '),                  # One or more plus signs
-            'n_word': (r'(^|[^a-zA-Z0-9_])n($|[^a-zA-Z0-9_])', r'\1 and \2'),              # Letter 'n' as word
+            'n_word': (r'(^|[^a-zA-Z0-9_])n($|[^a-zA-Z0-9_])', r'$1 and $2'),              # Letter 'n' as word
             'forward_slash': (r'/', ' '),               # Forward slashes
             'backslash': (r'\\', ' '),                  # Backslashes
             'pipe': (r'\|', ' '),                       # Pipe characters
@@ -150,12 +150,12 @@ class TextNormalizer:
         # These fix common character substitutions from OCR systems
         ocr_patterns = {
             # Pattern captures the boundary + digit + letter, replaces with boundary + corrected letter + original letter
-            'zero_before_letter': (r'(^|[^a-zA-Z0-9])0([a-z])', r'\1o\2'),
-            'zero_after_letter': (r'([a-z])0($|[^a-zA-Z0-9])', r'\1o\2'),
-            'one_before_letter': (r'(^|[^a-zA-Z0-9])1([a-z])', r'\1i\2'),
-            'one_after_letter': (r'([a-z])1($|[^a-zA-Z0-9])', r'\1i\2'),
-            'five_before_letter': (r'(^|[^a-zA-Z0-9])5([a-z])', r'\1s\2'),
-            'five_after_letter': (r'([a-z])5($|[^a-zA-Z0-9])', r'\1s\2')
+            'zero_before_letter': (r'(^|[^a-zA-Z0-9_])0([a-zA-Z])', r'$1o$2'),
+            'zero_after_letter': (r'([a-zA-Z])0($|[^a-zA-Z0-9_])', r'$1o$2'),
+            'one_before_letter': (r'(^|[^a-zA-Z0-9_])1([a-zA-Z])', r'$1i$2'),
+            'one_after_letter': (r'([a-zA-Z])1($|[^a-zA-Z0-9_])', r'$1i$2'),
+            'five_before_letter': (r'(^|[^a-zA-Z0-9_])5([a-zA-Z])', r'$1s$2'),
+            'five_after_letter': (r'([a-zA-Z])5($|[^a-zA-Z0-9_])', r'$1s$2')
         }
         
         for ocr_key, (pattern_str, replacement) in ocr_patterns.items():
@@ -192,7 +192,7 @@ class TextNormalizer:
                 pattern_str = r'(^|[^a-zA-Z0-9_])' + re.escape(old_word) + r'($|[^a-zA-Z0-9_])'
                 patterns[pattern_key] = re.compile(pattern_str, re.IGNORECASE)
                 # Store the replacement text
-                patterns[f'{pattern_key}_replacement'] = r'\1' + new_word + r'\2'
+                patterns[f'{pattern_key}_replacement'] = r'$1' + new_word + r'$2'
             
             logger.debug(f"  - Compiled {len(self.config.replacements)} custom replacement patterns")
         
