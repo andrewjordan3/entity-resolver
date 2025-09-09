@@ -254,8 +254,8 @@ class AddressProcessor:
             # control, and non-standard space characters can break tokenization logic
             # and are often invisible. Removing them prevents hard-to-debug parsing errors.
             # Common separators are then collapsed into a single space for consistency.
-            address_part = address_part.str.replace(self.ZW_CTRL_PATTERN.pattern, '', regex=True)
-            address_part = address_part.str.replace(self.SEPS_PATTERN.pattern, ' ', regex=True)
+            #address_part = address_part.str.replace(self.ZW_CTRL_PATTERN.pattern, '', regex=True)
+            #address_part = address_part.str.replace(self.SEPS_PATTERN.pattern, ' ', regex=True)
 
             # Step 3: Convert to lowercase. libpostal is largely case-insensitive, but
             # providing a consistently cased string is a best practice that removes
@@ -269,7 +269,7 @@ class AddressProcessor:
             address_part = address_part.str.strip()
             # The `where` clause acts as a conditional replacement: if the part does NOT
             # match the punctuation-only pattern, keep it; otherwise, replace it with ''.
-            address_part = address_part.where(~address_part.str.match(self.PUNCT_ONLY_PATTERN.pattern), other='')
+            #address_part = address_part.where(~address_part.str.match(self.PUNCT_ONLY_PATTERN.pattern), other='')
 
             address_parts.append(address_part)
 
