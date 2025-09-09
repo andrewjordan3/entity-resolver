@@ -313,4 +313,4 @@ def nfkc_normalize_series(input_series: cudf.Series) -> cudf.Series:
     remapped_series = pd.Series(normalized_unique_values).take(category_codes)
 
     # Move the final, normalized series back to the GPU, preserving the original index.
-    return cudf.Series(remapped_series, index=input_series.index)
+    return cudf.Series(remapped_series.values, index=input_series.index)
