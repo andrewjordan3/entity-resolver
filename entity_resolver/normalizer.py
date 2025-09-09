@@ -330,7 +330,7 @@ class TextNormalizer:
         # Use pre-compiled business qualifier pattern
         qualifier_pattern = self._compiled_patterns['business_qualifier'].pattern
         extracted_business_names = normalized_series.str.extract(qualifier_pattern, expand=False)
-        qualifier_mask = extracted_business_names[0].notna()
+        qualifier_mask = extracted_business_names.notna()
         qualifier_count = qualifier_mask.sum()
         
         # Use extracted name where qualifier found, keep original otherwise
