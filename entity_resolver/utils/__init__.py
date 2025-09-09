@@ -22,7 +22,8 @@ Modules:
 
 # Text processing
 from .text import (
-    get_canonical_name_gpu
+    get_canonical_name_gpu,
+    nfkc_normalize_series
 )
 
 # Address operations
@@ -81,6 +82,7 @@ from .matrix_ops import (
 __all__ = [
     # text.py
     'get_canonical_name_gpu',
+    'nfkc_normalize_series',
 
     # address.py
     'safe_parse_address',

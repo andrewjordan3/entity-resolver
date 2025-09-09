@@ -16,7 +16,7 @@ import cupy as cp
 
 # Local Package Imports
 from .config import NormalizationConfig, VectorizerConfig
-from . import utils
+from .utils import get_canonical_name_gpu, nfkc_normalize_series
 
 # Set up module-level logger
 logger = logging.getLogger(__name__)
@@ -253,7 +253,7 @@ class TextNormalizer:
         # This converts characters to their canonical decomposed form then recomposes them
         # Handles variations like full-width characters, ligatures, and combining marks
         logger.debug("Step 1: Applying Unicode normalization (NFKC)")
-        normalized_series = normalized_series.str.normalize_characters(form='NFKC')
+        normalized_series = nfkc_normalize_series(normalized_series)
         
         # Step 2: Convert to lowercase for case-insensitive matching
         # This must come after Unicode normalization for proper handling of special cases
@@ -649,14 +649,14 @@ class TextNormalizer:
                     }
                     
                     # Determine canonical name
-                    canonical_name = utils.get_canonical_name_gpu(names_at_address, self.vectorizer_config.similarity_tfidf)
+                    canonical_name = get_canonical_name_gpu(names_at_address, self.vectorizer_config.similarity_tfidf)
                     example['canonical'] = canonical_name
                     
                     self._consolidation_stats['consolidation_examples'].append(example)
                     examples_collected += 1
                 else:
                     # Just determine canonical name without logging
-                    canonical_name = utils.get_canonical_name_gpu(names_at_address, self.vectorizer_config.similarity_tfidf)
+                    canonical_name = get_canonical_name_gpu(names_at_address, self.vectorizer_config.similarity_tfidf)
                 
                 address_to_canonical_map[addr_key] = canonical_name
             

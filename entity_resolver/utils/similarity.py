@@ -13,6 +13,7 @@ from typing import Dict, Any
 from cuml.feature_extraction.text import TfidfVectorizer
 from cuml.neighbors import NearestNeighbors
 from .graph import create_edge_list
+from .utils import nfkc_normalize_series
 
 # Set up a logger for this module.
 logger = logging.getLogger(__name__)
@@ -51,8 +52,8 @@ def calculate_similarity_gpu(
     series_b = series_b.fillna('').astype(str).str.strip()
 
     # 2) Unicode normalization (fold weird forms to standard ones)
-    series_a = series_a.str.normalize_characters(form='NFKC')
-    series_b = series_b.str.normalize_characters(form='NFKC')
+    series_a = nfkc_normalize_series(series_a)
+    series_b = nfkc_normalize_series(series_b)
 
     # 3) Remove zero-widths & odd spaces, then collapse spaces
     ZW_WEIRD = r'[\u00A0\u1680\u180E\u2000-\u200D\u202F\u205F\u2060\u3000\uFEFF]+'
