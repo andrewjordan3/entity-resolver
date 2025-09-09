@@ -285,6 +285,23 @@ class TextNormalizer:
                     abbreviation_replacement_count += affected_records
                     logger.debug(f"  - Expanded '{abbrev_key}' to '{replacement}' in {affected_records:,} records")
         
+        # --- Debug regex check ---
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("--- Checking sample after all abbreviation expansions ---")
+            
+            # Check for a few common expansions to get a representative sample
+            corp_sample = normalized_series[normalized_series.str.contains('corporation', regex=False)].head(2)
+            inc_sample = normalized_series[normalized_series.str.contains('incorporated', regex=False)].head(2)
+            llc_sample = normalized_series[normalized_series.str.contains('limited liability company', regex=False)].head(2)
+            
+            # Combine the samples and print to the log
+            combined_sample = cudf.concat([corp_sample, inc_sample, llc_sample])
+            
+            if not combined_sample.empty:
+                logger.debug("Sample of expanded names:\n%s", combined_sample.to_pandas().to_string())
+            else:
+                logger.debug("No common expansions found in sample check.")
+
         if abbreviation_replacement_count > 0:
             logger.info(f"  - Total abbreviation expansions: {abbreviation_replacement_count:,}")
 

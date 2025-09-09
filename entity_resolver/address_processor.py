@@ -18,7 +18,14 @@ import pandas as pd
 
 # Local Package Imports
 from .config import ValidationConfig, ColumnConfig, VectorizerConfig
-from . import utils
+from .utils import (
+    nfkc_normalize_series, 
+    safe_parse_address, 
+    create_address_key_gpu, 
+    find_graph_components, 
+    find_similar_pairs, 
+    calculate_address_score_gpu,
+)
 
 # Set up module-level logger
 logger = logging.getLogger(__name__)
@@ -157,7 +164,7 @@ class AddressProcessor:
         
         # Parse canonical addresses
         logger.debug(f"Parsing {len(df):,} canonical addresses")
-        parsed_dicts = df["canonical_address"].apply(utils.safe_parse_address)
+        parsed_dicts = df["canonical_address"].apply(safe_parse_address)
         
         # Check for parsing failures
         failures = sum(1 for d in parsed_dicts if not d)
@@ -241,7 +248,7 @@ class AddressProcessor:
             # standardizes character representations, converting full-width characters to
             # half-width, handling ligatures (e.g., 'ﬁ' -> 'fi'), and collapsing
             # combining marks. This creates a canonical text representation for parsing.
-            address_part = address_part.str.normalize_characters(form='NFKC')
+            address_part = nfkc_normalize_series(address_part)
 
             # Step 2: Remove disruptive characters and normalize separators. Zero-width,
             # control, and non-standard space characters can break tokenization logic
@@ -310,7 +317,7 @@ class AddressProcessor:
         address_series_pd = address_series.to_pandas()
         
         # Parse addresses
-        parsed_dicts = address_series_pd.apply(utils.safe_parse_address)
+        parsed_dicts = address_series_pd.apply(safe_parse_address)
         
         # Count failures
         failures = sum(1 for d in parsed_dicts if not d)
@@ -378,7 +385,7 @@ class AddressProcessor:
         
         # Create normalized address key
         logger.debug("Creating normalized address key")
-        out_gdf["addr_normalized_key"] = utils.create_address_key_gpu(out_gdf)
+        out_gdf["addr_normalized_key"] = create_address_key_gpu(out_gdf)
         
         # Log statistics
         non_empty_keys = (out_gdf["addr_normalized_key"] != "").sum()
@@ -531,7 +538,7 @@ class AddressProcessor:
         logger.debug(f"Using distance threshold: {distance_threshold:.3f}")
         
         # Find similar address pairs
-        matched_pairs = utils.find_similar_pairs(
+        matched_pairs = find_similar_pairs(
             string_series=unique_addresses[key_col],
             tfidf_params=self.vectorizer_config.similarity_tfidf,
             nn_params=self.vectorizer_config.similarity_nn,
@@ -547,7 +554,7 @@ class AddressProcessor:
         
         # Find connected components in similarity graph
         logger.debug("Finding connected components in similarity graph")
-        components = utils.find_graph_components(
+        components = find_graph_components(
             edge_list_df=matched_pairs,
             output_vertex_column="unique_addr_idx",
             output_component_column="component_id"
@@ -625,7 +632,7 @@ class AddressProcessor:
         logger.debug("Scoring candidate addresses for canonical selection")
         
         # Calculate completeness score
-        candidates_gdf["completeness_score"] = utils.calculate_address_score_gpu(candidates_gdf)
+        candidates_gdf["completeness_score"] = calculate_address_score_gpu(candidates_gdf)
         
         # Ensure frequency column exists
         if "freq" not in candidates_gdf.columns:
