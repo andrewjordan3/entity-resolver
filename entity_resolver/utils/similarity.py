@@ -13,7 +13,7 @@ from typing import Dict, Any
 from cuml.feature_extraction.text import TfidfVectorizer
 from cuml.neighbors import NearestNeighbors
 from .graph import create_edge_list
-from .utils import nfkc_normalize_series
+from .text import nfkc_normalize_series
 
 # Set up a logger for this module.
 logger = logging.getLogger(__name__)
