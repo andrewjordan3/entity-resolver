@@ -121,7 +121,7 @@ class TextNormalizer:
         # These are used multiple times and benefit from compilation
         separator_patterns = {
             'ampersand': (r'&+', ' and '),              # One or more ampersands
-            'plus': (r'\++', ' and '),                  # One or more plus signs
+            'plus': (r'[+]+', ' and '),                  # One or more plus signs
             'n_word': (r'\bn\b', ' and '),              # Letter 'n' as word
             'forward_slash': (r'/', ' '),               # Forward slashes
             'backslash': (r'\\', ' '),                  # Backslashes
