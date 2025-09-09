@@ -149,13 +149,13 @@ class TextNormalizer:
         # OCR error correction patterns
         # These fix common character substitutions from OCR systems
         ocr_patterns = {
-            # Pattern captures the boundary + digit + letter, replaces with boundary + corrected letter + original letter
-            'zero_before_letter': (r'(^|[^a-zA-Z0-9_])0([a-zA-Z])', r'$1o$2'),
-            'zero_after_letter': (r'([a-zA-Z])0($|[^a-zA-Z0-9_])', r'$1o$2'),
-            'one_before_letter': (r'(^|[^a-zA-Z0-9_])1([a-zA-Z])', r'$1i$2'),
-            'one_after_letter': (r'([a-zA-Z])1($|[^a-zA-Z0-9_])', r'$1i$2'),
-            'five_before_letter': (r'(^|[^a-zA-Z0-9_])5([a-zA-Z])', r'$1s$2'),
-            'five_after_letter': (r'([a-zA-Z])5($|[^a-zA-Z0-9_])', r'$1s$2')
+            # This stricter pattern only corrects a digit when it appears
+            # between two letters, which is a very high-confidence signal for an
+            # OCR substitution error (e.g., "MICR0S0FT" -> "MICROSOFT").
+            # The character class is [a-z] because this runs after lowercasing.
+            'zero_in_word': (r'([a-z])0([a-z])', r'$1o$2'),
+            'one_in_word':  (r'([a-z])1([a-z])', r'$1l$2'), 
+            'five_in_word': (r'([a-z])5([a-z])', r'$1s$2')
         }
         
         for ocr_key, (pattern_str, replacement) in ocr_patterns.items():

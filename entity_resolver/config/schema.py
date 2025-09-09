@@ -208,13 +208,12 @@ class OutputConfig(BaseModel):
 
 
 # === Preprocessing Configurations ===
-
 class NormalizationConfig(BaseModel):
     """
     Defines rules for cleaning and standardizing entity names before matching.
     
     This preprocessing step is crucial for matching variations of the same entity.
-    It handles common abbreviations, misspellings, and removes legal suffixes that
+    It handles common abbreviations, misspelllings, and removes legal suffixes that
     don't contribute to entity identity. All operations are GPU-accelerated using cuDF.
     """
     model_config = ConfigDict(extra='forbid')
@@ -243,9 +242,9 @@ class NormalizationConfig(BaseModel):
         },
         description=(
             "A dictionary mapping common abbreviations, acronyms, or misspellings to their "
-            "standardized forms. Applied before suffix removal. Keys should be lowercase. "
-            "The replacement is case-insensitive but preserves the original case pattern. "
-            "Example: 'Svc' becomes 'Service', 'SVC' becomes 'SERVICE'."
+            "standardized forms. This operation is case-insensitive because it is applied "
+            "AFTER the entire string has been converted to lowercase. "
+            "Example: Both 'Svc' and 'SVC' will become 'service'."
         )
     )
     
@@ -264,12 +263,12 @@ class NormalizationConfig(BaseModel):
         },
         description=(
             "A set of common legal and organizational suffixes to remove from entity names. "
-            "These are removed after replacements are applied. Removal is case-insensitive. "
-            "Suffixes are only removed from the end of the name, not from the middle. "
-            "Example: 'Acme Corp LLC' becomes 'Acme', but 'LLC Acme Services' becomes 'LLC Acme Services'."
+            "Removal is case-insensitive and happens after custom replacements. The pattern "
+            "is designed to remove these terms when they appear as whole words, regardless "
+            "of their position in the string. "
+            "Example: Both 'Acme Corp LLC' and 'Acme Corp, a subsidiary' become 'acme'."
         )
     )
-
 
 # === Modeling Stage Configurations ===
 
