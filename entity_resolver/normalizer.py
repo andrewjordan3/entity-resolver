@@ -12,7 +12,6 @@ import logging
 from typing import Dict
 
 import cudf
-import cupy as cp
 
 # Local Package Imports
 from .config import NormalizationConfig, VectorizerConfig
@@ -77,20 +76,20 @@ class TextNormalizer:
         
         # Business abbreviation patterns - used frequently
         # These expand common abbreviations to their full forms
-        # Pattern: (boundary_start)abbrev.?(boundary_end) -> \1expansion\2
+        # Pattern: (boundary_start)abbrev.?(boundary_end) -> $1expansion$2
         business_abbreviations = {
-            'corp': (r'(^|[^a-zA-Z0-9_])corp\.?($|[^a-zA-Z0-9_])', r'\1corporation\2'),
-            'inc': (r'(^|[^a-zA-Z0-9_])inc\.?($|[^a-zA-Z0-9_])', r'\1incorporated\2'),
-            'ltd': (r'(^|[^a-zA-Z0-9_])ltd\.?($|[^a-zA-Z0-9_])', r'\1limited\2'),
-            'llc': (r'(^|[^a-zA-Z0-9_])llc\.?($|[^a-zA-Z0-9_])', r'\1limited liability company\2'),
-            'co': (r'(^|[^a-zA-Z0-9_])co\.?($|[^a-zA-Z0-9_])', r'\1company\2'),
-            'assoc': (r'(^|[^a-zA-Z0-9_])assoc\.?($|[^a-zA-Z0-9_])', r'\1associates\2'),
-            'mfg': (r'(^|[^a-zA-Z0-9_])mfg\.?($|[^a-zA-Z0-9_])', r'\1manufacturing\2'),
-            'intl': (r'(^|[^a-zA-Z0-9_])intl\.?($|[^a-zA-Z0-9_])', r'\1international\2'),
-            'dist': (r'(^|[^a-zA-Z0-9_])dist\.?($|[^a-zA-Z0-9_])', r'\1distribution\2'),
-            'svcs': (r'(^|[^a-zA-Z0-9_])svcs?\.?($|[^a-zA-Z0-9_])', r'\1services\2'),
-            'mgmt': (r'(^|[^a-zA-Z0-9_])mgmt\.?($|[^a-zA-Z0-9_])', r'\1management\2'),
-            'grp': (r'(^|[^a-zA-Z0-9_])grp\.?($|[^a-zA-Z0-9_])', r'\1group\2')
+            'corp': (r'(^|[^a-zA-Z0-9_])corp\.?($|[^a-zA-Z0-9_])', r'$1corporation$2'),
+            'inc': (r'(^|[^a-zA-Z0-9_])inc\.?($|[^a-zA-Z0-9_])', r'$1incorporated$2'),
+            'ltd': (r'(^|[^a-zA-Z0-9_])ltd\.?($|[^a-zA-Z0-9_])', r'$1limited$2'),
+            'llc': (r'(^|[^a-zA-Z0-9_])llc\.?($|[^a-zA-Z0-9_])', r'$1limited liability company$2'),
+            'co': (r'(^|[^a-zA-Z0-9_])co\.?($|[^a-zA-Z0-9_])', r'$1company$2'),
+            'assoc': (r'(^|[^a-zA-Z0-9_])assoc\.?($|[^a-zA-Z0-9_])', r'$1associates$2'),
+            'mfg': (r'(^|[^a-zA-Z0-9_])mfg\.?($|[^a-zA-Z0-9_])', r'$1manufacturing$2'),
+            'intl': (r'(^|[^a-zA-Z0-9_])intl\.?($|[^a-zA-Z0-9_])', r'$1international$2'),
+            'dist': (r'(^|[^a-zA-Z0-9_])dist\.?($|[^a-zA-Z0-9_])', r'$1distribution$2'),
+            'svcs': (r'(^|[^a-zA-Z0-9_])svcs?\.?($|[^a-zA-Z0-9_])', r'$1services$2'),
+            'mgmt': (r'(^|[^a-zA-Z0-9_])mgmt\.?($|[^a-zA-Z0-9_])', r'$1management$2'),
+            'grp': (r'(^|[^a-zA-Z0-9_])grp\.?($|[^a-zA-Z0-9_])', r'$1group$2')
         }
         
         for abbrev_key, (pattern_str, expansion) in business_abbreviations.items():
@@ -105,15 +104,15 @@ class TextNormalizer:
         # This complex pattern benefits significantly from pre-compilation
         patterns['business_qualifier'] = re.compile(
             r'(?:\s|^)(?:'
-            r'd(?:\s*[/.\-]\s*)?b(?:\s*[/.\-]\s*)?a|'    # dba variations
-            r'f(?:\s*[/.\-]\s*)?k(?:\s*[/.\-]\s*)?a|'    # fka variations
-            r'a(?:\s*[/.\-]\s*)?k(?:\s*[/.\-]\s*)?a|'    # aka variations
-            r't(?:\s*[/.\-]\s*)?a|'                      # ta (trading as)
-            r'formerly|'                                # formerly
-            r'now\s+known\s+as|'                        # now known as
-            r'trading\s+as|'                            # trading as
-            r'doing\s+business\s+as'                    # doing business as
-            r')(?:\s*:)?\s+(.*?)(?:\s*$)',              # Capture group for the actual name
+            r'd(?:\s*[/.\-]\s*)?b(?:\s*[/.\-]\s*)?a|'     # dba variations
+            r'f(?:\s*[/.\-]\s*)?k(?:\s*[/.\-]\s*)?a|'     # fka variations
+            r'a(?:\s*[/.\-]\s*)?k(?:\s*[/.\-]\s*)?a|'     # aka variations
+            r't(?:\s*[/.\-]\s*)?a|'                        # ta (trading as)
+            r'formerly|'                                    # formerly
+            r'now\s+known\s+as|'                           # now known as
+            r'trading\s+as|'                                # trading as
+            r'doing\s+business\s+as'                        # doing business as
+            r')(?:\s*:)?\s+(.*?)(?:\s*$)',                 # Capture group for the actual name
             re.IGNORECASE
         )
         logger.debug("  - Compiled business qualifier pattern (dba/fka/aka/ta/formerly/etc.)")
@@ -121,15 +120,15 @@ class TextNormalizer:
         # Separator and conjunction patterns
         # These are used multiple times and benefit from compilation
         separator_patterns = {
-            'ampersand': (r'&+', ' and '),                      # One or more ampersands
-            'plus': (r'[+]+', ' and '),                         # One or more plus signs
-            'n_word': (r'(^|[^a-zA-Z0-9_])n($|[^a-zA-Z0-9_])', r'\1 and \2'),  # Letter 'n' as word
-            'forward_slash': (r'/', ' '),                       # Forward slashes
-            'backslash': (r'\\', ' '),                          # Backslashes
-            'pipe': (r'\|', ' '),                               # Pipe characters
-            'middle_dot': (r'·', ' '),                          # Middle dot
-            'bullet': (r'•', ' '),                              # Bullet
-            'dashes': (r'–|—', ' ')                             # En-dash and em-dash
+            'ampersand': (r'&+', ' and '),              # One or more ampersands
+            'plus': (r'[+]+', ' and '),                  # One or more plus signs
+            'n_word': (r'(^|[^a-zA-Z0-9_])n($|[^a-zA-Z0-9_])', r'$1 and $2'),              # Letter 'n' as word
+            'forward_slash': (r'/', ' '),               # Forward slashes
+            'backslash': (r'\\', ' '),                  # Backslashes
+            'pipe': (r'\|', ' '),                       # Pipe characters
+            'middle_dot': (r'·', ' '),                  # Middle dot
+            'bullet': (r'•', ' '),                      # Bullet
+            'dashes': (r'–|—', ' ')                     # En-dash and em-dash
         }
         
         for sep_key, (pattern_str, replacement) in separator_patterns.items():
@@ -153,9 +152,9 @@ class TextNormalizer:
             # between two letters, which is a very high-confidence signal for an
             # OCR substitution error (e.g., "MICR0S0FT" -> "MICROSOFT").
             # The character class is [a-z] because this runs after lowercasing.
-            'zero_in_word': (r'([a-z])0([a-z])', r'\1o\2'),
-            'one_in_word':  (r'([a-z])1([a-z])', r'\1l\2'), 
-            'five_in_word': (r'([a-z])5([a-z])', r'\1s\2')
+            'zero_in_word': (r'([a-z])0([a-z])', r'$1o$2'),
+            'one_in_word':  (r'([a-z])1([a-z])', r'$1l$2'), 
+            'five_in_word': (r'([a-z])5([a-z])', r'$1s$2')
         }
         
         for ocr_key, (pattern_str, replacement) in ocr_patterns.items():
@@ -192,7 +191,7 @@ class TextNormalizer:
                 pattern_str = r'(^|[^a-zA-Z0-9_])' + re.escape(old_word) + r'($|[^a-zA-Z0-9_])'
                 patterns[pattern_key] = re.compile(pattern_str, re.IGNORECASE)
                 # Store the replacement text
-                patterns[f'{pattern_key}_replacement'] = r'\1' + new_word + r'\2'
+                patterns[f'{pattern_key}_replacement'] = r'$1' + new_word + r'$2'
             
             logger.debug(f"  - Compiled {len(self.config.replacements)} custom replacement patterns")
         
@@ -203,7 +202,6 @@ class TextNormalizer:
         logger.info(f"Successfully pre-compiled {total_patterns} regex patterns for normalization")
         
         return patterns
-
 
     def normalize_text(self, gdf: cudf.DataFrame, entity_col: str) -> cudf.DataFrame:
         """
@@ -246,7 +244,7 @@ class TextNormalizer:
         
         # Initialize normalized series with null handling
         # Using empty string for nulls to maintain consistent processing
-        normalized_series = gdf[entity_col].fillna('').astype(str)
+        normalized_series = gdf[entity_col].fillna('').astype('str')
         
         # Capture initial statistics for comparison
         initial_unique_count = normalized_series.nunique()
@@ -394,7 +392,7 @@ class TextNormalizer:
             suffix_pattern = self._compiled_patterns['suffix_removal'].pattern
             
             before_suffix_removal = normalized_series.copy()
-            normalized_series = normalized_series.str.replace(suffix_pattern, ' ', regex=True)
+            normalized_series = normalized_series.str.replace(suffix_pattern, r'$1 $2', regex=True)
             suffix_affected = (normalized_series != before_suffix_removal).sum()
             logger.debug(f"  - Removed suffixes from {suffix_affected:,} records")
 
@@ -402,8 +400,7 @@ class TextNormalizer:
         logger.debug("Step 9: Correcting common OCR/data entry errors")
         
         # Fix common OCR substitutions using pre-compiled patterns
-        ocr_keys = ['zero_before_letter', 'zero_after_letter', 'one_before_letter', 
-                    'one_after_letter', 'five_before_letter', 'five_after_letter']
+        ocr_keys = ['zero_in_word', 'one_in_word', 'five_in_word']
         
         ocr_correction_count = 0
         for ocr_key in ocr_keys:
