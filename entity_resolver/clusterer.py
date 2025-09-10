@@ -75,6 +75,9 @@ class EntityClusterer:
         
         # Extract random state for consistent seeding
         self.random_state = self.config.umap_params.get("random_state", 42)
+
+        # Initialize inverse vector mapping for UMAP input
+        self._current_inverse_indices
         
         logger.info("Initialized EntityClusterer")
         logger.debug(f"UMAP ensemble size: {config.umap_n_runs}")
@@ -468,19 +471,38 @@ class EntityClusterer:
         is_training: bool
     ) -> cp.ndarray:
         """
-        Perform manifold learning using UMAP ensemble.
+        Perform manifold learning using UMAP ensemble with vector deduplication.
+        
+        This method includes deduplication to handle the strict UMAP 
+        zero-distance neighbor check in newer cuML versions. The process:
+        1. Deduplicate input vectors (with epsilon tolerance for floating-point)
+        2. Run UMAP ensemble on unique vectors only
+        3. Expand results back to original size
+        4. Create consensus embedding
         
         Args:
             vectors: High-dimensional feature vectors
             is_training: Whether to fit new models
             
         Returns:
-            Low-dimensional consensus embedding
+            Low-dimensional consensus embedding for all input vectors
             
         Raises:
             RuntimeError: If ensemble fails or no models available
         """
         logger.info(f"Running UMAP ensemble on shape {vectors.shape}")
+
+        # Step 1: Deduplicate vectors to avoid zero-distance neighbor errors
+        # We use a small epsilon (1e-9) to handle floating-point comparison issues
+        dedup_epsilon = 1e-9
+        unique_vectors, unique_indices, inverse_indices = self._deduplicate_vectors(
+            vectors, 
+            epsilon=dedup_epsilon
+        )
+        
+        # Store the inverse mapping for later expansion
+        # We need this to expand UMAP results back to original size
+        self._current_inverse_indices = inverse_indices
         
         n_runs = int(self.config.umap_n_runs)
         umap_embeddings: List[cp.ndarray] = []
@@ -498,14 +520,24 @@ class EntityClusterer:
                 
                 try:
                     reducer = UMAP(**umap_params)
-                    embedding = reducer.fit_transform(vectors)
+                    
+                    # Fit UMAP on deduplicated vectors only
+                    # This avoids the zero-distance neighbor error
+                    unique_embedding = reducer.fit_transform(unique_vectors)
                     
                     # Validate embedding
-                    if cp.isnan(embedding).any():
+                    if cp.isnan(unique_embedding).any():
                         logger.warning(f"UMAP run {run_idx + 1} produced NaN values, skipping")
                         continue
                     
-                    umap_embeddings.append(embedding)
+                    # Expand embedding back to original size
+                    # Duplicate vectors get identical embeddings
+                    expanded_embedding = self._expand_umap_embeddings(
+                        unique_embedding, 
+                        inverse_indices
+                    )
+
+                    umap_embeddings.append(expanded_embedding)
                     trained_umaps.append(reducer)
                     
                 except Exception as e:
@@ -523,17 +555,27 @@ class EntityClusterer:
             if not self.umap_ensemble:
                 raise RuntimeError("No pre-trained UMAP models found")
             
-            logger.info(f"Transforming with {len(self.umap_ensemble)} UMAP models")
+            logger.info(
+                f"Transforming {len(unique_vectors):,} unique vectors "
+                f"with {len(self.umap_ensemble)} UMAP models"
+            )
             
             for idx, reducer in enumerate(self.umap_ensemble):
                 try:
-                    embedding = reducer.transform(vectors)
+                    # Transform deduplicated vectors
+                    unique_embedding = reducer.transform(unique_vectors)
                     
-                    if cp.isnan(embedding).any():
+                    if cp.isnan(unique_embedding).any():
                         logger.warning(f"UMAP model {idx + 1} produced NaN values, skipping")
                         continue
                     
-                    umap_embeddings.append(embedding)
+                    # Expand to original size
+                    expanded_embedding = self._expand_umap_embeddings(
+                        unique_embedding,
+                        inverse_indices
+                    )
+                    
+                    umap_embeddings.append(expanded_embedding)
                     
                 except Exception as e:
                     logger.error(f"UMAP transform {idx + 1} failed: {e}")
@@ -551,6 +593,9 @@ class EntityClusterer:
             batch_size=self.config.cosine_consensus_batch_size,
             random_state=self.random_state
         )
+
+        # Clean up temporary deduplication mapping
+        del self._current_inverse_indices
 
         # --- GPU Memory Cleanup ---
         # The umap_embeddings list can be very large. We delete it and
@@ -1128,6 +1173,123 @@ class EntityClusterer:
             n_inf = int(cp.isinf(vectors).sum())
             raise ValueError(f"Feature vectors contain {n_inf} Inf values")
     
+    def _deduplicate_vectors(
+        self, 
+        vectors: cp.ndarray, 
+        epsilon: float = 1e-9
+    ) -> Tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
+        """
+        Deduplicate vectors with floating-point tolerance to avoid UMAP zero-distance errors.
+        
+        This method identifies and removes duplicate vectors (within epsilon tolerance) to prevent
+        UMAP from encountering the "all neighbors at distance 0" error. It maintains a mapping
+        to reconstruct the original vector indices after UMAP transformation.
+        
+        The deduplication process:
+        1. Round vectors to a precision determined by epsilon to handle floating-point errors
+        2. Find unique vectors and create index mappings
+        3. Return deduplicated vectors and mappings for reconstruction
+        
+        Args:
+            vectors: Input vectors of shape (n_samples, n_features)
+            epsilon: Tolerance for considering vectors as duplicates. Vectors are rounded
+                    to approximately -log10(epsilon) decimal places before comparison.
+                    Default 1e-9 provides ~9 decimal places of precision.
+        
+        Returns:
+            Tuple containing:
+                - unique_vectors: Deduplicated vectors of shape (n_unique, n_features)
+                - unique_indices: Indices of unique vectors in original array
+                - inverse_indices: Mapping from original indices to unique indices,
+                                 shape (n_samples,). Used to expand results back.
+        
+        Example:
+            If input has vectors [A, B, A, C, B], returns:
+            - unique_vectors: [A, B, C]
+            - unique_indices: [0, 1, 3] (first occurrence of each unique vector)
+            - inverse_indices: [0, 1, 0, 2, 1] (maps each original to its unique index)
+        """
+        n_samples = vectors.shape[0]
+        logger.debug(f"Deduplicating {n_samples:,} vectors with epsilon={epsilon}")
+        
+        # Determine rounding precision based on epsilon
+        # For epsilon=1e-9, this gives decimal_places=9
+        decimal_places = int(-np.log10(epsilon))
+        
+        # Round vectors to handle floating-point comparison issues
+        # This ensures that vectors differing by less than epsilon are treated as identical
+        vectors_rounded = cp.around(vectors, decimals=decimal_places)
+        
+        # Convert to structured array for efficient unique operation
+        # We create a view of the data as a structured array with one field per row
+        # This allows cupy's unique function to treat each row as a single element
+        vector_dtype = np.dtype((np.void, vectors_rounded.dtype.itemsize * vectors_rounded.shape[1]))
+        vectors_structured = cp.ascontiguousarray(vectors_rounded).view(vector_dtype)
+        
+        # Find unique vectors and create index mappings
+        # unique_structured: the unique row vectors (as structured array)
+        # unique_indices: indices of first occurrence of each unique vector
+        # inverse_indices: for each original vector, index into unique array
+        unique_structured, unique_indices, inverse_indices = cp.unique(
+            vectors_structured,
+            return_index=True,
+            return_inverse=True
+        )
+        
+        # Extract the actual unique vectors (not structured array format)
+        # We use the unique_indices to index into the original vectors
+        # This preserves the original precision (not rounded)
+        unique_vectors = vectors[unique_indices]
+        
+        n_unique = len(unique_vectors)
+        reduction_ratio = 1.0 - (n_unique / n_samples)
+        
+        logger.info(
+            f"Vector deduplication: {n_samples:,} → {n_unique:,} unique vectors "
+            f"({reduction_ratio:.1%} reduction)"
+        )
+        
+        if reduction_ratio > 0.5:
+            logger.info(
+                f"High duplication rate detected ({reduction_ratio:.1%}). "
+                f"This is common for categorical embeddings or repeated entities."
+            )
+        
+        return unique_vectors, unique_indices, inverse_indices
+    
+    def _expand_umap_embeddings(
+        self, 
+        unique_embeddings: cp.ndarray, 
+        inverse_indices: cp.ndarray
+    ) -> cp.ndarray:
+        """
+        Expand deduplicated UMAP embeddings back to original size.
+        
+        After UMAP processes unique vectors, this method maps the results back to all
+        original vector positions, ensuring duplicate vectors get identical embeddings.
+        
+        Args:
+            unique_embeddings: UMAP embeddings for unique vectors, shape (n_unique, n_dims)
+            inverse_indices: Mapping from original to unique indices, shape (n_samples,)
+        
+        Returns:
+            Expanded embeddings matching original vector count, shape (n_samples, n_dims)
+        
+        Example:
+            If unique_embeddings has 3 embeddings [E1, E2, E3] and 
+            inverse_indices is [0, 1, 0, 2, 1], returns [E1, E2, E1, E3, E2]
+        """
+        # Use fancy indexing to expand embeddings
+        # Each position in inverse_indices tells us which unique embedding to use
+        expanded_embeddings = unique_embeddings[inverse_indices]
+        
+        logger.debug(
+            f"Expanded embeddings from {unique_embeddings.shape[0]:,} unique "
+            f"to {expanded_embeddings.shape[0]:,} total"
+        )
+        
+        return expanded_embeddings
+
     def _log_clustering_stats(self, gdf: cudf.DataFrame) -> None:
         """
         Log comprehensive clustering statistics.
