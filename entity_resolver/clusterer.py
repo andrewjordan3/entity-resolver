@@ -1187,7 +1187,7 @@ class EntityClusterer:
         
         The deduplication process:
         1. Round vectors to a precision determined by epsilon to handle floating-point errors
-        2. Find unique vectors and create index mappings
+        2. Use cuDF DataFrame for efficient row-wise deduplication
         3. Return deduplicated vectors and mappings for reconstruction
         
         Args:
@@ -1209,8 +1209,8 @@ class EntityClusterer:
             - unique_indices: [0, 1, 3] (first occurrence of each unique vector)
             - inverse_indices: [0, 1, 0, 2, 1] (maps each original to its unique index)
         """
-        n_samples = vectors.shape[0]
-        logger.debug(f"Deduplicating {n_samples:,} vectors with epsilon={epsilon}")
+        n_samples, n_features = vectors.shape
+        logger.debug(f"Deduplicating {n_samples:,} vectors with {n_features} features, epsilon={epsilon}")
         
         # Determine rounding precision based on epsilon
         # For epsilon=1e-9, this gives decimal_places=9
@@ -1220,26 +1220,41 @@ class EntityClusterer:
         # This ensures that vectors differing by less than epsilon are treated as identical
         vectors_rounded = cp.around(vectors, decimals=decimal_places)
         
-        # Convert to structured array for efficient unique operation
-        # We create a view of the data as a structured array with one field per row
-        # This allows cupy's unique function to treat each row as a single element
-        vector_dtype = np.dtype((np.void, vectors_rounded.dtype.itemsize * vectors_rounded.shape[1]))
-        vectors_structured = cp.ascontiguousarray(vectors_rounded).view(vector_dtype)
+        # Method 1: Use cuDF for row-wise deduplication (most reliable for GPU)
+        # Convert rounded vectors to DataFrame for efficient deduplication
+        # Create column names for the DataFrame
+        column_names = [f"f{i}" for i in range(n_features)]
         
-        # Find unique vectors and create index mappings
-        # unique_structured: the unique row vectors (as structured array)
-        # unique_indices: indices of first occurrence of each unique vector
-        # inverse_indices: for each original vector, index into unique array
-        unique_structured, unique_indices, inverse_indices = cp.unique(
-            vectors_structured,
-            return_index=True,
-            return_inverse=True
-        )
+        # Create DataFrame from vectors
+        # We add an index column to track original positions
+        vectors_df = cudf.DataFrame(vectors_rounded, columns=column_names)
+        vectors_df['original_idx'] = cp.arange(n_samples, dtype=cp.int32)
         
-        # Extract the actual unique vectors (not structured array format)
-        # We use the unique_indices to index into the original vectors
-        # This preserves the original precision (not rounded)
+        # Drop duplicates, keeping first occurrence
+        # This gives us the unique vectors and their original indices
+        unique_df = vectors_df.drop_duplicates(subset=column_names, keep='first')
+        unique_df = unique_df.sort_values('original_idx')  # Maintain order
+        
+        # Extract unique indices (positions of first occurrence in original array)
+        unique_indices = unique_df['original_idx'].values
+        
+        # Get the unique vectors from the original (non-rounded) array
+        # This preserves full precision
         unique_vectors = vectors[unique_indices]
+        
+        # Create inverse mapping: for each original vector, find its unique index
+        # We need to map each original vector to its corresponding unique vector index
+        # First, create a mapping from unique vectors back to their new indices
+        unique_df_for_merge = unique_df.copy()
+        unique_df_for_merge['unique_idx'] = cp.arange(len(unique_df), dtype=cp.int32)
+        
+        # Merge with original DataFrame to get mapping
+        merged_df = vectors_df[column_names].merge(
+            unique_df_for_merge[column_names + ['unique_idx']], 
+            on=column_names, 
+            how='left'
+        )
+        inverse_indices = merged_df['unique_idx'].values
         
         n_unique = len(unique_vectors)
         reduction_ratio = 1.0 - (n_unique / n_samples)
@@ -1254,6 +1269,10 @@ class EntityClusterer:
                 f"High duplication rate detected ({reduction_ratio:.1%}). "
                 f"This is common for categorical embeddings or repeated entities."
             )
+        
+        # Clean up temporary DataFrames to free GPU memory
+        del vectors_df, unique_df, unique_df_for_merge, merged_df
+        cp.get_default_memory_pool().free_all_blocks()
         
         return unique_vectors, unique_indices, inverse_indices
     
