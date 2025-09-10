@@ -25,20 +25,24 @@ class TextNormalizer:
     """
     Handle cleaning and standardization of entity names for resolution.
     
-    This class implements a comprehensive text normalization pipeline that
-    prepares entity names for vectorization and matching. It handles common
-    variations in business names, removes noise, and consolidates entities
-    that share addresses. It is specifically optimized for use with the
-    rapids.ai cuDF library.
+    Optimized for entity resolution and deduplication, this class balances
+    standardization with preservation of distinguishing features. It handles
+    common business variations while keeping proper nouns distinct.
 
     Attributes:
         config (NormalizationConfig): Configuration for normalization rules
         vectorizer_config (VectorizerConfig): Configuration for vectorizer settings
         _compiled_patterns (Dict): Pre-compiled regex patterns for efficiency
         _consolidation_stats (Dict): Statistics from last consolidation operation
+        min_string_length (int): Minimum length to preserve during normalization
     """
     
-    def __init__(self, config: NormalizationConfig, vectorizer_config: VectorizerConfig):
+    def __init__(
+        self, 
+        config: NormalizationConfig, 
+        vectorizer_config: VectorizerConfig,
+        min_string_length: int = 2
+    ):
         """
         Initialize the TextNormalizer with configuration settings.
 
@@ -46,325 +50,372 @@ class TextNormalizer:
             config: NormalizationConfig object containing replacement rules,
                     suffixes to remove, and other normalization parameters.
             vectorizer_config: VectorizerConfig object for downstream processing.
+            min_string_length: Minimum string length to preserve. Strings shorter
+                             than this after normalization will use minimal processing.
         """
         self.config = config
         self.vectorizer_config = vectorizer_config
-        self._compiled_patterns = self._compile_regex_patterns()
+        self.min_string_length = min_string_length
         self._consolidation_stats = {}
         
-        logger.info("Initialized TextNormalizer")
-        logger.debug(f"Replacements configured: {len(config.replacements)}")
-        logger.debug(f"Suffixes to remove: {len(config.suffixes_to_remove)}")
+        # Convert config to dictionaries/sets for efficient lookup
+        self.replacements = dict(config.replacements) if config.replacements else {}
+        self.suffixes_to_remove = set(config.suffixes_to_remove) if config.suffixes_to_remove else set()
+        
+        # Remove overlap between replacements and suffixes
+        self._dedup_config_overlap()
+        
+        # Compile patterns after deduplication
+        self._compiled_patterns = self._compile_regex_patterns()
+        
+        logger.info("Initialized TextNormalizer for entity resolution")
+        logger.debug(f"Replacements configured: {len(self.replacements)}")
+        logger.debug(f"Suffixes to remove: {len(self.suffixes_to_remove)}")
+        logger.debug(f"Minimum string length: {min_string_length}")
 
-
-    def _compile_regex_patterns(self) -> Dict[str, re.Pattern]:
+    def _dedup_config_overlap(self):
         """
-        Pre-compile all regex patterns and define cuDF-compatible replacements.
-
-        Pre-compiling patterns during initialization avoids repeated compilation
-        when processing large datasets. This method also formats replacement strings
-        with backslashes (e.g., \\1, \\2) for compatibility with cuDF's stricter
-        regex engine.
-
-        Returns:
-            Dictionary mapping pattern names to compiled regex pattern objects and
-            their corresponding replacement strings.
+        Remove overlapping entries between replacements and suffixes.
+        
+        If a word appears as both a replacement target and a suffix to remove,
+        prefer the replacement (more specific intent).
+        """
+        if not self.replacements or not self.suffixes_to_remove:
+            return
             
-        Note:
-            While cuDF uses Numba/CUDA for regex operations, pre-compiling patterns
-            still provides benefits by validating patterns early and organizing them
-            for maintainability.
+        # Find overlaps
+        replacement_keys = set(self.replacements.keys())
+        overlaps = replacement_keys & self.suffixes_to_remove
+        
+        if overlaps:
+            logger.debug(f"Found {len(overlaps)} overlapping entries between replacements and suffixes")
+            # Remove overlaps from suffixes (prefer replacements)
+            self.suffixes_to_remove -= overlaps
+            logger.debug(f"Removed from suffixes: {overlaps}")
+
+    def _compile_regex_patterns(self) -> Dict[str, any]:
+        """
+        Pre-compile regex patterns compatible with cuDF's RE2 engine.
+        
+        Since RE2 doesn't support \\b word boundaries, we use character class
+        patterns like (^|[^a-z0-9]) for word starts and ($|[^a-z0-9]) for word ends.
+        
+        Returns:
+            Dictionary containing pattern strings and replacement info.
         """
         patterns = {}
+        logger.debug("Compiling regex patterns for cuDF RE2 engine")
 
-        logger.debug("Pre-compiling regex patterns for cuDF-based text normalization")
-
-        # Business abbreviation patterns
-        # These expand common abbreviations to their full forms. The replacement
-        # strings use the '\\1', '\\2' backreference syntax required by cuDF.
-        # Pattern: (boundary_start)abbrev.?(boundary_end) -> \1expansion\2
-        business_abbreviations = {
-            'corp': (r'(^|[^a-zA-Z0-9_])corp\.?($|[^a-zA-Z0-9_])', r'\1corporation\2'),
-            'inc': (r'(^|[^a-zA-Z0-9_])inc\.?($|[^a-zA-Z0-9_])', r'\1incorporated\2'),
-            'ltd': (r'(^|[^a-zA-Z0-9_])ltd\.?($|[^a-zA-Z0-9_])', r'\1limited\2'),
-            'llc': (r'(^|[^a-zA-Z0-9_])llc\.?($|[^a-zA-Z0-9_])', r'\1limited liability company\2'),
-            'co': (r'(^|[^a-zA-Z0-9_])co\.?($|[^a-zA-Z0-9_])', r'\1company\2'),
-            'assoc': (r'(^|[^a-zA-Z0-9_])assoc\.?($|[^a-zA-Z0-9_])', r'\1associates\2'),
-            'mfg': (r'(^|[^a-zA-Z0-9_])mfg\.?($|[^a-zA-Z0-9_])', r'\1manufacturing\2'),
-            'intl': (r'(^|[^a-zA-Z0-9_])intl\.?($|[^a-zA-Z0-9_])', r'\1international\2'),
-            'dist': (r'(^|[^a-zA-Z0-9_])dist\.?($|[^a-zA-Z0-9_])', r'\1distribution\2'),
-            'svcs': (r'(^|[^a-zA-Z0-9_])svcs?\.?($|[^a-zA-Z0-9_])', r'\1services\2'),
-            'mgmt': (r'(^|[^a-zA-Z0-9_])mgmt\.?($|[^a-zA-Z0-9_])', r'\1management\2'),
-            'grp': (r'(^|[^a-zA-Z0-9_])grp\.?($|[^a-zA-Z0-9_])', r'\1group\2')
+        # Business qualifier patterns - matches anywhere in string
+        # Captures text after the qualifier as the main business name
+        patterns['business_qualifier'] = {
+            'pattern': (
+                r'(?:^|.*?[^a-z0-9])'  # Non-capturing group for text before
+                r'(?:'
+                r'd[\/.\-\s]*b[\/.\-\s]*a|'           # dba variations
+                r'f[\/.\-\s]*k[\/.\-\s]*a|'           # fka variations  
+                r'a[\/.\-\s]*k[\/.\-\s]*a|'           # aka variations
+                r't[\/.\-\s]*a(?:[^a-z0-9]|$)|'       # ta (trading as) - avoid matching "tax"
+                r'formerly|'                          # formerly
+                r'now\s+known\s+as|'                  # now known as
+                r'trading\s+as|'                      # trading as
+                r'doing\s+business\s+as'              # doing business as
+                r')'
+                r'[\s:]+(.+?)$'                       # Capture the actual business name
+            ),
+            'type': 'extract'
         }
-
-        for abbrev_key, (pattern_str, expansion) in business_abbreviations.items():
-            pattern_name = f'abbrev_{abbrev_key}'
-            patterns[pattern_name] = re.compile(pattern_str, re.IGNORECASE)
-            patterns[f'{pattern_name}_replacement'] = expansion
-
-        logger.debug(f"  - Compiled {len(business_abbreviations)} business abbreviation patterns")
-
-        # Enhanced business name qualifier pattern (dba, fka, aka, etc.)
-        patterns['business_qualifier'] = re.compile(
-            r'(?:\s|^)(?:'
-            r'd(?:\s*[/.\-]\s*)?b(?:\s*[/.\-]\s*)?a|'    # dba variations
-            r'f(?:\s*[/.\-]\s*)?k(?:\s*[/.\-]\s*)?a|'    # fka variations
-            r'a(?:\s*[/.\-]\s*)?k(?:\s*[/.\-]\s*)?a|'    # aka variations
-            r't(?:\s*[/.\-]\s*)?a|'                      # ta (trading as)
-            r'formerly|'                                # formerly
-            r'now\s+known\s+as|'                        # now known as
-            r'trading\s+as|'                            # trading as
-            r'doing\s+business\s+as'                    # doing business as
-            r')(?:\s*:)?\s+(.*?)(?:\s*$)',               # Capture group for the actual name
-            re.IGNORECASE
-        )
-        logger.debug("  - Compiled business qualifier pattern (dba/fka/aka/ta/formerly/etc.)")
-
-        # Separator and conjunction patterns
-        separator_patterns = {
-            'ampersand': (r'&+', ' and '),
-            'plus': (r'[+]+', ' and '),
-            'n_word': (r'(^|[^a-zA-Z0-9_])n($|[^a-zA-Z0-9_])', r'\1 and \2'),  # Uses backreferences
-            'forward_slash': (r'/', ' '),
-            'backslash': (r'\\', ' '),
-            'pipe': (r'\|', ' '),
-            'middle_dot': (r'·', ' '),
-            'bullet': (r'•', ' '),
-            'dashes': (r'–|—', ' ')
+        
+        # Separator patterns for standardization
+        patterns['ampersand'] = {'pattern': r'&+', 'replacement': ' and ', 'type': 'simple'}
+        patterns['plus'] = {'pattern': r'\++', 'replacement': ' and ', 'type': 'simple'}
+        patterns['forward_slash'] = {'pattern': r'/', 'replacement': ' ', 'type': 'simple'}
+        patterns['pipe'] = {'pattern': r'\|', 'replacement': ' ', 'type': 'simple'}
+        patterns['middle_dot'] = {'pattern': r'·', 'replacement': ' ', 'type': 'simple'}
+        patterns['bullet'] = {'pattern': r'•', 'replacement': ' ', 'type': 'simple'}
+        patterns['dashes'] = {'pattern': r'[–—-]+', 'replacement': ' ', 'type': 'simple'}
+        
+        # Common letter replacements for matching (e.g., "Triple A" -> "AAA")
+        patterns['triple'] = {
+            'pattern': r'(^|[^a-z0-9])triple\s+([a-z])($|[^a-z0-9])',
+            'replacement': r'\1\2\2\2\3',
+            'type': 'backrefs'
         }
-
-        for sep_key, (pattern_str, replacement) in separator_patterns.items():
-            pattern_name = f'separator_{sep_key}'
-            patterns[pattern_name] = re.compile(pattern_str, re.IGNORECASE if sep_key == 'n_word' else 0)
-            patterns[f'{pattern_name}_replacement'] = replacement
-
-        logger.debug(f"  - Compiled {len(separator_patterns)} separator patterns")
-
-        # Noise removal patterns - parenthetical and quoted content
-        patterns['parenthetical'] = re.compile(r'\([^)]*\)')
-        patterns['bracketed'] = re.compile(r'\[[^\]]*\]')
-        patterns['double_quoted'] = re.compile(r'"[^"]*"')
-        patterns['single_quoted'] = re.compile(r"'[^']*'")
-        logger.debug("  - Compiled noise removal patterns (parenthetical/bracketed/quoted)")
-
-        # OCR error correction patterns, updated for cuDF backreferences
-        ocr_patterns = {
-            'zero_in_word': (r'([a-z])0([a-z])', r'\1o\2'),
-            'one_in_word':  (r'([a-z])1([a-z])', r'\1l\2'),
-            'five_in_word': (r'([a-z])5([a-z])', r'\1s\2')
+        patterns['double'] = {
+            'pattern': r'(^|[^a-z0-9])double\s+([a-z])($|[^a-z0-9])',
+            'replacement': r'\1\2\2\3',
+            'type': 'backrefs'
         }
-
-        for ocr_key, (pattern_str, replacement) in ocr_patterns.items():
-            pattern_name = f'ocr_{ocr_key}'
-            patterns[pattern_name] = re.compile(pattern_str, re.IGNORECASE)
-            patterns[f'{pattern_name}_replacement'] = replacement
-
-        logger.debug(f"  - Compiled {len(ocr_patterns)} OCR correction patterns")
-
-        # Final cleanup patterns
-        patterns['possessive_s'] = re.compile(r"'s($|[^a-zA-Z0-9_])", re.IGNORECASE)
-        patterns['possessive_plural'] = re.compile(r"s'($|[^a-zA-Z0-9_])", re.IGNORECASE)
-        patterns['non_alphanumeric'] = re.compile(r'[^\w\s]')
-        patterns['trailing_numbers'] = re.compile(r'\s+\d+$')
-        patterns['single_chars'] = re.compile(r'(^|[^a-zA-Z0-9_])([b-hj-z])($|[^a-zA-Z0-9_])', re.IGNORECASE)
-        patterns['multiple_spaces'] = re.compile(r'\s+')
-        logger.debug("  - Compiled final cleanup patterns")
-
-        # Compile suffix removal pattern if suffixes are configured
-        if self.config.suffixes_to_remove:
-            escaped_suffixes = [re.escape(suffix) for suffix in self.config.suffixes_to_remove]
-            suffix_pattern_str = r'(^|[^a-zA-Z0-9_])(?:' + '|'.join(escaped_suffixes) + r')($|[^a-zA-Z0-9_])'
-            patterns['suffix_removal'] = re.compile(suffix_pattern_str, re.IGNORECASE)
-            logger.debug(f"  - Compiled suffix removal pattern for {len(self.config.suffixes_to_remove)} suffixes")
-
-        # Compile custom replacement patterns from configuration
-        if self.config.replacements:
-            for old_word, new_word in self.config.replacements.items():
-                pattern_key = f'custom_replacement_{old_word}'
-                pattern_str = r'(^|[^a-zA-Z0-9_])' + re.escape(old_word) + r'($|[^a-zA-Z0-9_])'
-                patterns[pattern_key] = re.compile(pattern_str, re.IGNORECASE)
-                # Store the cuDF-compatible replacement text
-                patterns[f'{pattern_key}_replacement'] = r'\1' + new_word + r'\2'
-
-            logger.debug(f"  - Compiled {len(self.config.replacements)} custom replacement patterns")
-
-        # Validation pattern - check for remaining special characters
-        patterns['validation_special_chars'] = re.compile(r'[^a-z0-9\s]')
-
-        total_patterns = len([k for k in patterns.keys() if not k.endswith('_replacement')])
-        logger.info(f"Successfully pre-compiled {total_patterns} regex patterns for normalization")
-
+        
+        # Noise removal patterns
+        patterns['parenthetical'] = {'pattern': r'\([^)]*\)', 'replacement': ' ', 'type': 'simple'}
+        patterns['bracketed'] = {'pattern': r'\[[^\]]*\]', 'replacement': ' ', 'type': 'simple'}
+        
+        # OCR corrections (only in middle of words)
+        patterns['ocr_zero'] = {
+            'pattern': r'([a-z])0([a-z])',
+            'replacement': r'\1o\2',
+            'type': 'backrefs'
+        }
+        patterns['ocr_one'] = {
+            'pattern': r'([a-z])1([a-z])',
+            'replacement': r'\1l\2',
+            'type': 'backrefs'
+        }
+        
+        # Possessives
+        patterns['possessive'] = {'pattern': r"'s(?:$|[^a-z0-9])", 'replacement': ' ', 'type': 'simple'}
+        
+        # Special characters (keep alphanumeric and spaces)
+        patterns['special_chars'] = {'pattern': r'[^\w\s]', 'replacement': ' ', 'type': 'simple'}
+        
+        # Multiple spaces
+        patterns['multi_space'] = {'pattern': r'\s+', 'replacement': ' ', 'type': 'simple'}
+        
+        # Build replacement patterns with proper word boundaries for RE2
+        if self.replacements:
+            for old_word, new_word in self.replacements.items():
+                key = f'repl_{old_word}'
+                # Use groups to simulate word boundaries
+                patterns[key] = {
+                    'pattern': r'(^|[^a-z0-9])' + re.escape(old_word) + r'($|[^a-z0-9])',
+                    'replacement': r'\1' + new_word + r'\2',
+                    'type': 'backrefs'
+                }
+            
+        # Build suffix removal patterns
+        if self.suffixes_to_remove:
+            # Sort by length (longest first) to handle compound suffixes
+            sorted_suffixes = sorted(self.suffixes_to_remove, key=len, reverse=True)
+            
+            # Create individual patterns for each suffix to ensure proper boundary handling
+            for suffix in sorted_suffixes:
+                key = f'suffix_{suffix}'
+                # Match suffix with word boundary simulation
+                patterns[key] = {
+                    'pattern': r'(^|[^a-z0-9])' + re.escape(suffix) + r'(?:\W*)?$',
+                    'replacement': r'\1',
+                    'type': 'backrefs'
+                }
+            
+        logger.info(f"Compiled {len(patterns)} normalization patterns")
         return patterns
 
     def normalize_text(self, gdf: cudf.DataFrame, entity_col: str) -> cudf.DataFrame:
         """
-        Apply comprehensive normalization rules to entity name column using cuDF.
-
-        This GPU-accelerated process performs multiple cleaning steps optimized for
-        business entity matching. It uses cuDF's string methods, including
-        `str.replace_with_backrefs` for complex replacements, to create a
-        consistent 'normalized_text' column.
-
+        Apply normalization rules to entity names for entity resolution.
+        
+        Balances standardization with preservation of distinguishing features.
+        Designed to match variations like "Triple A Hardware" with "AAA Hardware"
+        or "Mack's Trk" with "Mac's Truck" while keeping proper nouns distinct.
+        
         Normalization pipeline:
         1. Unicode normalization (NFKC)
-        2. Basic cleaning (lowercase, whitespace)
-        3. Business abbreviation expansion
-        4. Separator and symbol standardization
-        5. Noise removal (parenthetical content)
-        6. Business qualifier handling (dba, fka, etc.)
-        7. Custom word replacements
-        8. Legal/organizational suffix removal
-        9. Common OCR/data entry error correction
+        2. Lowercase conversion
+        3. Expand word-number patterns (triple a -> aaa)
+        4. Word replacements from config (trk -> truck)
+        5. Business qualifier extraction (dba, fka, etc.)
+        6. Separator standardization (& -> and)
+        7. Noise removal (parenthetical content)
+        8. OCR error correction
+        9. Suffix removal (inc, llc, etc.)
         10. Final cleanup and validation
-
+        
         Args:
             gdf: Input cuDF DataFrame containing entity data.
             entity_col: Name of column with entity names to normalize.
-
+            
         Returns:
-            cuDF DataFrame with an added 'normalized_text' column.
-
+            cuDF DataFrame with added 'normalized_text' column.
+            
         Raises:
             KeyError: If entity_col doesn't exist in the DataFrame.
-            ValueError: If normalization fails or produces invalid output.
         """
         if entity_col not in gdf.columns:
             raise KeyError(f"Column '{entity_col}' not found in DataFrame")
-
-        initial_record_count = len(gdf)
-        logger.info(f"Starting text normalization for {initial_record_count:,} records in '{entity_col}'")
-
-        normalized_series = gdf[entity_col].fillna('').astype('str')
-
-        initial_unique_count = normalized_series.nunique()
-        initial_avg_length = normalized_series.str.len().mean()
-        logger.debug(f"Initial stats - Unique: {initial_unique_count:,}, Avg length: {initial_avg_length:.1f}")
-
-        # Step 1: Unicode normalization (NFKC form)
-        logger.debug("Step 1: Applying Unicode normalization (NFKC)")
-        normalized_series = nfkc_normalize_series(normalized_series)
-
-        # Step 2: Convert to lowercase
-        logger.debug("Step 2: Converting to lowercase")
-        normalized_series = normalized_series.str.lower()
-
-        # Step 3: Expand common business abbreviations
-        logger.debug("Step 3: Expanding business abbreviations")
-        abbreviation_replacement_count = 0
-        abbreviation_keys = ['corp', 'inc', 'ltd', 'llc', 'co', 'assoc', 'mfg', 'intl', 'dist', 'svcs', 'mgmt', 'grp']
-
-        for abbrev_key in abbreviation_keys:
-            pattern_name = f'abbrev_{abbrev_key}'
-            if pattern_name in self._compiled_patterns:
-                pattern_str = self._compiled_patterns[pattern_name].pattern
-                replacement = self._compiled_patterns[f'{pattern_name}_replacement']
-
-                before_expansion = normalized_series.copy()
-                # Use replace_with_backrefs as replacements contain \1, \2
-                normalized_series = normalized_series.str.replace_with_backrefs(pattern_str, replacement)
-                affected_records = (normalized_series != before_expansion).sum()
-                if affected_records > 0:
-                    abbreviation_replacement_count += affected_records
-                    display_replacement = re.sub(r'\\\d', '', replacement)
-                    logger.debug(f"  - Expanded '{abbrev_key}' to '{display_replacement}' in {affected_records:,} records")
+            
+        logger.info(f"Starting entity name normalization for {len(gdf):,} records")
         
-        if abbreviation_replacement_count > 0:
-            logger.info(f"  - Total abbreviation expansions: {abbreviation_replacement_count:,}")
-
-        # Step 4: Standardize separators and conjunctions
-        logger.debug("Step 4: Standardizing separators and conjunctions")
-        separator_keys = ['ampersand', 'plus', 'n_word', 'forward_slash', 'backslash',
-                          'pipe', 'middle_dot', 'bullet', 'dashes']
-
-        for sep_key in separator_keys:
-            pattern_name = f'separator_{sep_key}'
-            if pattern_name in self._compiled_patterns:
-                pattern_str = self._compiled_patterns[pattern_name].pattern
-                replacement = self._compiled_patterns[f'{pattern_name}_replacement']
-                # Conditionally use replace_with_backrefs only if needed
-                if '\\' in replacement:
-                    normalized_series = normalized_series.str.replace_with_backrefs(pattern_str, replacement)
-                else:
-                    normalized_series = normalized_series.str.replace(pattern_str, replacement, regex=True)
-
-        # Step 5: Remove noise - parenthetical content and special annotations
-        logger.debug("Step 5: Removing parenthetical content and annotations")
-        before_parenthetical_removal = normalized_series.copy()
-        normalized_series = normalized_series.str.replace(self._compiled_patterns['parenthetical'].pattern, ' ', regex=True)
-        affected_by_parentheses = (normalized_series != before_parenthetical_removal).sum()
-        logger.debug(f"  - Removed parenthetical content from {affected_by_parentheses:,} records")
-
-        normalized_series = normalized_series.str.replace(self._compiled_patterns['bracketed'].pattern, ' ', regex=True)
-        normalized_series = normalized_series.str.replace(self._compiled_patterns['double_quoted'].pattern, ' ', regex=True)
-        normalized_series = normalized_series.str.replace(self._compiled_patterns['single_quoted'].pattern, ' ', regex=True)
-
-        # Step 6: Handle business name qualifiers (dba, fka, aka, etc.)
-        logger.debug("Step 6: Processing business name qualifiers")
-        qualifier_pattern = self._compiled_patterns['business_qualifier'].pattern
-        # extract does not need backreference changes
-        extracted_business_names = normalized_series.str.extract(qualifier_pattern, expand=False)
-        qualifier_count = extracted_business_names.notna().sum()
-        normalized_series = extracted_business_names.fillna(normalized_series)
-        logger.info(f"  - Processed business qualifiers in {qualifier_count:,} records")
-
-        # Step 7: Apply custom word replacements from configuration
-        if self.config.replacements:
-            logger.debug(f"Step 7: Applying {len(self.config.replacements)} custom replacements")
-            for old_word, new_word in self.config.replacements.items():
-                pattern_key = f'custom_replacement_{old_word}'
-                if pattern_key in self._compiled_patterns:
-                    pattern_str = self._compiled_patterns[pattern_key].pattern
-                    replacement_text = self._compiled_patterns[f'{pattern_key}_replacement']
-                    # Use replace_with_backrefs due to \1, \2 in replacement
-                    normalized_series = normalized_series.str.replace_with_backrefs(pattern_str, replacement_text)
-
-        # Step 8: Remove legal and organizational suffixes
-        if self.config.suffixes_to_remove and 'suffix_removal' in self._compiled_patterns:
-            logger.debug(f"Step 8: Removing {len(self.config.suffixes_to_remove)} legal/org suffixes")
-            suffix_pattern = self._compiled_patterns['suffix_removal'].pattern
-            # Use replace_with_backrefs for the replacement string r'\1 \2'
-            normalized_series = normalized_series.str.replace_with_backrefs(suffix_pattern, r'\1 \2')
-
-        # Step 9: Handle common OCR and data entry errors
-        logger.debug("Step 9: Correcting common OCR/data entry errors")
-        ocr_keys = ['zero_in_word', 'one_in_word', 'five_in_word']
-        for ocr_key in ocr_keys:
-            pattern_name = f'ocr_{ocr_key}'
-            if pattern_name in self._compiled_patterns:
-                pattern_str = self._compiled_patterns[pattern_name].pattern
-                replacement = self._compiled_patterns[f'{pattern_name}_replacement']
-                # Use replace_with_backrefs for OCR corrections
-                normalized_series = normalized_series.str.replace_with_backrefs(pattern_str, replacement)
-
-        # Step 10: Final cleanup and validation
-        logger.debug("Step 10: Final cleanup and validation")
-        normalized_series = normalized_series.str.replace(self._compiled_patterns['possessive_s'].pattern, '', regex=True)
-        normalized_series = normalized_series.str.replace(self._compiled_patterns['possessive_plural'].pattern, 's', regex=True)
-        normalized_series = normalized_series.str.replace(self._compiled_patterns['non_alphanumeric'].pattern, ' ', regex=True)
-        normalized_series = normalized_series.str.replace(self._compiled_patterns['trailing_numbers'].pattern, '', regex=True)
-        normalized_series = normalized_series.str.replace(self._compiled_patterns['single_chars'].pattern, ' ', regex=True)
-        normalized_series = normalized_series.str.replace(self._compiled_patterns['multiple_spaces'].pattern, ' ', regex=True)
-        normalized_series = normalized_series.str.strip()
-
-        # Handle edge cases - empty strings after normalization
-        empty_mask = (normalized_series == '') | normalized_series.isna()
-        empty_count = empty_mask.sum()
-        if empty_count > 0:
-            logger.warning(f"  - {empty_count:,} records became empty after normalization")
-            normalized_series[empty_mask] = 'UNKNOWN_ENTITY'
-
-        # Assign normalized text to DataFrame
-        gdf['normalized_text'] = normalized_series
-
-        # Calculate and log final statistics
-        final_unique_count = gdf['normalized_text'].nunique()
-        unique_reduction_ratio = 1 - (final_unique_count / initial_unique_count) if initial_unique_count > 0 else 0
+        # Start with original text
+        normalized = gdf[entity_col].fillna('').astype('str')
+        
+        # Track statistics
+        initial_unique = normalized.nunique()
+        initial_avg_len = normalized.str.len().mean()
+        logger.debug(f"Initial: {initial_unique:,} unique, avg length {initial_avg_len:.1f}")
+        
+        # Step 1: Unicode normalization
+        logger.debug("Step 1: Unicode normalization (NFKC)")
+        normalized = nfkc_normalize_series(normalized)
+        
+        # Step 2: Lowercase
+        logger.debug("Step 2: Converting to lowercase")
+        normalized = normalized.str.lower()
+        
+        # Step 3: Expand word-number patterns (triple a -> aaa, double u -> uu)
+        logger.debug("Step 3: Expanding word-number patterns")
+        for pattern_key in ['triple', 'double']:
+            if pattern_key in self._compiled_patterns:
+                pattern_info = self._compiled_patterns[pattern_key]
+                normalized = normalized.str.replace_with_backrefs(
+                    pattern_info['pattern'],
+                    pattern_info['replacement']
+                )
+        
+        # Step 4: Apply word replacements from config
+        logger.debug(f"Step 4: Applying {len(self.replacements)} word replacements")
+        replacement_keys = [k for k in self._compiled_patterns.keys() if k.startswith('repl_')]
+        
+        for key in replacement_keys:
+            pattern_info = self._compiled_patterns[key]
+            normalized = normalized.str.replace_with_backrefs(
+                pattern_info['pattern'],
+                pattern_info['replacement']
+            )
+        
+        # Step 5: Extract business qualifiers (dba, fka, etc.)
+        logger.debug("Step 5: Processing business qualifiers")
+        if 'business_qualifier' in self._compiled_patterns:
+            pattern = self._compiled_patterns['business_qualifier']['pattern']
+            extracted = normalized.str.extract(pattern, expand=False)
+            qualifier_count = extracted.notna().sum()
+            if qualifier_count > 0:
+                # Use the extracted name where found, otherwise keep original
+                normalized = extracted.fillna(normalized)
+                logger.info(f"  Extracted business names from {qualifier_count:,} qualifiers")
+        
+        # Step 6: Standardize separators
+        logger.debug("Step 6: Standardizing separators and symbols")
+        for key in ['ampersand', 'plus', 'forward_slash', 'pipe', 'middle_dot', 'bullet', 'dashes']:
+            if key in self._compiled_patterns:
+                pattern_info = self._compiled_patterns[key]
+                normalized = normalized.str.replace(
+                    pattern_info['pattern'],
+                    pattern_info['replacement'],
+                    regex=True
+                )
+        
+        # Step 7: Remove noise (parenthetical content)
+        logger.debug("Step 7: Removing parenthetical and bracketed content")
+        for key in ['parenthetical', 'bracketed']:
+            if key in self._compiled_patterns:
+                pattern_info = self._compiled_patterns[key]
+                normalized = normalized.str.replace(
+                    pattern_info['pattern'],
+                    pattern_info['replacement'],
+                    regex=True
+                )
+        
+        # Step 8: OCR corrections
+        logger.debug("Step 8: Applying OCR corrections")
+        for key in ['ocr_zero', 'ocr_one']:
+            if key in self._compiled_patterns:
+                pattern_info = self._compiled_patterns[key]
+                normalized = normalized.str.replace_with_backrefs(
+                    pattern_info['pattern'],
+                    pattern_info['replacement']
+                )
+        
+        # Step 9: Remove suffixes (iteratively to handle multiple)
+        logger.debug(f"Step 9: Removing {len(self.suffixes_to_remove)} business suffixes")
+        suffix_keys = [k for k in self._compiled_patterns.keys() if k.startswith('suffix_')]
+        
+        # Apply suffix removal up to 3 times to handle cases like "inc usa llc"
+        for iteration in range(3):
+            changes_made = False
+            for key in suffix_keys:
+                pattern_info = self._compiled_patterns[key]
+                before = normalized.copy()
+                normalized = normalized.str.replace_with_backrefs(
+                    pattern_info['pattern'],
+                    pattern_info['replacement']
+                )
+                if not (normalized == before).all():
+                    changes_made = True
+            
+            if not changes_made:
+                break  # No more suffixes to remove
+        
+        # Step 10: Final cleanup
+        logger.debug("Step 10: Final cleanup")
+        
+        # Remove possessives
+        if 'possessive' in self._compiled_patterns:
+            pattern_info = self._compiled_patterns['possessive']
+            normalized = normalized.str.replace(
+                pattern_info['pattern'],
+                pattern_info['replacement'],
+                regex=True
+            )
+        
+        # Remove remaining special characters
+        if 'special_chars' in self._compiled_patterns:
+            pattern_info = self._compiled_patterns['special_chars']
+            normalized = normalized.str.replace(
+                pattern_info['pattern'],
+                pattern_info['replacement'],
+                regex=True
+            )
+        
+        # Clean up multiple spaces and trim
+        if 'multi_space' in self._compiled_patterns:
+            pattern_info = self._compiled_patterns['multi_space']
+            normalized = normalized.str.replace(
+                pattern_info['pattern'],
+                pattern_info['replacement'],
+                regex=True
+            )
+        
+        normalized = normalized.str.strip()
+        
+        # Step 11: Protect against over-normalization
+        logger.debug("Step 11: Checking for over-normalization")
+        
+        # Create a mask for strings that became too short
+        too_short_mask = (normalized.str.len() < self.min_string_length) & (normalized != '')
+        
+        # For strings that became too short, use minimal normalization
+        if too_short_mask.any():
+            count_too_short = too_short_mask.sum()
+            logger.warning(f"  {count_too_short:,} strings became too short, using minimal normalization")
+            
+            # Apply minimal normalization (just lowercase, trim, and basic cleanup)
+            original_minimal = gdf[entity_col].fillna('').astype('str')
+            original_minimal = original_minimal.str.lower()
+            original_minimal = original_minimal.str.replace(r'[^\w\s]', ' ', regex=True)
+            original_minimal = original_minimal.str.replace(r'\s+', ' ', regex=True)
+            original_minimal = original_minimal.str.strip()
+            
+            # Replace too-short normalized strings with minimally processed originals
+            normalized[too_short_mask] = original_minimal[too_short_mask]
+        
+        # Handle completely empty strings
+        empty_mask = (normalized == '') | normalized.isna()
+        if empty_mask.any():
+            empty_count = empty_mask.sum()
+            logger.warning(f"  {empty_count:,} records became empty, marking as UNKNOWN")
+            normalized[empty_mask] = 'unknown_entity'
+        
+        # Add to DataFrame
+        gdf['normalized_text'] = normalized
+        
+        # Log statistics
+        final_unique = gdf['normalized_text'].nunique()
+        reduction = 1 - (final_unique / initial_unique) if initial_unique > 0 else 0
+        
+        # Log some example normalizations if in debug mode
+        if logger.isEnabledFor(logging.DEBUG) and len(gdf) > 0:
+            sample_size = min(5, len(gdf))
+            sample_df = gdf[[entity_col, 'normalized_text']].head(sample_size)
+            logger.debug("Sample normalizations:")
+            for idx, row in enumerate(sample_df.to_pandas().itertuples()):
+                logger.debug(f"  '{row[1]}' -> '{row[2]}'")
+        
         logger.info(
-            f"Text normalization complete: "
-            f"Unique values reduced from {initial_unique_count:,} to {final_unique_count:,} ({unique_reduction_ratio:.1%} reduction)"
+            f"Normalization complete: {initial_unique:,} → {final_unique:,} unique "
+            f"({reduction:.1%} reduction)"
         )
-
+        
         return gdf
     
     def consolidate_by_address(self, gdf: cudf.DataFrame) -> cudf.DataFrame:
