@@ -77,7 +77,7 @@ class EntityClusterer:
         self.random_state = self.config.umap_params.get("random_state", 42)
 
         # Initialize inverse vector mapping for UMAP input
-        self._current_inverse_indices
+        self._current_inverse_indices: cp.ndarray | None = None
         
         logger.info("Initialized EntityClusterer")
         logger.debug(f"UMAP ensemble size: {config.umap_n_runs}")
