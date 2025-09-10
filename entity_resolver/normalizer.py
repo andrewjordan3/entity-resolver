@@ -262,7 +262,7 @@ class TextNormalizer:
 
                 before_expansion = normalized_series.copy()
                 # Use replace_with_backrefs as replacements contain \1, \2
-                normalized_series = normalized_series.str.replace_with_backrefs(pattern_str, replacement, regex=True)
+                normalized_series = normalized_series.str.replace_with_backrefs(pattern_str, replacement)
                 affected_records = (normalized_series != before_expansion).sum()
                 if affected_records > 0:
                     abbreviation_replacement_count += affected_records
@@ -284,7 +284,7 @@ class TextNormalizer:
                 replacement = self._compiled_patterns[f'{pattern_name}_replacement']
                 # Conditionally use replace_with_backrefs only if needed
                 if '\\' in replacement:
-                    normalized_series = normalized_series.str.replace_with_backrefs(pattern_str, replacement, regex=True)
+                    normalized_series = normalized_series.str.replace_with_backrefs(pattern_str, replacement)
                 else:
                     normalized_series = normalized_series.str.replace(pattern_str, replacement, regex=True)
 
@@ -317,14 +317,14 @@ class TextNormalizer:
                     pattern_str = self._compiled_patterns[pattern_key].pattern
                     replacement_text = self._compiled_patterns[f'{pattern_key}_replacement']
                     # Use replace_with_backrefs due to \1, \2 in replacement
-                    normalized_series = normalized_series.str.replace_with_backrefs(pattern_str, replacement_text, regex=True)
+                    normalized_series = normalized_series.str.replace_with_backrefs(pattern_str, replacement_text)
 
         # Step 8: Remove legal and organizational suffixes
         if self.config.suffixes_to_remove and 'suffix_removal' in self._compiled_patterns:
             logger.debug(f"Step 8: Removing {len(self.config.suffixes_to_remove)} legal/org suffixes")
             suffix_pattern = self._compiled_patterns['suffix_removal'].pattern
             # Use replace_with_backrefs for the replacement string r'\1 \2'
-            normalized_series = normalized_series.str.replace_with_backrefs(suffix_pattern, r'\1 \2', regex=True)
+            normalized_series = normalized_series.str.replace_with_backrefs(suffix_pattern, r'\1 \2')
 
         # Step 9: Handle common OCR and data entry errors
         logger.debug("Step 9: Correcting common OCR/data entry errors")
@@ -335,7 +335,7 @@ class TextNormalizer:
                 pattern_str = self._compiled_patterns[pattern_name].pattern
                 replacement = self._compiled_patterns[f'{pattern_name}_replacement']
                 # Use replace_with_backrefs for OCR corrections
-                normalized_series = normalized_series.str.replace_with_backrefs(pattern_str, replacement, regex=True)
+                normalized_series = normalized_series.str.replace_with_backrefs(pattern_str, replacement)
 
         # Step 10: Final cleanup and validation
         logger.debug("Step 10: Final cleanup and validation")
