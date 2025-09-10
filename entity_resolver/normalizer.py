@@ -265,6 +265,9 @@ class TextNormalizer:
         # Step 3: Expand common business abbreviations before other processing
         # This helps standardize variations like "corp." vs "corporation"
         logger.debug("Step 3: Expanding common business abbreviations")
+
+        # Catch cuDF / Pandas mismatch
+        assert isinstance(normalized_series, cudf.Series), "Expected cuDF Series before regex replacements"
         
         abbreviation_replacement_count = 0
         abbreviation_keys = ['corp', 'inc', 'ltd', 'llc', 'co', 'assoc', 'mfg', 'intl', 'dist', 'svcs', 'mgmt', 'grp']
@@ -306,6 +309,9 @@ class TextNormalizer:
         # Step 4: Standardize separators and conjunctions
         # Handle various representations of "and" including symbols and abbreviations
         logger.debug("Step 4: Standardizing separators and conjunctions")
+
+        # Catch cuDF / Pandas mismatch
+        assert isinstance(normalized_series, cudf.Series), "Expected cuDF Series before regex replacements"
         
         separator_keys = ['ampersand', 'plus', 'n_word', 'forward_slash', 'backslash', 
                         'pipe', 'middle_dot', 'bullet', 'dashes']
@@ -320,6 +326,9 @@ class TextNormalizer:
         # Step 5: Remove noise - parenthetical content and special annotations
         # These often contain non-essential information like stock symbols, dates, or clarifications
         logger.debug("Step 5: Removing parenthetical content and annotations")
+
+        # Catch cuDF / Pandas mismatch
+        assert isinstance(normalized_series, cudf.Series), "Expected cuDF Series before regex replacements"
         
         # Remove parenthetical content using pre-compiled pattern
         before_parenthetical_removal = normalized_series.copy()
@@ -345,6 +354,9 @@ class TextNormalizer:
         # Step 6: Handle business name qualifiers (dba, fka, aka, etc.)
         # Extract the actual business name when these qualifiers are present
         logger.debug("Step 6: Processing business name qualifiers")
+
+        # Catch cuDF / Pandas mismatch
+        assert isinstance(normalized_series, cudf.Series), "Expected cuDF Series before regex replacements"
         
         # Use pre-compiled business qualifier pattern
         qualifier_pattern = self._compiled_patterns['business_qualifier'].pattern
@@ -355,6 +367,9 @@ class TextNormalizer:
         # Use extracted name where qualifier found, keep original otherwise
         normalized_series = extracted_business_names.fillna(normalized_series)
         logger.info(f"  - Processed business qualifiers in {qualifier_count:,} records")
+
+        # Catch cuDF / Pandas mismatch
+        assert isinstance(normalized_series, cudf.Series), "Expected cuDF Series before regex replacements"
 
         # Step 7: Apply custom word replacements from configuration
         if self.config.replacements:
@@ -384,6 +399,10 @@ class TextNormalizer:
                 logger.info(f"  - Total custom replacements applied: {total_replacements:,}")
 
         # Step 8: Remove legal and organizational suffixes
+
+        # Catch cuDF / Pandas mismatch
+        assert isinstance(normalized_series, cudf.Series), "Expected cuDF Series before regex replacements"
+
         # These are typically not useful for entity matching
         if self.config.suffixes_to_remove and 'suffix_removal' in self._compiled_patterns:
             logger.debug(f"Step 8: Removing {len(self.config.suffixes_to_remove)} legal/org suffixes")
@@ -398,6 +417,9 @@ class TextNormalizer:
 
         # Step 9: Handle common OCR and data entry errors
         logger.debug("Step 9: Correcting common OCR/data entry errors")
+
+        # Catch cuDF / Pandas mismatch
+        assert isinstance(normalized_series, cudf.Series), "Expected cuDF Series before regex replacements"
         
         # Fix common OCR substitutions using pre-compiled patterns
         ocr_keys = ['zero_in_word', 'one_in_word', 'five_in_word']
@@ -418,6 +440,9 @@ class TextNormalizer:
 
         # Step 10: Final cleanup and validation
         logger.debug("Step 10: Final cleanup and validation")
+
+        # Catch cuDF / Pandas mismatch
+        assert isinstance(normalized_series, cudf.Series), "Expected cuDF Series before regex replacements"
         
         # Remove possessives using pre-compiled patterns
         normalized_series = normalized_series.str.replace(
