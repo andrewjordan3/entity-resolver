@@ -93,17 +93,14 @@ def calculate_similarity_gpu(
     logger.debug(f"Starting row-wise similarity for two series of length {len(series_a)}.")
 
     # --- 1. Preprocessing and Cleaning ---
-    # A regular expression to find and remove zero-width characters and weird spaces.
-    ZERO_WIDTH_AND_ODD_SPACES_REGEX = r'[\u00A0\u1680\u180E\u2000-\u200D\u202F\u205F\u2060\u3000\uFEFF]+'
-
     def clean_series(series: cudf.Series) -> cudf.Series:
         """Applies a full cleaning pipeline to a string series."""
-        # Fill nulls, ensure string type, and strip leading/trailing whitespace.
-        s = series.fillna('').astype('str').str.strip()
-        # Apply Unicode normalization for consistency.
+        # Fill nulls and ensure string type before normalization.
+        s = series.fillna('').astype('str')
+        # Apply Unicode and compatibility normalization. The nfkc_normalize_series
+        # function handles a comprehensive cleaning pipeline including NFKC,
+        # symbol folding, and all whitespace normalization (collapsing and stripping)
         s = nfkc_normalize_series(s)
-        # Remove zero-width characters and normalize internal spacing to single spaces.
-        s = s.str.replace(ZERO_WIDTH_AND_ODD_SPACES_REGEX, '', regex=True).str.normalize_spaces()
         return s
 
     series_a_cleaned = clean_series(series_a)
@@ -131,7 +128,11 @@ def calculate_similarity_gpu(
     # If there are no valid rows to process, we can return the zeros series immediately.
     if not valid_rows_mask.any():
         logger.debug("No rows with sufficient string length for n-gram generation. Returning all zeros.")
-        _log_series_samples(series_a, series_b, min_n, "Sample at insufficient-length condition")
+        # Log the CLEANED series as well to diagnose normalization issues.
+        logger.debug("--- Logging Original Series for Context ---")
+        _log_series_samples(series_a, series_b, min_n, "Sample at insufficient-length condition (ORIGINAL)")
+        logger.debug("--- Logging Cleaned Series That Caused Failure ---")
+        _log_series_samples(series_a_cleaned, series_b_cleaned, min_n, "Sample at insufficient-length condition (CLEANED)")
         return result_series
 
     del series_a, series_b
