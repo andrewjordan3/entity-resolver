@@ -19,6 +19,44 @@ from .text import nfkc_normalize_series
 logger = logging.getLogger(__name__)
 
 
+def _log_series_samples(
+    series_a: cudf.Series,
+    series_b: cudf.Series,
+    min_n: int,
+    message: str
+) -> None:
+    """
+    A helper function to log descriptive statistics and samples from two series
+    for debugging purposes.
+
+    Args:
+        series_a: The first cuDF Series.
+        series_b: The second cuDF Series.
+        min_n: The minimum n-gram size used for filtering.
+        message: A descriptive message to include in the log header.
+    """
+    try:
+        sample_df = cudf.DataFrame({
+            'series_a_sample': series_a.head(5),
+            'series_a_len': series_a.head(5).str.len(),
+            'series_b_sample': series_b.head(5),
+            'series_b_len': series_b.head(5).str.len(),
+        })
+        logger.debug(
+            f"{message} (min_n={min_n}):\n"
+            f"{sample_df.to_pandas().to_string(index=True)}"
+        )
+        stats = {
+            "A_min_len": int(series_a.str.len().min()),
+            "A_max_len": int(series_a.str.len().max()),
+            "B_min_len": int(series_b.str.len().min()),
+            "B_max_len": int(series_b.str.len().max()),
+        }
+        logger.debug(f"Length statistics for logged series: {stats}")
+    except Exception as log_ex:
+        logger.debug(f"Failed to log series samples due to: {log_ex}")
+
+
 def calculate_similarity_gpu(
     series_a: cudf.Series,
     series_b: cudf.Series,
@@ -31,7 +69,7 @@ def calculate_similarity_gpu(
     This function vectorizes two series of strings using a shared TF-IDF
     vocabulary and then computes their pairwise cosine similarity. It preemptively
     filters out pairs where at least one string is too short for the specified
-    n-gram size, assigning them a similarity of 0.
+    n-gram size after cleaning, assigning them a similarity score of 0.0.
 
     Args:
         series_a: The first cuDF Series of strings.
@@ -41,187 +79,124 @@ def calculate_similarity_gpu(
                       character n-grams.
 
     Returns:
-        A cuDF Series of float values representing the cosine similarity
+        A cuDF Series of float32 values representing the cosine similarity
         for each corresponding row in the input series.
     """
-    logger.debug(f"Calculating row-wise similarity for two series of length {len(series_a)}.")
-    
-    # Ensure consistent data types and handle nulls before processing.
-    # 1) Base sanitation
-    series_a = series_a.fillna('').astype('str').str.strip()
-    series_b = series_b.fillna('').astype('str').str.strip()
+    if not series_a.index.equals(series_b.index):
+        raise ValueError("Input series 'series_a' and 'series_b' must have the same index.")
 
-    # 2) Unicode normalization (fold weird forms to standard ones)
-    series_a = nfkc_normalize_series(series_a)
-    series_b = nfkc_normalize_series(series_b)
+    logger.debug(f"Starting row-wise similarity for two series of length {len(series_a)}.")
 
-    # 3) Remove zero-widths & odd spaces, then collapse spaces
-    ZW_WEIRD = r'[\u00A0\u1680\u180E\u2000-\u200D\u202F\u205F\u2060\u3000\uFEFF]+'
-    series_a = series_a.str.replace(ZW_WEIRD, '', regex=True).str.normalize_spaces()
-    series_b = series_b.str.replace(ZW_WEIRD, '', regex=True).str.normalize_spaces()
+    # --- 1. Preprocessing and Cleaning ---
+    # A regular expression to find and remove zero-width characters and weird spaces.
+    ZERO_WIDTH_AND_ODD_SPACES_REGEX = r'[\u00A0\u1680\u180E\u2000-\u200D\u202F\u205F\u2060\u3000\uFEFF]+'
+
+    def clean_series(series: cudf.Series) -> cudf.Series:
+        """Applies a full cleaning pipeline to a string series."""
+        # Fill nulls, ensure string type, and strip leading/trailing whitespace.
+        s = series.fillna('').astype('str').str.strip()
+        # Apply Unicode normalization for consistency.
+        s = nfkc_normalize_series(s)
+        # Remove zero-width characters and normalize internal spacing to single spaces.
+        s = s.str.replace(ZERO_WIDTH_AND_ODD_SPACES_REGEX, '', regex=True).str.normalize_spaces()
+        return s
+
+    series_a_cleaned = clean_series(series_a)
+    series_b_cleaned = clean_series(series_b)
 
     # Initialize the final result series with a default similarity of 0.0.
-    # This ensures that any rows we skip will have a defined, logical similarity score.
+    # This ensures that any rows we filter out will have a defined score.
     result_series = cudf.Series(cupy.zeros(len(series_a)), index=series_a.index, dtype='float32')
 
-    # --- Robustness Check ---
+    # --- 2. Identify Rows Valid for N-gram Processing ---
     # Determine the minimum n-gram size from the TF-IDF parameters.
-    # This logic is only necessary if the analyzer is character-based.
+    # This is only necessary if the analyzer is character-based.
     min_n = 0
     if tfidf_params.get('analyzer') in ['char', 'char_wb']:
         min_n = min(tfidf_params.get('ngram_range', (1, 1)))
 
-    # Create a mask to identify rows where BOTH strings are long enough for n-gram generation.
-    # If not using character n-grams (min_n=0), all rows are considered valid initially.
+    # Create a single boolean mask to identify rows where BOTH strings are long enough.
+    # This check is performed AFTER all cleaning to be as accurate as possible.
     if min_n > 0:
-        valid_mask = (series_a.str.len() >= min_n) & (series_b.str.len() >= min_n)
+        valid_rows_mask = (series_a_cleaned.str.len() >= min_n) & (series_b_cleaned.str.len() >= min_n)
     else:
-        # If not using n-grams, all rows are valid from a length perspective.
-        valid_mask = cudf.Series(cupy.ones(len(series_a), dtype=bool), index=series_a.index)
+        # If not using character n-grams, all rows are considered valid from a length perspective.
+        valid_rows_mask = cudf.Series(cupy.ones(len(series_a), dtype=bool), index=series_a.index)
 
     # If there are no valid rows to process, we can return the zeros series immediately.
-    if not valid_mask.any():
+    if not valid_rows_mask.any():
         logger.debug("No rows with sufficient string length for n-gram generation. Returning all zeros.")
-        try:
-            a_sample = series_a.head(5)
-            b_sample = series_b.head(5)
-            sample_df = cudf.DataFrame({
-                'A': a_sample,
-                'A_len': a_sample.str.len(),
-                'B': b_sample,
-                'B_len': b_sample.str.len(),
-            })
-            logger.debug(f"Sample at insufficient-length condition (head 5), min_n={min_n}:\n"
-                         f"{sample_df.to_pandas().to_string(index=False)}")
-            a_len_min = int(series_a.str.len().min())
-            b_len_min = int(series_b.str.len().min())
-            a_len_max = int(series_a.str.len().max())
-            b_len_max = int(series_b.str.len().max())
-            logger.debug(f"Length stats — A[min={a_len_min}, max={a_len_max}], "
-                         f"B[min={b_len_min}, max={b_len_max}], tfidf_params={tfidf_params}")
-        except Exception as log_ex:
-            logger.debug(f"Failed to log insufficient-length samples due to: {log_ex}")
+        _log_series_samples(series_a, series_b, min_n, "Sample at insufficient-length condition")
         return result_series
 
-    # Filter the series to only the valid rows that we need to process.
-    series_a_valid = series_a[valid_mask]
-    series_b_valid = series_b[valid_mask]
-    
-    # It's possible the valid series are now empty or only contain empty strings.
-    # We should only proceed if there's actual text content to analyze.
-    if series_a_valid.empty and series_b_valid.empty:
-        logger.debug("After filtering, no valid data remains to be processed.")
-        return result_series
-    
-    # Apply additional filtering to handle edge cases
-    # Some strings might pass the length check but still cause issues in n-gram generation
-    # (e.g., strings that are all spaces or special characters)
-    if min_n > 0:
-        # Re-strip and check length after all preprocessing
-        series_a_valid = series_a_valid.str.strip()
-        series_b_valid = series_b_valid.str.strip()
-        
-        # Create a secondary mask for strings that are still valid after stripping
-        secondary_mask_a = series_a_valid.str.len() >= min_n
-        secondary_mask_b = series_b_valid.str.len() >= min_n
-        combined_secondary_mask = secondary_mask_a & secondary_mask_b
-        
-        if not combined_secondary_mask.any():
-            logger.debug("No strings remain valid after secondary filtering.")
-            return result_series
-        
-        # Apply secondary filtering
-        series_a_valid = series_a_valid[combined_secondary_mask]
-        series_b_valid = series_b_valid[combined_secondary_mask]
+    # Filter the series down to only the valid rows that need processing.
+    # The index from the original series is preserved in these filtered views.
+    series_a_to_process = series_a_cleaned[valid_rows_mask]
+    series_b_to_process = series_b_cleaned[valid_rows_mask]
 
-    logger.debug(f"Processing {len(series_a_valid)} valid rows.")
+    logger.debug(f"Found {len(series_a_to_process)} valid rows to process for similarity.")
 
-    # To ensure a fair comparison, the TF-IDF vectorizer must be fitted on the
-    # combined vocabulary of both series. This guarantees that the same words
-    # map to the same feature indices and have consistent IDF weights.
-    combined_series = cudf.concat(
-        [
-            series_a_valid.reset_index(drop=True),
-            series_b_valid.reset_index(drop=True),
-        ],
-        ignore_index=True,
-    ).dropna().astype('str')
-    
-    # The combined series could be empty if the inputs only contained empty strings.
-    if combined_series.empty:
-        logger.debug("Combined series for fitting TF-IDF is empty. Returning.")
-        return result_series
-
+    # --- 3. TF-IDF Vectorization and Similarity Calculation ---
     try:
+        # To ensure a fair comparison, the TF-IDF vectorizer must be fitted on the
+        # combined vocabulary of both series. This guarantees that the same features
+        # map to the same indices and have consistent IDF weights.
+        combined_series = cudf.concat(
+            [series_a_to_process, series_b_to_process],
+            ignore_index=True
+        ).dropna()
+
+        # It's possible the combined series is empty if inputs only contained empty strings
+        # or strings that were filtered out.
+        if combined_series.empty:
+            logger.debug("Combined series for TF-IDF fitting is empty. No similarities to calculate.")
+            return result_series
+
         vectorizer = TfidfVectorizer(**tfidf_params)
         vectorizer.fit(combined_series)
-        vocab_size = (len(vectorizer.vocabulary_)
-                    if hasattr(vectorizer, "vocabulary_") and vectorizer.vocabulary_ is not None
-                    else None)
-        logger.debug(
-            f"TF-IDF vectorizer fitted. "
-            f"{'Vocabulary size: ' + str(vocab_size) if vocab_size is not None else 'Vocabulary size unavailable'}."
-        )
+        logger.debug(f"TF-IDF vectorizer fitted. Vocabulary size: {len(getattr(vectorizer, 'vocabulary_', {}))}")
 
-        # The combined series is no longer needed after fitting the vectorizer.
+        # The combined series is no longer needed after fitting.
         del combined_series
 
         # Transform each valid series into a TF-IDF matrix with L2 normalization (the default).
-        vectors_a = vectorizer.transform(series_a_valid)
-        vectors_b = vectorizer.transform(series_b_valid)
+        vectors_a = vectorizer.transform(series_a_to_process)
+        vectors_b = vectorizer.transform(series_b_to_process)
 
         # A key property of L2-normalized vectors is that their cosine similarity
-        # is equivalent to their dot product. This is a highly efficient operation.
-        # We multiply element-wise and then sum across the feature dimension (axis=1).
+        # is equivalent to their dot product.
+        # The sum operation on a sparse matrix returns a column vector (shape [n, 1]),
+        # which is handled by `.flatten()` below before creating the final Series.
         similarities_valid = vectors_a.multiply(vectors_b).sum(axis=1)
 
-        # The large TF-IDF matrices are no longer needed.
-        del vectors_a
-        del vectors_b
-
-        # Create a cuDF Series from the calculated similarities, using the correct index.
+        # Create a cuDF Series from the calculated similarities.
+        # CRITICAL: Use the index from the filtered series (`series_a_to_process.index`)
+        # to ensure the results align correctly with their original positions.
         similarities_series = cudf.Series(
-            cupy.asarray(similarities_valid).flatten(), 
-            index=series_a_valid.index
+            cupy.asarray(similarities_valid).flatten(),
+            index=series_a_to_process.index
         )
 
-        # The intermediate similarities array is no longer needed.
-        del similarities_valid
-
-        # Place calculated similarities back at their original positions
-        # series_a_valid.index contains the indices after both filters were applied
-        result_series.loc[series_a_valid.index] = similarities_series
+        # Place the calculated similarities back into the full result series.
+        # Using the boolean mask with .loc for assignment is a clean and direct
+        # way to do this. It assigns values from `similarities_series` to the
+        # locations in `result_series` where the mask is True, automatically
+        # aligning by index to ensure correctness.
+        result_series.loc[valid_rows_mask] = similarities_series
 
     except RuntimeError as e:
-        logger.debug(f"RuntimeError in calculate_similarity_gpu: {e}")
-        logger.debug(f"tfidf_params: {tfidf_params} | min_n: {min_n}")
-        try:
-            a_sample = series_a_valid.head(5)
-            b_sample = series_b_valid.head(5)
-            sample_df = cudf.DataFrame({
-                'A': a_sample,
-                'A_len': a_sample.str.len(),
-                'B': b_sample,
-                'B_len': b_sample.str.len(),
-            })
-            logger.debug("Sample of valid rows at failure (head 5):\n"
-                         f"{sample_df.to_pandas().to_string(index=False)}")
-            if 'combined_series' in locals():
-                comb_sample = combined_series.head(10)
-                logger.debug(f"Combined series sample (head 10): {comb_sample.to_pandas().tolist()}")
-        except Exception as log_ex:
-            logger.debug(f"Failed to log samples due to: {log_ex}")
-
+        logger.error(f"A runtime error occurred in 'calculate_similarity_gpu' during TF-IDF processing: {e}", exc_info=True)
+        _log_series_samples(series_a_to_process, series_b_to_process, min_n, "Sample of valid rows at failure")
         if "Insufficient number of characters" in str(e):
-            logger.warning(f"N-gram generation failed despite checks. Returning zeros. Error: {e}")
-            return result_series
+            logger.warning(f"N-gram generation failed despite pre-checks. Returning calculated similarities so far.")
+            # The result_series will contain zeros for the rows that failed, which is the desired outcome.
         else:
+            # For other unexpected errors, re-raise the exception.
             raise
-
     finally:
-        # --- Memory Management ---
-        # This block ensures cleanup happens regardless of success or failure.
-        # It's the most important part for preventing memory leaks over many calls.
+        # --- 4. Memory Management ---
+        # This block ensures GPU memory cleanup happens regardless of success or failure,
+        # preventing memory leaks over many calls to this function.
         gc.collect()
         cupy.get_default_memory_pool().free_all_blocks()
         logger.debug("GPU memory cleanup complete.")
