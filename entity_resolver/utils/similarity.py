@@ -18,7 +18,6 @@ from .text import nfkc_normalize_series
 # Set up a logger for this module.
 logger = logging.getLogger(__name__)
 
-
 def _log_series_samples(
     series_a: cudf.Series,
     series_b: cudf.Series,
@@ -46,16 +45,22 @@ def _log_series_samples(
             f"{message} (min_n={min_n}):\n"
             f"{sample_df.to_pandas().to_string(index=True)}"
         )
+        a_len = series_a.str.len()
+        b_len = series_b.str.len()
         stats = {
-            "A_min_len": int(series_a.str.len().min()),
-            "A_max_len": int(series_a.str.len().max()),
-            "B_min_len": int(series_b.str.len().min()),
-            "B_max_len": int(series_b.str.len().max()),
+            "A_min_len": int(a_len.min()),
+            "A_max_len": int(a_len.max()),
+            "B_min_len": int(b_len.min()),
+            "B_max_len": int(b_len.max()),
         }
         logger.debug(f"Length statistics for logged series: {stats}")
     except Exception as log_ex:
         logger.debug(f"Failed to log series samples due to: {log_ex}")
-
+    finally:
+        # Proactively release small intermediates (harmless + hygienic)
+        if "sample_df" in locals(): del sample_df
+        if "a_len" in locals(): del a_len
+        if "b_len" in locals(): del b_len
 
 def calculate_similarity_gpu(
     series_a: cudf.Series,
@@ -129,10 +134,14 @@ def calculate_similarity_gpu(
         _log_series_samples(series_a, series_b, min_n, "Sample at insufficient-length condition")
         return result_series
 
+    del series_a, series_b
+
     # Filter the series down to only the valid rows that need processing.
     # The index from the original series is preserved in these filtered views.
     series_a_to_process = series_a_cleaned[valid_rows_mask]
     series_b_to_process = series_b_cleaned[valid_rows_mask]
+
+    del series_a_cleaned, series_b_cleaned
 
     logger.debug(f"Found {len(series_a_to_process)} valid rows to process for similarity.")
 
@@ -177,6 +186,8 @@ def calculate_similarity_gpu(
             index=series_a_to_process.index
         )
 
+        del similarities_valid, vectors_a, vectors_b
+
         # Place the calculated similarities back into the full result series.
         # Using the boolean mask with .loc for assignment is a clean and direct
         # way to do this. It assigns values from `similarities_series` to the
@@ -197,6 +208,7 @@ def calculate_similarity_gpu(
         # --- 4. Memory Management ---
         # This block ensures GPU memory cleanup happens regardless of success or failure,
         # preventing memory leaks over many calls to this function.
+        del series_a_to_process, series_b_to_process, valid_rows_mask
         gc.collect()
         cupy.get_default_memory_pool().free_all_blocks()
         logger.debug("GPU memory cleanup complete.")
