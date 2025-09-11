@@ -105,7 +105,7 @@ class ClusterMerger:
         
         # A final edge exists only if both the name and address are similar.
         # This is an inner merge, equivalent to a logical AND.
-        final_edges = addr_edges.merge(name_edges, on=['source', 'dest'])
+        final_edges = addr_edges.merge(name_edges, on=['source', 'destination'])
 
         if final_edges.empty:
             logger.info("No fuzzy cluster merges found based on similarity graph.")
@@ -116,7 +116,7 @@ class ClusterMerger:
         components = utils.find_graph_components(
             edge_list_df=final_edges, 
             source_column='source', 
-            destination_column='dest', 
+            destination_column='destination', 
             directed=False, 
             output_vertex_column='profile_idx', 
             output_component_column='component_id'
