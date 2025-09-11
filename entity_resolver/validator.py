@@ -44,12 +44,11 @@ class ClusterValidator:
             vectorizer_config: Configuration for vectorization, needed for similarity params.
         """
         self.config = validation_config
-        # The vectorizer config is needed for the similarity TF-IDF parameters.
         self.vectorizer_config = vectorizer_config
-
+        
         # Cache for similarity computations, cleared after each main run.
         self._similarity_cache = {}
-
+        
         # Define a consistent schema for empty results to prevent concat errors.
         self.EMPTY_ASSIGNMENT_SCHEMA = {
             'original_index': cudf.Series([], dtype='int64'),
@@ -57,12 +56,19 @@ class ClusterValidator:
             'avg_probability': cudf.Series([], dtype='float64'),
             'match_score': cudf.Series([], dtype='float64')
         }
-
+        
         # Memory management parameters
         self.max_pairs_per_chunk = min(
             self.config.profile_comparison_max_pairs_per_chunk,
             100000  # Hard limit to prevent OOM
         )
+        
+        # Tolerance parameters to make validation less aggressive
+        # These provide a buffer zone where entities can stay in their current cluster
+        self.validation_tolerance = 0.05  # 5% tolerance on similarity thresholds
+        self.min_improvement_threshold = 0.1  # Require 10% improvement to reassign
+        self.keep_original_if_close = True  # Keep original assignment if scores are close
+        self.soft_threshold_penalty = 0.2  # Penalty for being below threshold (not elimination)
 
     def validate_with_reassignment(self, gdf: cudf.DataFrame) -> cudf.DataFrame:
         """
@@ -212,18 +218,21 @@ class ClusterValidator:
         profiles: cudf.DataFrame
     ) -> cudf.DataFrame:
         """
-        Identifies entities that are noise or invalid in their current cluster.
-
+        Identifies entities that need reassignment.
+        
         An entity needs reassignment if:
         1. It's currently marked as noise (cluster == -1), or
-        2. It doesn't match well with its current cluster's profile.
+        2. It's significantly mismatched with its current cluster's profile.
+        
+        Uses tolerance zones and considers overall match quality
+        rather than hard cutoffs.
         """
         # First, handle noise entities - they always need reassignment.
         noise_entities = gdf[gdf['cluster'] == -1].copy()
-
+        
         # For clustered entities, check if they're valid in their current cluster.
         clustered_entities = gdf[gdf['cluster'] != -1].copy()
-
+        
         invalid_entities_list = []
         if not clustered_entities.empty:
             # Merge current cluster profile info onto each entity
@@ -232,47 +241,71 @@ class ClusterValidator:
                 on='cluster',
                 how='left'
             )
-
+            
             # Calculate similarity of each entity to its own cluster's profile
             name_sim = utils.calculate_similarity_gpu(
                 entities_with_profiles['normalized_text'],
                 entities_with_profiles['profile_canonical_name'],
                 self.vectorizer_config.similarity_tfidf
             )
-
+            
             addr_sim = utils.calculate_similarity_gpu(
                 entities_with_profiles['addr_normalized_key'],
                 entities_with_profiles['profile_canonical_addr_key'],
                 self.vectorizer_config.similarity_tfidf
             )
-
-            # An assignment is valid if it meets name, address, and state criteria
-            is_valid = (
-                (name_sim >= self.config.name_fuzz_ratio / 100.0) &
-                (addr_sim >= self.config.address_fuzz_ratio / 100.0)
+            
+            # Apply tolerance to thresholds - be more forgiving
+            # Instead of strict thresholds, use a softer validation with tolerance
+            name_threshold_with_tolerance = max(
+                0.0, 
+                (self.config.name_fuzz_ratio / 100.0) - self.validation_tolerance
             )
-
+            addr_threshold_with_tolerance = max(
+                0.0,
+                (self.config.address_fuzz_ratio / 100.0) - self.validation_tolerance
+            )
+            
+            # Calculate a composite match score for the current assignment
+            current_match_score = (name_sim * 0.6 + addr_sim * 0.4)
+            
+            # An entity is considered for reassignment only if:
+            # 1. Both similarities are below tolerant thresholds, OR
+            # 2. The composite score is very low (below 50% of expected)
+            is_potentially_invalid = (
+                ((name_sim < name_threshold_with_tolerance) & 
+                (addr_sim < addr_threshold_with_tolerance)) |
+                (current_match_score < 0.3)  # Very poor overall match
+            )
+            
+            # Additional state compatibility check if enforced
             if self.config.enforce_state_boundaries:
-                is_valid &= self._check_state_compatibility(
+                state_compatible = self._check_state_compatibility(
                     entities_with_profiles['addr_state'],
                     entities_with_profiles['profile_canonical_state']
                 )
-
-            # Get entities that are invalid in their current cluster
-            invalid_clustered = clustered_entities[~is_valid]
+                # Only mark as invalid if BOTH similarity is poor AND state is incompatible
+                is_potentially_invalid &= ~state_compatible
+            
+            # Store the current match score for later comparison
+            invalid_clustered = clustered_entities[is_potentially_invalid].copy()
             if not invalid_clustered.empty:
+                # Store current match scores to compare against potential new assignments
+                invalid_clustered['current_match_score'] = current_match_score[is_potentially_invalid]
                 invalid_entities_list.append(invalid_clustered)
-
+        
         # Combine noise and invalid entities into a single DataFrame
         all_to_reassign = []
         if not noise_entities.empty:
+            # Noise entities get a current_match_score of 0
+            noise_entities['current_match_score'] = 0.0
             all_to_reassign.append(noise_entities)
         if invalid_entities_list:
             all_to_reassign.extend(invalid_entities_list)
-
+        
         if not all_to_reassign:
             return cudf.DataFrame()
-
+        
         return cudf.concat(all_to_reassign)
 
     def _find_best_assignments(
@@ -498,83 +531,148 @@ class ClusterValidator:
         clusters: cudf.DataFrame
     ) -> cudf.DataFrame:
         """
-        Scores all entity-cluster pairs and selects the best match for each entity.
-
-        This is the core matching logic that evaluates similarity between
-        entities and cluster profiles, applying filters sequentially to reduce
-        the computational load.
+        Scores entity-cluster pairs with SOFT SCORING instead of hard filtering.
+        
+        1. Calculates all similarities first before filtering
+        2. Uses soft penalties instead of hard cutoffs
+        3. Considers partial matches as valid candidates
+        4. Only filters out truly incompatible matches
         """
         # Create all pairs using a cross-join
         entities_subset = entities[['original_index', 'normalized_text',
-                                    'addr_normalized_key', 'addr_state']].copy()
+                                    'addr_normalized_key', 'addr_state', 
+                                    'current_match_score']].copy()
         entities_subset['_join_key'] = 1
-
+        
         clusters_subset = clusters[['cluster', 'profile_canonical_name',
                                     'profile_canonical_addr_key', 'profile_canonical_state',
                                     'avg_probability', 'size']].copy()
         clusters_subset['_join_key'] = 1
-
-        # Perform cross-join. This is the memory-intensive step.
+        
+        # Perform cross-join
         pairs = entities_subset.merge(clusters_subset, on='_join_key', how='outer')
         pairs = pairs.drop(columns=['_join_key'])
-
+        
         if pairs.empty:
             return cudf.DataFrame(self.EMPTY_ASSIGNMENT_SCHEMA)
-
-        # --- Sequential Filtering for Efficiency ---
-        # 1. Calculate name similarity and filter
+        
+        # --- Calculate ALL similarities first (no filtering yet) ---
         pairs['name_sim'] = utils.calculate_similarity_gpu(
             pairs['normalized_text'],
             pairs['profile_canonical_name'],
             self.vectorizer_config.similarity_tfidf
         )
-        name_threshold = self.config.name_fuzz_ratio / 100.0
-        pairs = pairs[pairs['name_sim'] >= name_threshold]
-        if pairs.empty:
-            return cudf.DataFrame(self.EMPTY_ASSIGNMENT_SCHEMA)
-
-        # 2. Calculate address similarity only for remaining pairs and filter
+        
         pairs['addr_sim'] = utils.calculate_similarity_gpu(
             pairs['addr_normalized_key'],
             pairs['profile_canonical_addr_key'],
             self.vectorizer_config.similarity_tfidf
         )
-        addr_threshold = self.config.address_fuzz_ratio / 100.0
-        pairs = pairs[pairs['addr_sim'] >= addr_threshold]
-        if pairs.empty:
-            return cudf.DataFrame(self.EMPTY_ASSIGNMENT_SCHEMA)
-
-        # 3. Check state compatibility if needed and filter
+        
+        # --- Check state compatibility ---
         if self.config.enforce_state_boundaries:
-            state_compatible = self._check_state_compatibility(
+            pairs['state_compatible'] = self._check_state_compatibility(
                 pairs['addr_state'],
                 pairs['profile_canonical_state']
             )
-            pairs = pairs[state_compatible]
-        if pairs.empty:
-            return cudf.DataFrame(self.EMPTY_ASSIGNMENT_SCHEMA)
-
-        # --- Final Scoring ---
-        # Calculate final match scores for the valid candidate pairs
+        else:
+            pairs['state_compatible'] = True
+        
+        # --- SOFT SCORING with penalties instead of hard filters ---
+        name_threshold = self.config.name_fuzz_ratio / 100.0
+        addr_threshold = self.config.address_fuzz_ratio / 100.0
+        
+        # Calculate base similarity scores
+        base_name_score = pairs['name_sim']
+        base_addr_score = pairs['addr_sim']
+        
+        # Apply soft penalties for being below threshold (but don't eliminate)
+        # If below threshold, reduce score but don't zero it out
+        name_penalty = cudf.Series(
+            cupy.where(
+                pairs['name_sim'].values < name_threshold,
+                self.soft_threshold_penalty,  # Apply penalty
+                0.0  # No penalty if above threshold
+            ),
+            index=pairs.index
+        )
+        
+        addr_penalty = cudf.Series(
+            cupy.where(
+                pairs['addr_sim'].values < addr_threshold,
+                self.soft_threshold_penalty,  # Apply penalty
+                0.0  # No penalty if above threshold
+            ),
+            index=pairs.index
+        )
+        
+        # Adjusted scores with penalties
+        adjusted_name_score = (base_name_score - name_penalty).clip(lower=0.0)
+        adjusted_addr_score = (base_addr_score - addr_penalty).clip(lower=0.0)
+        
+        # State incompatibility is a stronger penalty but not elimination
+        state_penalty = cudf.Series(
+            cupy.where(
+                pairs['state_compatible'].values,
+                0.0,  # No penalty if compatible
+                0.3   # Significant penalty if incompatible
+            ),
+            index=pairs.index
+        )
+        
+        # --- Calculate final match scores ---
         weights = self.config.reassignment_scoring_weights
-
-        # Normalize cluster size with log scale to dampen the effect of huge clusters
+        
+        # Normalize cluster size with log scale
         size_values = pairs['size'].values
         size_factor = (cupy.log1p(size_values) / cupy.log1p(10.0)).clip(0.0, 1.0)
-
-        pairs['match_score'] = (
-            weights['name_similarity'] * pairs['name_sim'] +
-            weights['address_similarity'] * pairs['addr_sim'] +
+        
+        # Compute raw match score
+        raw_match_score = (
+            weights['name_similarity'] * adjusted_name_score +
+            weights['address_similarity'] * adjusted_addr_score +
             weights['cluster_size'] * cudf.Series(size_factor, index=pairs.index) +
             weights['cluster_probability'] * pairs['avg_probability']
         )
-
-        # Select the best match for each entity based on the highest score
+        
+        # Apply state penalty to final score
+        pairs['match_score'] = (raw_match_score - state_penalty).clip(lower=0.0)
+        
+        # --- Apply MINIMUM viable score filter ---
+        # Only filter out truly terrible matches (below 20% score)
+        minimum_viable_score = 0.2
+        pairs = pairs[pairs['match_score'] >= minimum_viable_score]
+        
+        if pairs.empty:
+            return cudf.DataFrame(self.EMPTY_ASSIGNMENT_SCHEMA)
+        
+        # --- Select best matches with improvement threshold ---
+        # Group by entity and find best match
         best_matches = (
             pairs.sort_values('match_score', ascending=False)
             .drop_duplicates(subset=['original_index'], keep='first')
         )
-
+        
+        # Only reassign if the new match is significantly better than current
+        # This prevents unnecessary reassignments for marginal improvements
+        if self.min_improvement_threshold > 0:
+            improvement = best_matches['match_score'] - best_matches['current_match_score']
+            
+            # For entities currently in noise (current_match_score == 0), 
+            # accept any reasonable match (score > 0.3)
+            is_noise = best_matches['current_match_score'] == 0.0
+            is_good_enough = best_matches['match_score'] > 0.3
+            
+            # For entities with existing clusters, require significant improvement
+            is_improvement = improvement >= self.min_improvement_threshold
+            
+            # Keep matches that are either:
+            # 1. Moving from noise to a reasonable cluster, OR
+            # 2. A significant improvement over current assignment
+            keep_mask = (is_noise & is_good_enough) | (~is_noise & is_improvement)
+            
+            best_matches = best_matches[keep_mask]
+        
         return best_matches[['original_index', 'cluster', 'avg_probability', 'match_score']]
 
     def _apply_final_assignments(
@@ -583,15 +681,21 @@ class ClusterValidator:
         best_assignments: cudf.DataFrame
     ) -> cudf.DataFrame:
         """
-        Merges the best assignments back into the main DataFrame.
-
-        Updates cluster assignments and probabilities based on the validation results.
+        Applies final assignments with PROTECTION against unnecessary noise assignment.
+        
+        Key improvement: Entities stay in their original cluster if no significantly
+        better match is found, rather than becoming noise.
         """
         if best_assignments.empty or 'original_index' not in best_assignments.columns:
             logger.info("No reassignments to apply.")
             return gdf
-
+        
         gdf['original_index'] = gdf.index
+        
+        # Track which entities were considered for reassignment
+        entities_considered = gdf[gdf['original_index'].isin(
+            best_assignments['original_index'].unique()
+        )]['original_index'].values
         
         # Merge new assignments back to the main dataframe
         gdf_with_new = gdf.merge(
@@ -601,69 +705,70 @@ class ClusterValidator:
             on='original_index',
             how='left'
         )
-
-        # Determine final cluster assignments
+        
+        # Determine which entities have new assignments
         has_new_assignment = gdf_with_new['new_cluster'].notna()
-
-        # --- Calculate statistics for logging before applying changes ---
-        # 1. Rescued: Was noise (cluster -1), now has a cluster.
+        
+        # --- Calculate statistics for logging ---
         rescued_mask = (gdf_with_new['cluster'] == -1) & has_new_assignment
-        # 2. Reassigned: Had a valid cluster, now has a different valid cluster.
         reassigned_mask = (
             (gdf_with_new['cluster'] != -1) &
             has_new_assignment &
             (gdf_with_new['cluster'] != gdf_with_new['new_cluster'])
         )
-        # 3. Evicted: Had a cluster, but was found to be invalid and no better home was found.
-        # This is implicitly handled by the logic; we calculate it here for logging.
-        # An entity identified for reassignment that does NOT have a new assignment.
-        initial_reassign_indices = gdf_with_new[gdf_with_new['original_index'].isin(
-            best_assignments['original_index'].unique()
-        )].index
-        evicted_mask = initial_reassign_indices.isin(gdf_with_new[~has_new_assignment].index)
-
-
+        
+        # Entities keep their original cluster if no better match was found
+        # This is the KEY CHANGE - we don't make them noise just because they're imperfect
+        was_considered_for_reassignment = gdf_with_new['original_index'].isin(entities_considered)
+        kept_original_mask = was_considered_for_reassignment & ~has_new_assignment & (gdf_with_new['cluster'] != -1)
+        
         # --- Apply new assignments ---
-        # Update cluster ID: use new cluster if available, otherwise keep old.
+        # Update cluster ID: use new cluster if available, otherwise keep old
         gdf_with_new['cluster'] = gdf_with_new['new_cluster'].fillna(gdf_with_new['cluster'])
         
         # Update probabilities for reassigned entities
-        # Use a weighted combination of match score and cluster average probability
-        # For reassigned entities, use the match score weighted by cluster probability
         reassigned_prob = (
             gdf_with_new['match_score'] *
             gdf_with_new['new_avg_prob']
         )
+        
         # Only update probabilities for rows that got a new assignment
         gdf_with_new['cluster_probability'] = gdf_with_new['cluster_probability'].mask(
             has_new_assignment, reassigned_prob
         )
         
-        # Entities that were invalid but found no new home are now noise
-        # This is handled implicitly if they were passed to reassignment and got no result.
-        # Let's make it explicit for clarity. An entity is noise if it was invalid and
-        # does not have a new assignment.
-        was_invalid_mask = gdf_with_new['original_index'].isin(best_assignments['original_index'].unique())
-        is_now_noise_mask = was_invalid_mask & (~has_new_assignment)
-        gdf_with_new.loc[is_now_noise_mask, 'cluster'] = -1
-        gdf_with_new.loc[is_now_noise_mask, 'cluster_probability'] = 0.0
-
+        # Only make entities noise if they were ALREADY noise and found no match
+        # Don't create new noise from previously clustered entities
+        was_noise = gdf['cluster'] == -1
+        still_no_match = ~has_new_assignment
+        remains_noise_mask = was_noise & still_no_match & was_considered_for_reassignment
+        
+        # These are the only entities that should be noise
+        gdf_with_new.loc[remains_noise_mask, 'cluster'] = -1
+        gdf_with_new.loc[remains_noise_mask, 'cluster_probability'] = 0.0
+        
+        # For entities that kept their original cluster despite being checked,
+        # slightly reduce their probability to reflect uncertainty
+        if self.keep_original_if_close:
+            gdf_with_new.loc[kept_original_mask, 'cluster_probability'] *= 0.9
+        
         # Log detailed statistics
         logger.info(
             "Validation complete: "
             f"{int(reassigned_mask.sum())} reassigned to different clusters, "
             f"{int(rescued_mask.sum())} rescued from noise, "
-            f"{int(evicted_mask.sum())} became noise after eviction."
+            f"{int(kept_original_mask.sum())} kept in original clusters, "
+            f"{int(remains_noise_mask.sum())} remain as noise."
         )
-
+        
         # Clean up temporary columns
         final_gdf = gdf_with_new.drop(columns=[
             'original_index', 'new_cluster', 'new_avg_prob', 'match_score'
         ]).astype({
-             'cluster': 'int32',
-             'cluster_probability': 'float32'
+            'cluster': 'int32',
+            'cluster_probability': 'float32'
         })
-
+        
         return final_gdf
 
     def _check_state_compatibility(

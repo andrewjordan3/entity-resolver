@@ -48,8 +48,8 @@ def calculate_similarity_gpu(
     
     # Ensure consistent data types and handle nulls before processing.
     # 1) Base sanitation
-    series_a = series_a.fillna('').astype(str).str.strip()
-    series_b = series_b.fillna('').astype(str).str.strip()
+    series_a = series_a.fillna('').astype('str').str.strip()
+    series_b = series_b.fillna('').astype('str').str.strip()
 
     # 2) Unicode normalization (fold weird forms to standard ones)
     series_a = nfkc_normalize_series(series_a)
@@ -82,6 +82,25 @@ def calculate_similarity_gpu(
     # If there are no valid rows to process, we can return the zeros series immediately.
     if not valid_mask.any():
         logger.debug("No rows with sufficient string length for n-gram generation. Returning all zeros.")
+        try:
+            a_sample = series_a.head(5)
+            b_sample = series_b.head(5)
+            sample_df = cudf.DataFrame({
+                'A': a_sample,
+                'A_len': a_sample.str.len(),
+                'B': b_sample,
+                'B_len': b_sample.str.len(),
+            })
+            logger.debug(f"Sample at insufficient-length condition (head 5), min_n={min_n}:\n"
+                         f"{sample_df.to_pandas().to_string(index=False)}")
+            a_len_min = int(series_a.str.len().min())
+            b_len_min = int(series_b.str.len().min())
+            a_len_max = int(series_a.str.len().max())
+            b_len_max = int(series_b.str.len().max())
+            logger.debug(f"Length stats — A[min={a_len_min}, max={a_len_max}], "
+                         f"B[min={b_len_min}, max={b_len_max}], tfidf_params={tfidf_params}")
+        except Exception as log_ex:
+            logger.debug(f"Failed to log insufficient-length samples due to: {log_ex}")
         return result_series
 
     # Filter the series to only the valid rows that we need to process.
@@ -99,7 +118,13 @@ def calculate_similarity_gpu(
     # To ensure a fair comparison, the TF-IDF vectorizer must be fitted on the
     # combined vocabulary of both series. This guarantees that the same words
     # map to the same feature indices and have consistent IDF weights.
-    combined_series = cudf.concat([series_a_valid, series_b_valid]).unique()
+    combined_series = cudf.concat(
+        [
+            series_a_valid.reset_index(drop=True),
+            series_b_valid.reset_index(drop=True),
+        ],
+        ignore_index=True,
+    ).dropna().astype('str')
 
     # It's possible for strings that are too short to make it through.
     # Filter combined series for minimum length
@@ -114,7 +139,13 @@ def calculate_similarity_gpu(
     try:
         vectorizer = TfidfVectorizer(**tfidf_params)
         vectorizer.fit(combined_series)
-        logger.debug(f"TF-IDF vectorizer fitted on a combined vocabulary of size {len(combined_series)}.")
+        vocab_size = (len(vectorizer.vocabulary_)
+                    if hasattr(vectorizer, "vocabulary_") and vectorizer.vocabulary_ is not None
+                    else None)
+        logger.debug(
+            f"TF-IDF vectorizer fitted. "
+            f"{'Vocabulary size: ' + str(vocab_size) if vocab_size is not None else 'Vocabulary size unavailable'}."
+        )
 
         # The combined series is no longer needed after fitting the vectorizer.
         del combined_series
@@ -142,9 +173,27 @@ def calculate_similarity_gpu(
         result_series.loc[valid_mask] = similarities_series
 
     except RuntimeError as e:
+        logger.debug(f"RuntimeError in calculate_similarity_gpu: {e}")
+        logger.debug(f"tfidf_params: {tfidf_params} | min_n: {min_n}")
+        try:
+            a_sample = series_a_valid.head(5)
+            b_sample = series_b_valid.head(5)
+            sample_df = cudf.DataFrame({
+                'A': a_sample,
+                'A_len': a_sample.str.len(),
+                'B': b_sample,
+                'B_len': b_sample.str.len(),
+            })
+            logger.debug("Sample of valid rows at failure (head 5):\n"
+                         f"{sample_df.to_pandas().to_string(index=False)}")
+            if 'combined_series' in locals():
+                comb_sample = combined_series.head(10)
+                logger.debug(f"Combined series sample (head 10): {comb_sample.to_pandas().tolist()}")
+        except Exception as log_ex:
+            logger.debug(f"Failed to log samples due to: {log_ex}")
+
         if "Insufficient number of characters" in str(e):
             logger.warning(f"N-gram generation failed despite checks. Returning zeros. Error: {e}")
-            # Return the zero-filled series
             return result_series
         else:
             raise

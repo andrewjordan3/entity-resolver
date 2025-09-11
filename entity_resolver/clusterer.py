@@ -1258,6 +1258,67 @@ class EntityClusterer:
         
         n_unique = len(unique_vectors)
         reduction_ratio = 1.0 - (n_unique / n_samples)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            # Float32 has ~7 decimal digits; avoid pretending we have more
+            decimal_places = max(0, min(int(-np.log10(epsilon)), 7))
+
+            # 1) Rounded uniqueness — reuse the rounded DataFrame we already built
+            # `vectors_df` = DataFrame of the *rounded* vectors; `column_names` are your f0..fN
+            n_unique_rounded = int(len(vectors_df.drop_duplicates(subset=column_names, keep="first")))
+            
+            # 2) Exact uniqueness — only build if problem size is reasonable
+            #    This can be memory-heavy (201k x 1312). Guard it.
+            n_unique_exact = None
+            try:
+                if n_samples * n_features <= 5_000_000:  # ~ heuristic to avoid huge frames
+                    df_exact = cudf.DataFrame(vectors, columns=column_names)
+                    n_unique_exact = int(len(df_exact.drop_duplicates(subset=column_names, keep="first")))
+                else:
+                    logger.debug(
+                        "Skipping exact-uniqueness count due to matrix size; "
+                        f"n_samples={n_samples:,}, n_features={n_features:,}."
+                    )
+            except Exception as diag_ex:
+                logger.debug(f"Exact-uniqueness diagnostic skipped due to: {diag_ex}")
+                n_unique_exact = None
+
+            # 3) Log concise comparison
+            if n_unique_exact is not None:
+                safe_den = max(n_unique_exact, 1)
+                extra_reduction = 1.0 - (n_unique_rounded / safe_den)
+                logger.debug(
+                    f"Uniqueness — exact: {n_unique_exact:,}, rounded(@{decimal_places}dp): {n_unique_rounded:,} "
+                    f"(additional reduction from rounding: {extra_reduction:.1%})"
+                )
+            else:
+                logger.debug(
+                    f"Uniqueness — rounded(@{decimal_places}dp): {n_unique_rounded:,} "
+                    "(exact count skipped)"
+                )
+
+            # 4) Show tiny diagnostic for merged groups after rounding
+            try:
+                if n_unique_exact is not None and n_unique_rounded < n_unique_exact:
+                    exact_hash = cudf.hash(df_exact[column_names])
+                    rounded_hash = cudf.hash(vectors_df[column_names])  # rounded already
+                    key_df = cudf.DataFrame({"rounded_key": rounded_hash, "exact_key": exact_hash})
+                    merged = key_df.groupby("rounded_key").agg({"exact_key": "nunique"})
+                    merged = merged.rename(columns={"exact_key": "merged_exact_rows"})
+                    merged = merged[merged["merged_exact_rows"] > 1].reset_index().head(5)
+                    if len(merged) > 0:
+                        logger.debug(
+                            "Rounded groups that merged multiple exact rows (up to 5 shown):\n"
+                            f"{merged.to_pandas().to_string(index=False)}"
+                        )
+            except Exception as diag_ex:
+                logger.debug(f"Dedup diagnostics (merge preview) skipped due to: {diag_ex}")
+            finally:
+                # Clean up heavy temporaries if we created them
+                try:
+                    del df_exact
+                except Exception:
+                    pass
         
         logger.info(
             f"Vector deduplication: {n_samples:,} → {n_unique:,} unique vectors "
