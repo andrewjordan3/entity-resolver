@@ -56,11 +56,6 @@ def _log_series_samples(
         logger.debug(f"Length statistics for logged series: {stats}")
     except Exception as log_ex:
         logger.debug(f"Failed to log series samples due to: {log_ex}")
-    finally:
-        # Proactively release small intermediates (harmless + hygienic)
-        if "sample_df" in locals(): del sample_df
-        if "a_len" in locals(): del a_len
-        if "b_len" in locals(): del b_len
 
 def calculate_similarity_gpu(
     series_a: cudf.Series,
@@ -135,8 +130,6 @@ def calculate_similarity_gpu(
         _log_series_samples(series_a_cleaned, series_b_cleaned, min_n, "Sample at insufficient-length condition (CLEANED)")
         return result_series
 
-    del series_a, series_b
-
     # Filter the series down to only the valid rows that need processing.
     # The index from the original series is preserved in these filtered views.
     series_a_to_process = series_a_cleaned[valid_rows_mask]
@@ -173,11 +166,20 @@ def calculate_similarity_gpu(
         vectors_a = vectorizer.transform(series_a_to_process)
         vectors_b = vectorizer.transform(series_b_to_process)
 
+        # The vectorizer is a large object and is no longer needed. Free it now.
+        del vectorizer
+
         # A key property of L2-normalized vectors is that their cosine similarity
         # is equivalent to their dot product.
         # The sum operation on a sparse matrix returns a column vector (shape [n, 1]),
         # which is handled by `.flatten()` below before creating the final Series.
         similarities_valid = vectors_a.multiply(vectors_b).sum(axis=1)
+
+        # The TF-IDF matrices are often the largest objects. Free them immediately
+        # after use to reduce peak memory pressure before the next allocation.
+        del vectors_a
+        del vectors_b
+        gc.collect()
 
         # Create a cuDF Series from the calculated similarities.
         # CRITICAL: Use the index from the filtered series (`series_a_to_process.index`)
@@ -187,7 +189,7 @@ def calculate_similarity_gpu(
             index=series_a_to_process.index
         )
 
-        del similarities_valid, vectors_a, vectors_b
+        del similarities_valid
 
         # Place the calculated similarities back into the full result series.
         # Using the boolean mask with .loc for assignment is a clean and direct
@@ -209,7 +211,6 @@ def calculate_similarity_gpu(
         # --- 4. Memory Management ---
         # This block ensures GPU memory cleanup happens regardless of success or failure,
         # preventing memory leaks over many calls to this function.
-        del series_a_to_process, series_b_to_process, valid_rows_mask
         gc.collect()
         cupy.get_default_memory_pool().free_all_blocks()
         logger.debug("GPU memory cleanup complete.")
