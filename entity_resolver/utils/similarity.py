@@ -112,6 +112,27 @@ def calculate_similarity_gpu(
     if series_a_valid.empty and series_b_valid.empty:
         logger.debug("After filtering, no valid data remains to be processed.")
         return result_series
+    
+    # Apply additional filtering to handle edge cases
+    # Some strings might pass the length check but still cause issues in n-gram generation
+    # (e.g., strings that are all spaces or special characters)
+    if min_n > 0:
+        # Re-strip and check length after all preprocessing
+        series_a_valid = series_a_valid.str.strip()
+        series_b_valid = series_b_valid.str.strip()
+        
+        # Create a secondary mask for strings that are still valid after stripping
+        secondary_mask_a = series_a_valid.str.len() >= min_n
+        secondary_mask_b = series_b_valid.str.len() >= min_n
+        combined_secondary_mask = secondary_mask_a & secondary_mask_b
+        
+        if not combined_secondary_mask.any():
+            logger.debug("No strings remain valid after secondary filtering.")
+            return result_series
+        
+        # Apply secondary filtering
+        series_a_valid = series_a_valid[combined_secondary_mask]
+        series_b_valid = series_b_valid[combined_secondary_mask]
 
     logger.debug(f"Processing {len(series_a_valid)} valid rows.")
 
@@ -125,11 +146,6 @@ def calculate_similarity_gpu(
         ],
         ignore_index=True,
     ).dropna().astype('str')
-
-    # It's possible for strings that are too short to make it through.
-    # Filter combined series for minimum length
-    if min_n > 0:
-        combined_series = combined_series[combined_series.str.len() >= min_n]
     
     # The combined series could be empty if the inputs only contained empty strings.
     if combined_series.empty:
@@ -164,13 +180,17 @@ def calculate_similarity_gpu(
         del vectors_b
 
         # Create a cuDF Series from the calculated similarities, using the correct index.
-        similarities_series = cudf.Series(cupy.asarray(similarities_valid).flatten(), index=series_a_valid.index)
+        similarities_series = cudf.Series(
+            cupy.asarray(similarities_valid).flatten(), 
+            index=series_a_valid.index
+        )
 
         # The intermediate similarities array is no longer needed.
         del similarities_valid
 
-        # Place the calculated similarities back into our full result series at the correct locations.
-        result_series.loc[valid_mask] = similarities_series
+        # Place calculated similarities back at their original positions
+        # series_a_valid.index contains the indices after both filters were applied
+        result_series.loc[series_a_valid.index] = similarities_series
 
     except RuntimeError as e:
         logger.debug(f"RuntimeError in calculate_similarity_gpu: {e}")
