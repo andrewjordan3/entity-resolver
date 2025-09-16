@@ -19,7 +19,7 @@ from typing import Dict, Any, Optional, List, Tuple
 
 # --- Local Package Imports ---
 from .config import ValidationConfig, VectorizerConfig
-from utils import gpu_memory_cleanup, get_canonical_name_gpu, get_best_address_gpu, calculate_similarity_gpu
+from .utils import gpu_memory_cleanup, get_canonical_name_gpu, get_best_address_gpu, calculate_similarity_gpu
 
 # Set up a logger for this module
 logger = logging.getLogger(__name__)
