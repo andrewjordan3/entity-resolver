@@ -136,6 +136,7 @@ def calculate_similarity_gpu(
     series_a_to_process = series_a_cleaned[valid_rows_mask]
     series_b_to_process = series_b_cleaned[valid_rows_mask]
 
+    # Clean series no longer needed after filtering
     del series_a_cleaned, series_b_cleaned
 
     logger.debug(f"Found {len(series_a_to_process)} valid rows to process for similarity.")
@@ -160,37 +161,68 @@ def calculate_similarity_gpu(
         vectorizer.fit(combined_series)
         logger.debug(f"TF-IDF vectorizer fitted. Vocabulary size: {len(getattr(vectorizer, 'vocabulary_', {}))}")
 
-        # The combined series is no longer needed after fitting.
+        # Combined series no longer needed after fitting
         del combined_series
 
         # Transform each valid series into a TF-IDF matrix with L2 normalization (the default).
         vectors_a = vectorizer.transform(series_a_to_process)
         vectors_b = vectorizer.transform(series_b_to_process)
 
-        # The vectorizer is a large object and is no longer needed. Free it now.
+        # Vectorizer is a large object, free it after transformation
         del vectorizer
+
+        # Ensure CUDA stream is synchronized before matrix operations
+        cupy.cuda.Stream.null.synchronize()
 
         # A key property of L2-normalized vectors is that their cosine similarity
         # is equivalent to their dot product.
         # The sum operation on a sparse matrix returns a column vector (shape [n, 1]),
         # which is handled by `.flatten()` below before creating the final Series.
-        similarities_valid = vectors_a.multiply(vectors_b).sum(axis=1)
+        similarities_sparse = vectors_a.multiply(vectors_b).sum(axis=1)
 
         # The TF-IDF matrices are often the largest objects. Free them immediately
         # after use to reduce peak memory pressure before the next allocation.
-        del vectors_a
-        del vectors_b
-        gc.collect()
+        del vectors_a, vectors_b
+
+        # Handle the sparse matrix to dense conversion more carefully
+        # Convert to dense array first, then handle any shape issues
+        if hasattr(similarities_sparse, 'todense'):
+            # It's a sparse matrix - convert to dense
+            similarities_dense = similarities_sparse.todense()
+            # Ensure it's a cupy array
+            similarities_array = cupy.asarray(similarities_dense)
+        elif hasattr(similarities_sparse, 'toarray'):
+            # Alternative sparse format
+            similarities_array = cupy.asarray(similarities_sparse.toarray())
+        else:
+            # Already dense or cupy array
+            similarities_array = cupy.asarray(similarities_sparse)
+        
+        # Ensure we have a 1D array, handling both (n,1) and (1,n) cases
+        if similarities_array.ndim > 1:
+            # Squeeze out any singleton dimensions
+            similarities_array = cupy.squeeze(similarities_array)
+        
+        # If still not 1D, flatten it
+        if similarities_array.ndim != 1:
+            similarities_array = similarities_array.flatten()
+            
+        # Ensure the array is contiguous in memory
+        similarities_array = cupy.ascontiguousarray(similarities_array, dtype='float32')
+        
+        # Verify array length matches expected
+        if len(similarities_array) != len(series_a_to_process):
+            logger.error(f"Shape mismatch: got {len(similarities_array)}, expected {len(series_a_to_process)}")
+            # Fall back to zeros for safety
+            return result_series
 
         # Create a cuDF Series from the calculated similarities.
         # CRITICAL: Use the index from the filtered series (`series_a_to_process.index`)
         # to ensure the results align correctly with their original positions.
         similarities_series = cudf.Series(
-            cupy.asarray(similarities_valid).flatten(),
+            similarities_array,
             index=series_a_to_process.index
         )
-
-        del similarities_valid
 
         # Place the calculated similarities back into the full result series.
         # Using the boolean mask with .loc for assignment is a clean and direct
