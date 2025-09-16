@@ -96,7 +96,7 @@ def _cleanup_gpu_memory(synchronize: bool, run_gc: bool, release_pools: bool):
     # Step 3: Release memory from the underlying memory pools.
     if release_pools:
         # Check if CuPy is configured to use the RMM allocator.
-        is_rmm_allocator_for_cupy = (cupy.cuda.get_allocator() is rmm.rmm_cupy_allocator)
+        is_rmm_allocator_for_cupy = (cupy.cuda.get_allocator() is rmm.cupy_allocator)
 
         # Always attempt to release the RMM pool, as it may be used by
         # libraries like cuDF even if CuPy is using its own pool.
