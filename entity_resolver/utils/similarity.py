@@ -14,6 +14,7 @@ from cuml.feature_extraction.text import TfidfVectorizer
 from cuml.neighbors import NearestNeighbors
 from .graph import create_edge_list
 from .text import nfkc_normalize_series
+from .clean_mem import gpu_memory_cleanup
 
 # Set up a logger for this module.
 logger = logging.getLogger(__name__)
@@ -207,16 +208,17 @@ def calculate_similarity_gpu(
         else:
             # For other unexpected errors, re-raise the exception.
             raise
-    finally:
-        # --- 4. Memory Management ---
-        # Perform a standard garbage collection. This is less aggressive and
-        # sufficient for cleanup within a frequently called function.
-        # The heavy-duty free_all_blocks() is moved to the calling loop.
-        gc.collect()
-        logger.debug("Internal garbage collection complete.")
+    # finally:
+    #     # --- 4. Memory Management ---
+    #     # Perform a standard garbage collection. This is less aggressive and
+    #     # sufficient for cleanup within a frequently called function.
+    #     # The heavy-duty free_all_blocks() is moved to the calling loop.
+    #     gc.collect()
+    #     logger.debug("Internal garbage collection complete.")
 
     return result_series
 
+@gpu_memory_cleanup
 def find_similar_pairs(
     string_series: cudf.Series,
     tfidf_params: Dict[str, Any],
@@ -273,10 +275,6 @@ def find_similar_pairs(
     # We are now done with the large distance and index arrays.
     del distances
     del indices
-
-    # Step 4: Force cleanup before returning.
-    gc.collect()
-    cupy.get_default_memory_pool().free_all_blocks()
 
     # Return only the source and destination columns, which correspond to the
     # integer indices of the items in the original `string_series`.
