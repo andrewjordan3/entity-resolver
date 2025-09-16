@@ -19,7 +19,7 @@ from typing import Dict, Any, Optional, List, Tuple
 
 # --- Local Package Imports ---
 from .config import ValidationConfig, VectorizerConfig
-from . import utils
+from utils import gpu_memory_cleanup, get_canonical_name_gpu, get_best_address_gpu, calculate_similarity_gpu
 
 # Set up a logger for this module
 logger = logging.getLogger(__name__)
@@ -156,13 +156,13 @@ class ClusterValidator:
                 continue
 
             # Get canonical name using TF-IDF similarity
-            c_name = utils.get_canonical_name_gpu(
+            c_name = get_canonical_name_gpu(
                 cluster_subset['normalized_text'],
                 self.vectorizer_config.similarity_tfidf
             )
 
             # Get best address representation
-            best_addr = utils.get_best_address_gpu(cluster_subset)
+            best_addr = get_best_address_gpu(cluster_subset)
 
             if not best_addr.empty:
                 canonical_info_list.append({
@@ -243,13 +243,13 @@ class ClusterValidator:
             )
             
             # Calculate similarity of each entity to its own cluster's profile
-            name_sim = utils.calculate_similarity_gpu(
+            name_sim = calculate_similarity_gpu(
                 entities_with_profiles['normalized_text'],
                 entities_with_profiles['profile_canonical_name'],
                 self.vectorizer_config.similarity_tfidf
             )
             
-            addr_sim = utils.calculate_similarity_gpu(
+            addr_sim = calculate_similarity_gpu(
                 entities_with_profiles['addr_normalized_key'],
                 entities_with_profiles['profile_canonical_addr_key'],
                 self.vectorizer_config.similarity_tfidf
@@ -354,6 +354,7 @@ class ClusterValidator:
         else:
             return cudf.DataFrame(self.EMPTY_ASSIGNMENT_SCHEMA)
 
+    @gpu_memory_cleanup
     def _process_reassignment_batch_efficient(
         self,
         batch: cudf.DataFrame,
@@ -557,13 +558,13 @@ class ClusterValidator:
             return cudf.DataFrame(self.EMPTY_ASSIGNMENT_SCHEMA)
         
         # --- Calculate ALL similarities first (no filtering yet) ---
-        pairs['name_sim'] = utils.calculate_similarity_gpu(
+        pairs['name_sim'] = calculate_similarity_gpu(
             pairs['normalized_text'],
             pairs['profile_canonical_name'],
             self.vectorizer_config.similarity_tfidf
         )
         
-        pairs['addr_sim'] = utils.calculate_similarity_gpu(
+        pairs['addr_sim'] = calculate_similarity_gpu(
             pairs['addr_normalized_key'],
             pairs['profile_canonical_addr_key'],
             self.vectorizer_config.similarity_tfidf

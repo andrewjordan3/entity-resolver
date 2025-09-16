@@ -78,6 +78,9 @@ from .matrix_ops import (
     prune_sparse_matrix
 )
 
+# GPU memory operations
+from .clean_mem import gpu_memory_cleanup
+
 # The public API of the 'utils' package.
 __all__ = [
     # text.py
@@ -120,5 +123,8 @@ __all__ = [
     'ensure_finite_matrix',
     'winsorize_matrix',
     'scale_by_frobenius_norm',
-    'prune_sparse_matrix'
+    'prune_sparse_matrix',
+
+    #clean_mem.py
+    'gpu_memory_cleanup'
 ]

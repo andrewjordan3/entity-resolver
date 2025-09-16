@@ -209,11 +209,11 @@ def calculate_similarity_gpu(
             raise
     finally:
         # --- 4. Memory Management ---
-        # This block ensures GPU memory cleanup happens regardless of success or failure,
-        # preventing memory leaks over many calls to this function.
+        # Perform a standard garbage collection. This is less aggressive and
+        # sufficient for cleanup within a frequently called function.
+        # The heavy-duty free_all_blocks() is moved to the calling loop.
         gc.collect()
-        cupy.get_default_memory_pool().free_all_blocks()
-        logger.debug("GPU memory cleanup complete.")
+        logger.debug("Internal garbage collection complete.")
 
     return result_series
 
