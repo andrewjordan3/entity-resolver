@@ -95,11 +95,9 @@ def _cleanup_gpu_memory(synchronize: bool, run_gc: bool, release_pools: bool):
 
     # Step 3: Release memory from the underlying memory pools.
     if release_pools:
-        # Check if CuPy is configured to use the RMM allocator.
-        is_rmm_allocator_for_cupy = (cupy.cuda.get_allocator() is rmm.cupy_allocator)
-
-        # Always attempt to release the RMM pool, as it may be used by
-        # libraries like cuDF even if CuPy is using its own pool.
+        # 3a) Attempt to release the RMM pool. This is safe even if RMM is not
+        # initialized, and it's necessary because libraries like cuDF might use
+        # RMM independently of CuPy.
         try:
             initial_mr = rmm.mr.get_current_device_resource()
             releasable_mr = _find_releasable_rmm_resource(initial_mr)
@@ -109,19 +107,17 @@ def _cleanup_gpu_memory(synchronize: bool, run_gc: bool, release_pools: bool):
         except Exception as e:
             logger.warning(f"Error during RMM pool release (non-critical): {e}")
 
-        # If CuPy is using its own separate allocator, we must clean it up too.
-        if not is_rmm_allocator_for_cupy:
-            logger.debug(
-                "CuPy is not using RMM allocator. Freeing CuPy pools independently."
-            )
-            try:
-                cupy.get_default_memory_pool().free_all_blocks()
-            except Exception as e:
-                logger.warning(f"Error freeing CuPy default pool (non-critical): {e}")
-            try:
-                cupy.get_default_pinned_memory_pool().free_all_blocks()
-            except Exception as e:
-                logger.warning(f"Error freeing CuPy pinned pool (non-critical): {e}")
+        # 3b) Independently free CuPy's pools. This is safe to do even if
+        # CuPy is using the RMM allocator, as the call will be a harmless
+        # redundant operation. If CuPy is using its own pools, this is critical.
+        try:
+            cupy.get_default_memory_pool().free_all_blocks()
+        except Exception as e:
+            logger.warning(f"Error freeing CuPy default pool (non-critical): {e}")
+        try:
+            cupy.get_default_pinned_memory_pool().free_all_blocks()
+        except Exception as e:
+            logger.warning(f"Error freeing CuPy pinned pool (non-critical): {e}")
 
 def _find_releasable_rmm_resource(mr):
     """
