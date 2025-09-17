@@ -172,7 +172,8 @@ def calculate_similarity_gpu(
         del vectorizer
 
         # Ensure CUDA stream is synchronized before matrix operations
-        cupy.cuda.Stream.null.synchronize()
+        # *** This might be redundent ***
+        #cupy.cuda.Stream.null.synchronize()
 
         # A key property of L2-normalized vectors is that their cosine similarity
         # is equivalent to their dot product.
@@ -219,6 +220,7 @@ def calculate_similarity_gpu(
         # Create a cuDF Series from the calculated similarities.
         # CRITICAL: Use the index from the filtered series (`series_a_to_process.index`)
         # to ensure the results align correctly with their original positions.
+        assert int(similarities_array.size) == int(series_a_to_process.size)
         similarities_series = cudf.Series(
             similarities_array,
             index=series_a_to_process.index

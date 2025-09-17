@@ -16,6 +16,12 @@ import cupy
 import logging
 import pandas as pd
 from typing import Dict, Any, Optional, List, Tuple
+from cudf.api.types import (
+    is_categorical_dtype,
+    is_string_dtype,
+    is_list_dtype,
+    is_struct_dtype,
+)
 
 # --- Local Package Imports ---
 from .config import ValidationConfig, VectorizerConfig
@@ -501,7 +507,8 @@ class ClusterValidator:
 
         if total_pairs <= self.max_pairs_per_chunk:
             # Can process all at once if below memory threshold
-            return self._score_and_select_matches(state_batch, candidate_clusters)
+            best_matches = self._score_and_select_matches(state_batch, candidate_clusters)
+            return self._own_gpu_df(best_matches)
         else:
             # Need to chunk the processing to avoid OOM errors
             # Ensure chunk_size is at least 1
@@ -522,7 +529,8 @@ class ClusterValidator:
                     chunk_results.append(chunk_matches)
 
             if chunk_results:
-                return cudf.concat(chunk_results, ignore_index=True)
+                best_matches = cudf.concat(chunk_results, ignore_index=True)
+                return self._own_gpu_df(best_matches)
             else:
                 return cudf.DataFrame(self.EMPTY_ASSIGNMENT_SCHEMA)
 
@@ -829,3 +837,112 @@ class ClusterValidator:
             states_match.loc[allowed_indices] = True
 
         return states_match
+
+    @staticmethod
+    def _own_gpu_df(
+        input_df: cudf.DataFrame,
+        *,
+        copy_index: bool = True,
+        prefer_numeric_astype: bool = True,
+    ) -> cudf.DataFrame:
+        """
+        Return a DataFrame whose buffers are *owned* by cuDF (no borrowed / zero-copy views).
+
+        Why this exists
+        ---------------
+        In GPU pipelines it’s common to construct cuDF objects from CuPy arrays or from
+        views of upstream columns. Those columns may be backed by memory pools (CuPy/RMM)
+        that can later be reclaimed. If a downstream cleanup frees a pool while a column
+        still references it, the next kernel can hit an illegal device access.
+
+        This helper defensively re-materializes each column into a fresh cuDF-owned buffer.
+        - Numeric dtypes use a fast device-side reallocation via `astype(..., copy=True)`.
+        - Strings / categoricals / nested (list/struct) get a `copy(deep=True)` to ensure
+          all child buffers (offsets, chars, categories, children) are duplicated.
+        - The index is optionally deep-copied to avoid aliasing there as well.
+
+        Parameters
+        ----------
+        input_df : cudf.DataFrame
+            The DataFrame to "own-ify".
+        copy_index : bool, default True
+            Whether to deep-copy the index. Set False if you explicitly manage index lifetime
+            elsewhere and want to avoid the extra allocation.
+        prefer_numeric_astype : bool, default True
+            For numeric columns, prefer `astype(same_dtype, copy=True)` (fast path). If you set
+            this False, numeric columns will use `copy(deep=True)` instead (slightly heavier).
+
+        Returns
+        -------
+        cudf.DataFrame
+            A DataFrame with the same schema and values, whose buffers are independent from
+            the inputs (safe against upstream pool releases).
+
+        Notes
+        -----
+        - This function keeps the **same dtypes** and **column order**.
+        - For categoricals, `copy(deep=True)` preserves both codes and category values.
+        - For nested types (list/struct), deep copy duplicates all child columns.
+        - This does not “defragment” VRAM; it only ensures ownership & non-aliasing.
+
+        Examples
+        --------
+        >>> owned = YourClass._own_gpu_df(df)
+        >>> # Now safe to release upstream pools / intermediates without dangling pointers.
+        """
+
+        # Fast exit for truly empty frames (no columns or no rows).
+        if input_df is None or len(input_df.columns) == 0 or len(input_df) == 0:
+            # Still consider index ownership for empty-but-indexed frames
+            if copy_index and input_df is not None and input_df.index is not None:
+                out = input_df.copy(deep=True)
+                # copy(deep=True) already owns the index; return as-is
+                return out
+            return input_df
+
+        owned_columns = {}
+
+        for col_name in input_df.columns:
+            src: cudf.Series = input_df[col_name]
+            dtype = src.dtype
+
+            # Heuristic: prefer the fastest safe path for numerics;
+            # use deep copies for types with child buffers or external tables.
+            is_numeric = getattr(getattr(dtype, "kind", None), "lower", lambda: None)() in ("i", "u", "f", "b")
+
+            try:
+                if is_numeric and prefer_numeric_astype:
+                    # For numerics, astype with copy=True forces a new device buffer
+                    # while preserving dtype and null mask semantics.
+                    owned = src.astype(dtype, copy=True)
+                elif is_string_dtype(dtype) or is_categorical_dtype(dtype) or is_list_dtype(dtype) or is_struct_dtype(dtype):
+                    # Strings: deep copy duplicates chars & offsets
+                    # Categoricals: deep copy preserves categories & codes
+                    # Lists/Structs: deep copy duplicates all child columns
+                    owned = src.copy(deep=True)
+                else:
+                    # Fallback: deep copy covers exotic / extension dtypes.
+                    owned = src.copy(deep=True)
+            except Exception:
+                # If any fast path fails due to dtype peculiarities, fall back to deep copy.
+                owned = src.copy(deep=True)
+
+            owned_columns[col_name] = owned
+
+        # Reassemble the DataFrame from owned columns (preserve order).
+        owned_df = cudf.DataFrame(owned_columns)
+
+        # Optionally deep-copy the index to detach from any shared buffers.
+        if copy_index:
+            try:
+                owned_df.index = input_df.index.copy(deep=True)
+            except Exception:
+                # If the index doesn’t support deep copy for some reason,
+                # force a materialization through a shallow copy of the frame,
+                # which typically re-allocates the index as well.
+                owned_df = owned_df.copy(deep=True)
+
+        # At this point, each column (and optionally the index) is backed by
+        # cuDF-owned buffers. We *avoid* another full-frame deep copy to keep
+        # performance sharp, since columns were already re-materialized above.
+        return owned_df
