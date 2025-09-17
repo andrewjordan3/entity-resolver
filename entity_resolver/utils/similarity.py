@@ -136,6 +136,9 @@ def calculate_similarity_gpu(
     series_a_to_process = series_a_cleaned[valid_rows_mask]
     series_b_to_process = series_b_cleaned[valid_rows_mask]
 
+    # Copy the index for similarities_series
+    series_a_to_process_index = series_a_to_process.index.copy(deep=True)
+
     # Clean series no longer needed after filtering
     del series_a_cleaned, series_b_cleaned
 
@@ -185,28 +188,11 @@ def calculate_similarity_gpu(
         # after use to reduce peak memory pressure before the next allocation.
         del vectors_a, vectors_b
 
-        # Handle the sparse matrix to dense conversion more carefully
-        # Convert to dense array first, then handle any shape issues
-        if hasattr(similarities_sparse, 'todense'):
-            # It's a sparse matrix - convert to dense
-            similarities_dense = similarities_sparse.todense()
-            # Ensure it's a cupy array
-            similarities_array = cupy.asarray(similarities_dense)
-        elif hasattr(similarities_sparse, 'toarray'):
-            # Alternative sparse format
-            similarities_array = cupy.asarray(similarities_sparse.toarray())
-        else:
-            # Already dense or cupy array
-            similarities_array = cupy.asarray(similarities_sparse)
-        
-        # Ensure we have a 1D array, handling both (n,1) and (1,n) cases
-        if similarities_array.ndim > 1:
-            # Squeeze out any singleton dimensions
-            similarities_array = cupy.squeeze(similarities_array)
-        
-        # If still not 1D, flatten it
-        if similarities_array.ndim != 1:
-            similarities_array = similarities_array.flatten()
+        # Safe conversion following CuPy's official guidance
+        # CSR sparse matrix -> dense CuPy array -> cuDF Series
+        # ALWAYS use .toarray() for CSR to dense conversion
+        similarities_array = similarities_sparse.toarray()  # Returns proper ndarray
+        similarities_array = similarities_array.ravel()  # Flatten from (n,1) to (n,)
             
         # Ensure the array is contiguous in memory
         similarities_array = cupy.ascontiguousarray(similarities_array, dtype='float32')
@@ -220,11 +206,16 @@ def calculate_similarity_gpu(
         # Create a cuDF Series from the calculated similarities.
         # CRITICAL: Use the index from the filtered series (`series_a_to_process.index`)
         # to ensure the results align correctly with their original positions.
-        assert int(similarities_array.size) == int(series_a_to_process.size)
         similarities_series = cudf.Series(
             similarities_array,
-            index=series_a_to_process.index
+            index=series_a_to_process_index
         )
+
+        # CRITICAL: Force cuDF to own its own device buffer (no borrowed CuPy memory)
+        similarities_series = similarities_series.astype("float32", copy=True)
+
+        # We no longer need the CuPy buffer; release it to its pool
+        del similarities_array
 
         # Place the calculated similarities back into the full result series.
         # Using the boolean mask with .loc for assignment is a clean and direct
@@ -242,13 +233,6 @@ def calculate_similarity_gpu(
         else:
             # For other unexpected errors, re-raise the exception.
             raise
-    # finally:
-    #     # --- 4. Memory Management ---
-    #     # Perform a standard garbage collection. This is less aggressive and
-    #     # sufficient for cleanup within a frequently called function.
-    #     # The heavy-duty free_all_blocks() is moved to the calling loop.
-    #     gc.collect()
-    #     logger.debug("Internal garbage collection complete.")
 
     return result_series
 

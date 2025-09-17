@@ -85,9 +85,11 @@ def _cleanup_gpu_memory(synchronize: bool, run_gc: bool, release_pools: bool):
     # Step 1: Synchronize CUDA operations to wait for pending kernels.
     if synchronize:
         try:
-            cupy.cuda.Stream.null.synchronize()
+            #cupy.cuda.Stream.null.synchronize()
+            cupy.cuda.runtime.deviceSynchronize()   # More thorough sync
         except Exception as e:
-            logger.warning(f"Error during CUDA stream sync (non-critical): {e}")
+            logger.warning(f"Error during CUDA stream sync: {e}")
+            raise
 
     # Step 2: Run garbage collection to free Python-level object references.
     if run_gc:
