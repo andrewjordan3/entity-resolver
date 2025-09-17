@@ -190,8 +190,18 @@ def calculate_similarity_gpu(
 
         # Safe conversion following CuPy's official guidance
         # CSR sparse matrix -> dense CuPy array -> cuDF Series
-        # ALWAYS use .toarray() for CSR to dense conversion
-        similarities_array = similarities_sparse.toarray()  # Returns proper ndarray
+        # Check if it's already dense or still sparse
+        if hasattr(similarities_sparse, 'toarray'):
+            # It's sparse - convert to dense
+            similarities_array = similarities_sparse.toarray()
+        elif isinstance(similarities_sparse, cupy.ndarray):
+            # Already a dense CuPy array
+            similarities_array = similarities_sparse
+        else:
+            # Fallback - try to convert to CuPy array
+            similarities_array = cupy.asarray(similarities_sparse)
+
+        # Now continue with flattening
         similarities_array = similarities_array.ravel()  # Flatten from (n,1) to (n,)
             
         # Ensure the array is contiguous in memory
