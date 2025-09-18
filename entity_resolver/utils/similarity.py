@@ -136,15 +136,20 @@ def calculate_similarity_gpu(
     series_a_to_process = series_a_cleaned[valid_rows_mask]
     series_b_to_process = series_b_cleaned[valid_rows_mask]
 
-    # Copy the index for similarities_series
+    # Copy the index for similarities_series - this ensures we have a clean copy
+    # that won't be affected by any memory operations on the original series
     series_a_to_process_index = series_a_to_process.index.copy(deep=True)
-
-    # Clean series no longer needed after filtering
-    del series_a_cleaned, series_b_cleaned
 
     logger.debug(f"Found {len(series_a_to_process)} valid rows to process for similarity.")
 
     # --- 3. TF-IDF Vectorization and Similarity Calculation ---
+    # Initialize variables to None for cleanup tracking
+    combined_series = None
+    vectorizer = None
+    vectors_a = None
+    vectors_b = None
+    similarities_array = None
+    
     try:
         # To ensure a fair comparison, the TF-IDF vectorizer must be fitted on the
         # combined vocabulary of both series. This guarantees that the same features
@@ -164,68 +169,54 @@ def calculate_similarity_gpu(
         vectorizer.fit(combined_series)
         logger.debug(f"TF-IDF vectorizer fitted. Vocabulary size: {len(getattr(vectorizer, 'vocabulary_', {}))}")
 
-        # Combined series no longer needed after fitting
-        del combined_series
-
         # Transform each valid series into a TF-IDF matrix with L2 normalization (the default).
         vectors_a = vectorizer.transform(series_a_to_process)
         vectors_b = vectorizer.transform(series_b_to_process)
 
-        # Vectorizer is a large object, free it after transformation
-        del vectorizer
-
-        # Ensure CUDA stream is synchronized before matrix operations
-        # *** This might be redundent ***
-        #cupy.cuda.Stream.null.synchronize()
-
         # A key property of L2-normalized vectors is that their cosine similarity
         # is equivalent to their dot product.
-        # The sum operation on a sparse matrix returns a column vector (shape [n, 1]),
-        # which is handled by `.flatten()` below before creating the final Series.
-        similarities_sparse = vectors_a.multiply(vectors_b).sum(axis=1)
+        # The sum operation on a sparse matrix returns a dense ndarray of shape (n, 1)
+        similarities_array = vectors_a.multiply(vectors_b).sum(axis=1, dtype='float32')
 
-        # The TF-IDF matrices are often the largest objects. Free them immediately
-        # after use to reduce peak memory pressure before the next allocation.
-        del vectors_a, vectors_b
+        # Debug synchronization check to catch CUDA errors immediately after the
+        # critical sparse matrix operations. This helps identify if the corruption
+        # happens during the multiply/sum operations.
+        if logger.isEnabledFor(logging.DEBUG):
+            try:
+                cupy.cuda.Stream.null.synchronize()
+                logger.debug(f"CUDA sync successful after multiply/sum for {len(series_a_to_process)} rows")
+            except cupy.cuda.runtime.CUDARuntimeError as e:
+                logger.error(f"CUDA corruption detected immediately after multiply/sum operation!")
+                logger.error(f"Error details: {e}")
+                logger.error(f"Batch size: {len(series_a_to_process)}, Vocabulary size: {len(getattr(vectorizer, 'vocabulary_', {}))}")
+                _log_series_samples(series_a_to_process, series_b_to_process, min_n, 
+                                  "Data that triggered CUDA corruption during multiply/sum")
+                raise
 
-        # Safe conversion following CuPy's official guidance
-        # CSR sparse matrix -> dense CuPy array -> cuDF Series
-        # Check if it's already dense or still sparse
-        if hasattr(similarities_sparse, 'toarray'):
-            # It's sparse - convert to dense
-            similarities_array = similarities_sparse.toarray()
-        elif isinstance(similarities_sparse, cupy.ndarray):
-            # Already a dense CuPy array
-            similarities_array = similarities_sparse
-        else:
-            # Fallback - try to convert to CuPy array
-            similarities_array = cupy.asarray(similarities_sparse)
-
-        # Now continue with flattening
-        similarities_array = similarities_array.ravel()  # Flatten from (n,1) to (n,)
+        # Now continue with flattening - ravel() converts (n,1) to (n)
+        similarities_array = similarities_array.ravel()
             
-        # Ensure the array is contiguous in memory
+        # Ensure the array is contiguous in memory for efficient access
         similarities_array = cupy.ascontiguousarray(similarities_array, dtype='float32')
         
-        # Verify array length matches expected
+        # Verify array length matches expected number of rows
         if len(similarities_array) != len(series_a_to_process):
             logger.error(f"Shape mismatch: got {len(similarities_array)}, expected {len(series_a_to_process)}")
             # Fall back to zeros for safety
             return result_series
 
         # Create a cuDF Series from the calculated similarities.
-        # CRITICAL: Use the index from the filtered series (`series_a_to_process.index`)
-        # to ensure the results align correctly with their original positions.
+        # CRITICAL: Use the copied index to ensure the results align correctly 
+        # with their original positions.
         similarities_series = cudf.Series(
             similarities_array,
             index=series_a_to_process_index
         )
 
-        # CRITICAL: Force cuDF to own its own device buffer (no borrowed CuPy memory)
+        # CRITICAL: Force cuDF to own its own device buffer instead of borrowing
+        # from CuPy's memory pool. This prevents potential use-after-free issues
+        # when CuPy's memory pool is cleared.
         similarities_series = similarities_series.astype("float32", copy=True)
-
-        # We no longer need the CuPy buffer; release it to its pool
-        del similarities_array
 
         # Place the calculated similarities back into the full result series.
         # Using the boolean mask with .loc for assignment is a clean and direct
@@ -243,6 +234,35 @@ def calculate_similarity_gpu(
         else:
             # For other unexpected errors, re-raise the exception.
             raise
+    
+    finally:
+        # --- 4. Memory Cleanup ---
+        # Clean up all intermediate objects in reverse order of creation.
+        # This ensures dependencies are freed in the correct order and helps
+        # prevent memory fragmentation. The 'del' statements remove Python
+        # references, allowing the GPU memory manager to reclaim the memory.
+        
+        # Clean up the similarity calculation intermediates
+        if similarities_array is not None:
+            del similarities_array
+        
+        # Clean up the TF-IDF vectors
+        if vectors_b is not None:
+            del vectors_b
+        if vectors_a is not None:
+            del vectors_a
+        
+        # Clean up the vectorizer (can be large with big vocabularies)
+        if vectorizer is not None:
+            del vectorizer
+        
+        # Clean up the combined series used for fitting
+        if combined_series is not None:
+            del combined_series
+        
+        # Clean up the cleaned series that are no longer needed
+        del series_b_cleaned
+        del series_a_cleaned
 
     return result_series
 
