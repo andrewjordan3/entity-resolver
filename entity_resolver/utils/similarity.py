@@ -14,7 +14,7 @@ from cuml.neighbors import NearestNeighbors
 from .graph import create_edge_list
 from .text import nfkc_normalize_series
 from .clean_mem import gpu_memory_cleanup
-from .matrix_ops import ensure_finite_matrix 
+from .matrix_ops import ensure_finite_matrix, prune_sparse_matrix, scale_by_frobenius_norm
 from .vector import normalize_rows
 
 # Set up a logger for this module.
@@ -174,20 +174,27 @@ def calculate_similarity_gpu(
         vectors_a = vectorizer.transform(series_a_to_process)
         vectors_b = vectorizer.transform(series_b_to_process)
 
+        # Attempting this to try and stop an illegal memory access error
+        # Make sure structure is canonical: no dup (i,j), sorted column indices
+        # (CuPy sparse exposes these; they’re cheap and may prevent kernel issues)
+        vectors_a.sum_duplicates() 
+        vectors_b.sum_duplicates() 
+        
         # Replace any NaN/Inf in .data and drop explicit zeros (keeps structure valid)
         vectors_a = ensure_finite_matrix(vectors_a, replace_non_finite=True, copy=False)
         vectors_b = ensure_finite_matrix(vectors_b, replace_non_finite=True, copy=False)
 
-        # Attempting this to try and stop an illegal memory access error
-        # Make sure structure is canonical: no dup (i,j), sorted column indices
-        # (CuPy sparse exposes these; they’re cheap and may prevent kernel issues)
-        vectors_a.sum_duplicates(); vectors_a.sort_indices()
-        vectors_b.sum_duplicates(); vectors_b.sort_indices()
+        vectors_a = prune_sparse_matrix(vectors_a, copy=False)
+        vectors_a = scale_by_frobenius_norm(vectors_a, copy=False)
+        vectors_b = prune_sparse_matrix(vectors_b, copy=False)
+        vectors_b = scale_by_frobenius_norm(vectors_b, copy=False)
 
         # 2) Row-wise L2 normalization (idempotent for TF-IDF if already normalized)
         # Guards against malformed rows and guarantees cosine==dot.
         vectors_a = normalize_rows(vectors_a, copy=False) 
         vectors_b = normalize_rows(vectors_b, copy=False)
+        vectors_a.sort_indices()
+        vectors_b.sort_indices()
 
         assert vectors_a.shape == vectors_b.shape, "\n*** Vector shapes don't match ***\n"
 
