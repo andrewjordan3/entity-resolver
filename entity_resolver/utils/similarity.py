@@ -5,7 +5,6 @@ similarity and finding similar pairs within a dataset using TF-IDF and
 Nearest Neighbors.
 """
 
-import gc
 import cudf
 import cupy
 import logging
@@ -15,6 +14,8 @@ from cuml.neighbors import NearestNeighbors
 from .graph import create_edge_list
 from .text import nfkc_normalize_series
 from .clean_mem import gpu_memory_cleanup
+from .matrix_ops import ensure_finite_matrix 
+from .vector import normalize_rows
 
 # Set up a logger for this module.
 logger = logging.getLogger(__name__)
@@ -173,14 +174,27 @@ def calculate_similarity_gpu(
         vectors_a = vectorizer.transform(series_a_to_process)
         vectors_b = vectorizer.transform(series_b_to_process)
 
+        # Replace any NaN/Inf in .data and drop explicit zeros (keeps structure valid)
+        vectors_a = ensure_finite_matrix(vectors_a, replace_non_finite=True, copy=False)
+        vectors_b = ensure_finite_matrix(vectors_b, replace_non_finite=True, copy=False)
+
         # Attempting this to try and stop an illegal memory access error
+        # Make sure structure is canonical: no dup (i,j), sorted column indices
+        # (CuPy sparse exposes these; they’re cheap and may prevent kernel issues)
         vectors_a.sum_duplicates(); vectors_a.sort_indices()
         vectors_b.sum_duplicates(); vectors_b.sort_indices()
+
+        # 2) Row-wise L2 normalization (idempotent for TF-IDF if already normalized)
+        # Guards against malformed rows and guarantees cosine==dot.
+        vectors_a = normalize_rows(vectors_a, copy=False) 
+        vectors_b = normalize_rows(vectors_b, copy=False)
+
+        assert vectors_a.shape == vectors_b.shape, "\n*** Vector shapes don't match ***\n"
 
         # A key property of L2-normalized vectors is that their cosine similarity
         # is equivalent to their dot product.
         # The sum operation on a sparse matrix returns a dense ndarray of shape (n, 1)
-        similarities_array = vectors_a.multiply(vectors_b).sum(axis=1, dtype='float32')
+        similarities_array = vectors_a.multiply(vectors_b).sum(axis=1, dtype=cupy.float32)
 
         # Debug synchronization check to catch CUDA errors immediately after the
         # critical sparse matrix operations. This helps identify if the corruption
