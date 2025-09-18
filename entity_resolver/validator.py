@@ -509,6 +509,12 @@ class ClusterValidator:
             return cudf.DataFrame(self.EMPTY_ASSIGNMENT_SCHEMA)
 
         if total_pairs <= self.max_pairs_per_chunk:
+            # Test sync illegal memory issue
+            if logger.isEnabledFor(logging.DEBUG):
+                try:
+                    cupy.cuda.Stream.null.synchronize()
+                except:
+                    logger.debug(f"*** CUDA sync failed inside _find_matches_for_state_group single chunk branch ***")
             # Can process all at once if below memory threshold
             best_matches = self._score_and_select_matches(state_batch, candidate_clusters)
             return self._own_gpu_df(best_matches)
@@ -520,6 +526,12 @@ class ClusterValidator:
 
             chunk_results = []
             for chunk_start in range(0, n_entities, chunk_size):
+                if logger.isEnabledFor(logging.DEBUG):
+                    try:
+                        cupy.cuda.Stream.null.synchronize()
+                    except:
+                        logger.debug(f"*** CUDA sync failed inside _find_matches_for_state_group multi chunk branch ***")
+                        logger.debug(f"*** Failed on chunk starting at {chunk_start} ***")
                 chunk_end = min(chunk_start + chunk_size, n_entities)
                 entity_chunk = state_batch.iloc[chunk_start:chunk_end]
 

@@ -173,6 +173,10 @@ def calculate_similarity_gpu(
         vectors_a = vectorizer.transform(series_a_to_process)
         vectors_b = vectorizer.transform(series_b_to_process)
 
+        # Attempting this to try and stop an illegal memory access error
+        vectors_a.sum_duplicates(); vectors_a.sort_indices()
+        vectors_b.sum_duplicates(); vectors_b.sort_indices()
+
         # A key property of L2-normalized vectors is that their cosine similarity
         # is equivalent to their dot product.
         # The sum operation on a sparse matrix returns a dense ndarray of shape (n, 1)
