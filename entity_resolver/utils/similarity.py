@@ -174,34 +174,60 @@ def calculate_similarity_gpu(
         vectors_a = vectorizer.transform(series_a_to_process)
         vectors_b = vectorizer.transform(series_b_to_process)
 
-        # Attempting this to try and stop an illegal memory access error
-        # Make sure structure is canonical: no dup (i,j), sorted column indices
-        # (CuPy sparse exposes these; they’re cheap and may prevent kernel issues)
-        vectors_a.sum_duplicates() 
-        vectors_b.sum_duplicates() 
+        # 1. Identify active rows: A row is active if it's non-zero in BOTH vectors.
+        #    The cosine similarity for any other row is implicitly zero.
+        row_norms_a = cupy.sparse.linalg.norm(vectors_a, axis=1)
+        row_norms_b = cupy.sparse.linalg.norm(vectors_b, axis=1)
+        active_rows_mask = (row_norms_a > 0) & (row_norms_b > 0)
+
+        if not cupy.any(active_rows_mask):
+            logger.debug("No rows with overlapping non-empty vectors after transform. Returning all zeros.")
+            return result_series
+
+        # 2. Get the original index for active rows to map results back later.
+        active_rows_cudf_mask = cudf.Series(active_rows_mask, index=series_a_to_process.index)
+        active_index = series_a_to_process.index[active_rows_cudf_mask]
+
+        # 3. Filter matrices to only active rows.
+        vectors_a_proc = vectors_a[active_rows_mask, :]
+        vectors_b_proc = vectors_b[active_rows_mask, :]
+
+        # 4. Identify active columns: A column is active if non-zero in EITHER filtered matrix.
+        #    This prevents shape mismatches by ensuring both matrices share the same feature set.
+        col_nnz_a = vectors_a_proc.getnnz(axis=0)
+        col_nnz_b = vectors_b_proc.getnnz(axis=0)
+        active_cols_mask = (col_nnz_a > 0) | (col_nnz_b > 0)
+
+        # 5. Filter both matrices by the common active column mask.
+        vectors_a_proc = vectors_a_proc[:, active_cols_mask]
+        vectors_b_proc = vectors_b_proc[:, active_cols_mask]
+
+        # 6. Apply pre-processing to the synchronized matrices. These steps are intended
+        #    to prevent CUDA errors on a clean, consistent dataset.
+        vectors_a_proc.sum_duplicates()
+        vectors_b_proc.sum_duplicates()
+        vectors_a_proc = ensure_finite_matrix(vectors_a_proc, replace_non_finite=True, copy=False)
+        vectors_b_proc = ensure_finite_matrix(vectors_b_proc, replace_non_finite=True, copy=False)
         
-        # Replace any NaN/Inf in .data and drop explicit zeros (keeps structure valid)
-        vectors_a = ensure_finite_matrix(vectors_a, replace_non_finite=True, copy=False)
-        vectors_b = ensure_finite_matrix(vectors_b, replace_non_finite=True, copy=False)
+        # The original prune/scale calls are kept for safety, but after our manual
+        # pruning, they should not alter the shape further.
+        vectors_a_proc, _, _ = prune_sparse_matrix(vectors_a_proc, copy=False)
+        vectors_a_proc, _ = scale_by_frobenius_norm(vectors_a_proc, copy=False)
+        vectors_b_proc, _, _ = prune_sparse_matrix(vectors_b_proc, copy=False)
+        vectors_b_proc, _ = scale_by_frobenius_norm(vectors_b_proc, copy=False)
 
-        vectors_a = prune_sparse_matrix(vectors_a, copy=False)
-        vectors_a = scale_by_frobenius_norm(vectors_a, copy=False)
-        vectors_b = prune_sparse_matrix(vectors_b, copy=False)
-        vectors_b = scale_by_frobenius_norm(vectors_b, copy=False)
+        # 7. Row-wise L2 normalization to prepare for cosine similarity calculation.
+        vectors_a_proc = normalize_rows(vectors_a_proc, copy=False)
+        vectors_b_proc = normalize_rows(vectors_b_proc, copy=False)
+        vectors_a_proc.sort_indices()
+        vectors_b_proc.sort_indices()
 
-        # 2) Row-wise L2 normalization (idempotent for TF-IDF if already normalized)
-        # Guards against malformed rows and guarantees cosine==dot.
-        vectors_a = normalize_rows(vectors_a, copy=False) 
-        vectors_b = normalize_rows(vectors_b, copy=False)
-        vectors_a.sort_indices()
-        vectors_b.sort_indices()
-
-        assert vectors_a.shape == vectors_b.shape, "\n*** Vector shapes don't match ***\n"
+        assert vectors_a_proc.shape == vectors_b_proc.shape, "Vector shapes don't match after synchronized pruning."
 
         # A key property of L2-normalized vectors is that their cosine similarity
         # is equivalent to their dot product.
         # The sum operation on a sparse matrix returns a dense ndarray of shape (n, 1)
-        similarities_array = vectors_a.multiply(vectors_b).sum(axis=1, dtype=cupy.float32)
+        similarities_array = vectors_a_proc.multiply(vectors_b_proc).sum(axis=1, dtype=cupy.float32)
 
         # Debug synchronization check to catch CUDA errors immediately after the
         # critical sparse matrix operations. This helps identify if the corruption
@@ -225,8 +251,8 @@ def calculate_similarity_gpu(
         similarities_array = cupy.ascontiguousarray(similarities_array, dtype='float32')
         
         # Verify array length matches expected number of rows
-        if len(similarities_array) != len(series_a_to_process):
-            logger.error(f"Shape mismatch: got {len(similarities_array)}, expected {len(series_a_to_process)}")
+        if len(similarities_array) != len(active_index):
+            logger.error(f"Shape mismatch: got {len(similarities_array)} similarities for {len(active_index)} rows.")
             # Fall back to zeros for safety
             return result_series
 
@@ -235,7 +261,7 @@ def calculate_similarity_gpu(
         # with their original positions.
         similarities_series = cudf.Series(
             similarities_array,
-            index=series_a_to_process_index
+            index=active_index
         )
 
         # CRITICAL: Force cuDF to own its own device buffer instead of borrowing
@@ -248,7 +274,7 @@ def calculate_similarity_gpu(
         # way to do this. It assigns values from `similarities_series` to the
         # locations in `result_series` where the mask is True, automatically
         # aligning by index to ensure correctness.
-        result_series.loc[valid_rows_mask] = similarities_series
+        result_series.loc[active_index] = similarities_series
 
     except RuntimeError as e:
         logger.error(f"A runtime error occurred in 'calculate_similarity_gpu' during TF-IDF processing: {e}", exc_info=True)
@@ -276,6 +302,10 @@ def calculate_similarity_gpu(
             del vectors_b
         if vectors_a is not None:
             del vectors_a
+        if vectors_b_proc is not None:
+            del vectors_b_proc
+        if vectors_a_proc is not None:
+            del vectors_a_proc
         
         # Clean up the vectorizer (can be large with big vocabularies)
         if vectorizer is not None:
