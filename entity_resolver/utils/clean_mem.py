@@ -89,7 +89,6 @@ def _cleanup_gpu_memory(synchronize: bool, run_gc: bool, release_pools: bool):
             cupy.cuda.runtime.deviceSynchronize()   # More thorough sync
         except Exception as e:
             logger.warning(f"Error during CUDA stream sync: {e}")
-            raise
 
     # Step 2: Run garbage collection to free Python-level object references.
     if run_gc:

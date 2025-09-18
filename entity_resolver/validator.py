@@ -75,6 +75,8 @@ class ClusterValidator:
         self.min_improvement_threshold = 0.1  # Require 10% improvement to reassign
         self.keep_original_if_close = True  # Keep original assignment if scores are close
         self.soft_threshold_penalty = 0.2  # Penalty for being below threshold (not elimination)
+        self.name_threshold = self.config.name_fuzz_ratio / 100.0
+        self.addr_threshold = self.config.address_fuzz_ratio / 100.0
 
     def validate_with_reassignment(self, gdf: cudf.DataFrame) -> cudf.DataFrame:
         """
@@ -360,7 +362,7 @@ class ClusterValidator:
         else:
             return cudf.DataFrame(self.EMPTY_ASSIGNMENT_SCHEMA)
 
-    @gpu_memory_cleanup
+    #@gpu_memory_cleanup
     def _process_reassignment_batch_efficient(
         self,
         batch: cudf.DataFrame,
@@ -486,6 +488,7 @@ class ClusterValidator:
         else:
             return cudf.DataFrame()
 
+    @gpu_memory_cleanup
     def _find_matches_for_state_group(
         self,
         state_batch: cudf.DataFrame,
@@ -587,10 +590,6 @@ class ClusterValidator:
         else:
             pairs['state_compatible'] = True
         
-        # --- SOFT SCORING with penalties instead of hard filters ---
-        name_threshold = self.config.name_fuzz_ratio / 100.0
-        addr_threshold = self.config.address_fuzz_ratio / 100.0
-        
         # Calculate base similarity scores
         base_name_score = pairs['name_sim']
         base_addr_score = pairs['addr_sim']
@@ -599,7 +598,7 @@ class ClusterValidator:
         # If below threshold, reduce score but don't zero it out
         name_penalty = cudf.Series(
             cupy.where(
-                pairs['name_sim'].values < name_threshold,
+                pairs['name_sim'].values < self.name_threshold,
                 self.soft_threshold_penalty,  # Apply penalty
                 0.0  # No penalty if above threshold
             ),
@@ -608,7 +607,7 @@ class ClusterValidator:
         
         addr_penalty = cudf.Series(
             cupy.where(
-                pairs['addr_sim'].values < addr_threshold,
+                pairs['addr_sim'].values < self.addr_threshold,
                 self.soft_threshold_penalty,  # Apply penalty
                 0.0  # No penalty if above threshold
             ),
