@@ -137,10 +137,6 @@ def calculate_similarity_gpu(
     series_a_to_process = series_a_cleaned[valid_rows_mask]
     series_b_to_process = series_b_cleaned[valid_rows_mask]
 
-    # Copy the index for similarities_series - this ensures we have a clean copy
-    # that won't be affected by any memory operations on the original series
-    series_a_to_process_index = series_a_to_process.index.copy(deep=True)
-
     logger.debug(f"Found {len(series_a_to_process)} valid rows to process for similarity.")
 
     # --- 3. TF-IDF Vectorization and Similarity Calculation ---
@@ -148,7 +144,9 @@ def calculate_similarity_gpu(
     combined_series = None
     vectorizer = None
     vectors_a = None
+    vectors_a_proc = None
     vectors_b = None
+    vectors_b_proc = None
     similarities_array = None
     
     try:
