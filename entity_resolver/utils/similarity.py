@@ -176,9 +176,9 @@ def calculate_similarity_gpu(
 
         # 1. Identify active rows: A row is active if it's non-zero in BOTH vectors.
         #    The cosine similarity for any other row is implicitly zero.
-        row_norms_a = cupy.sparse.linalg.norm(vectors_a, axis=1)
-        row_norms_b = cupy.sparse.linalg.norm(vectors_b, axis=1)
-        active_rows_mask = (row_norms_a > 0) & (row_norms_b > 0)
+        row_nnz_a = vectors_a.getnnz(axis=1)
+        row_nnz_b = vectors_b.getnnz(axis=1)
+        active_rows_mask = (row_nnz_a > 0) & (row_nnz_b > 0)
 
         if not cupy.any(active_rows_mask):
             logger.debug("No rows with overlapping non-empty vectors after transform. Returning all zeros.")
