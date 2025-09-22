@@ -172,10 +172,13 @@ def calculate_similarity_gpu(
         vectors_a = vectorizer.transform(series_a_to_process)
         vectors_b = vectorizer.transform(series_b_to_process)
 
-        # 1. Identify active rows: A row is active if it's non-zero in BOTH vectors.
-        #    The cosine similarity for any other row is implicitly zero.
-        row_nnz_a = vectors_a.getnnz(axis=1)
-        row_nnz_b = vectors_b.getnnz(axis=1)
+        # 1. Identify active rows by calculating the number of non-zero elements
+        #    per row directly from the CSR matrix's indptr array. This is the
+        #    officially supported and most efficient method.
+        #    The difference between consecutive elements of the indptr array
+        #    gives the count of non-zero elements in each row.
+        row_nnz_a = vectors_a.indptr[1:] - vectors_a.indptr[:-1]
+        row_nnz_b = vectors_b.indptr[1:] - vectors_b.indptr[:-1]
         active_rows_mask = (row_nnz_a > 0) & (row_nnz_b > 0)
 
         if not cupy.any(active_rows_mask):
@@ -190,15 +193,18 @@ def calculate_similarity_gpu(
         vectors_a_proc = vectors_a[active_rows_mask, :]
         vectors_b_proc = vectors_b[active_rows_mask, :]
 
-        # 4. Identify active columns: A column is active if non-zero in EITHER filtered matrix.
-        #    This prevents shape mismatches by ensuring both matrices share the same feature set.
-        col_nnz_a = vectors_a_proc.getnnz(axis=0)
-        col_nnz_b = vectors_b_proc.getnnz(axis=0)
-        active_cols_mask = (col_nnz_a > 0) | (col_nnz_b > 0)
+        # 4. Identify active columns by taking the union of column indices
+        #    that have non-zero elements in either matrix. This is the most
+        #    robust way to find the shared feature set without relying on
+        #    the unsupported `axis` parameter in `getnnz`.
+        unique_cols_a = cupy.unique(vectors_a_proc.indices)
+        unique_cols_b = cupy.unique(vectors_b_proc.indices)
+        active_cols_indices = cupy.union1d(unique_cols_a, unique_cols_b)
 
-        # 5. Filter both matrices by the common active column mask.
-        vectors_a_proc = vectors_a_proc[:, active_cols_mask]
-        vectors_b_proc = vectors_b_proc[:, active_cols_mask]
+        # 5. Filter both matrices by the common active column indices.
+        #    Slicing a CSR matrix by a list of column indices is efficient.
+        vectors_a_proc = vectors_a_proc[:, active_cols_indices]
+        vectors_b_proc = vectors_b_proc[:, active_cols_indices]
 
         # 6. Apply pre-processing to the synchronized matrices. These steps are intended
         #    to prevent CUDA errors on a clean, consistent dataset.
