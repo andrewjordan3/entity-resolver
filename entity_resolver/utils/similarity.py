@@ -7,6 +7,7 @@ Nearest Neighbors.
 
 import cudf
 import cupy
+import cupyx.scipy.sparse
 import logging
 from typing import Dict, Any
 from cuml.feature_extraction.text import TfidfVectorizer
@@ -84,6 +85,17 @@ def calculate_similarity_gpu(
         A cuDF Series of float32 values representing the cosine similarity
         for each corresponding row in the input series.
     """
+    # --- 3. TF-IDF Vectorization and Similarity Calculation ---
+    # Initialize variables to None for cleanup tracking
+    combined_series = None
+    vectorizer = None
+    vectors_a = None
+    vectors_a_proc = None
+    vectors_b = None
+    vectors_b_proc = None
+    similarities_array = None
+    combined_proc_vectors = None
+
     if not series_a.index.equals(series_b.index):
         raise ValueError("Input series 'series_a' and 'series_b' must have the same index.")
 
@@ -138,16 +150,6 @@ def calculate_similarity_gpu(
     series_b_to_process = series_b_cleaned[valid_rows_mask]
 
     logger.debug(f"Found {len(series_a_to_process)} valid rows to process for similarity.")
-
-    # --- 3. TF-IDF Vectorization and Similarity Calculation ---
-    # Initialize variables to None for cleanup tracking
-    combined_series = None
-    vectorizer = None
-    vectors_a = None
-    vectors_a_proc = None
-    vectors_b = None
-    vectors_b_proc = None
-    similarities_array = None
     
     try:
         # To ensure a fair comparison, the TF-IDF vectorizer must be fitted on the
@@ -213,11 +215,21 @@ def calculate_similarity_gpu(
         vectors_a_proc = ensure_finite_matrix(vectors_a_proc, replace_non_finite=True, copy=False)
         vectors_b_proc = ensure_finite_matrix(vectors_b_proc, replace_non_finite=True, copy=False)
         
-        # The original prune/scale calls are kept for safety, but after our manual
-        # pruning, they should not alter the shape further.
-        vectors_a_proc, _, _ = prune_sparse_matrix(vectors_a_proc, copy=False)
+        # To ensure column pruning is consistent, we must determine the columns
+        # to keep based on the combined statistics of both matrices.
+        combined_proc_vectors = cupyx.scipy.sparse.vstack([vectors_a_proc, vectors_b_proc], format='csr')
+
+        # Run prune on the combined matrix to get a single, consistent set of columns.
+        # We only care about the column mask/indices that are kept.
+        _, _, kept_cols = prune_sparse_matrix(combined_proc_vectors, copy=False)
+
+        # Apply the common column filter to both matrices.
+        if kept_cols is not None:
+            vectors_a_proc = vectors_a_proc[:, kept_cols]
+            vectors_b_proc = vectors_b_proc[:, kept_cols]        
+        
+        # With columns synchronized, we can now scale each matrix independently.
         vectors_a_proc, _ = scale_by_frobenius_norm(vectors_a_proc, copy=False)
-        vectors_b_proc, _, _ = prune_sparse_matrix(vectors_b_proc, copy=False)
         vectors_b_proc, _ = scale_by_frobenius_norm(vectors_b_proc, copy=False)
 
         # 7. Row-wise L2 normalization to prepare for cosine similarity calculation.
@@ -226,7 +238,11 @@ def calculate_similarity_gpu(
         vectors_a_proc.sort_indices()
         vectors_b_proc.sort_indices()
 
-        assert vectors_a_proc.shape == vectors_b_proc.shape, "Vector shapes don't match after synchronized pruning."
+        assert vectors_a_proc.shape == vectors_b_proc.shape, (
+            f"Vector shapes don't match after synchronized pruning.\n"
+            f"Shape A: {vectors_a_proc.shape}\n"
+            f"Shape B: {vectors_b_proc.shape}"
+        )
 
         # A key property of L2-normalized vectors is that their cosine similarity
         # is equivalent to their dot product.
@@ -318,6 +334,10 @@ def calculate_similarity_gpu(
         # Clean up the combined series used for fitting
         if combined_series is not None:
             del combined_series
+
+        # Clean up combined vectors from pruning
+        if combined_proc_vectors is not None:
+            del combined_proc_vectors
         
         # Clean up the cleaned series that are no longer needed
         del series_b_cleaned
