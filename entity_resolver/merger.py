@@ -344,10 +344,10 @@ class ClusterMerger:
         )
         
         # Group by entity key and find keys with multiple clusters
-        entity_cluster_groups = clustered_entities.groupby('composite_entity_key')['cluster'].agg([
-            ('unique_clusters', 'unique'),
-            ('cluster_count', 'nunique')
-        ]).reset_index()
+        entity_cluster_groups = clustered_entities.groupby('composite_entity_key').agg(
+            unique_clusters=('cluster', 'unique'),
+            cluster_count=('cluster', 'nunique')
+        ).reset_index()
         
         # Filter to only entity keys that appear in multiple clusters
         inconsistent_entities = entity_cluster_groups[entity_cluster_groups['cluster_count'] > 1]
