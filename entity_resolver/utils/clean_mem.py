@@ -87,12 +87,14 @@ def _cleanup_gpu_memory(synchronize: bool, run_gc: bool, release_pools: bool):
         try:
             #cupy.cuda.Stream.null.synchronize()
             cupy.cuda.runtime.deviceSynchronize()   # More thorough sync
+            logger.debug(f'Cuda device sync inside gpu_memory_cleanup successful.')
         except Exception as e:
             logger.warning(f"Error during CUDA stream sync: {e}")
 
     # Step 2: Run garbage collection to free Python-level object references.
     if run_gc:
         gc.collect()
+        logger.debug(f'Python garbage collection inside gpu_memory_cleanup successful.')
 
     # Step 3: Release memory from the underlying memory pools.
     if release_pools:
@@ -113,10 +115,12 @@ def _cleanup_gpu_memory(synchronize: bool, run_gc: bool, release_pools: bool):
         # redundant operation. If CuPy is using its own pools, this is critical.
         try:
             cupy.get_default_memory_pool().free_all_blocks()
+            logger.debug(f'Cupy free all blocks in default memory pool successful.')
         except Exception as e:
             logger.warning(f"Error freeing CuPy default pool (non-critical): {e}")
         try:
             cupy.get_default_pinned_memory_pool().free_all_blocks()
+            logger.debug(f'Cupy free all blocks in pinned memory pool successful.')
         except Exception as e:
             logger.warning(f"Error freeing CuPy pinned pool (non-critical): {e}")
 
