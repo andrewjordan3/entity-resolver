@@ -386,7 +386,11 @@ def prune_sparse_matrix(
     df_keepable_cols = cupy.where(df_mask)[0]
 
     if df_keepable_cols.size == 0:
-        raise ValueError("No columns survived document frequency pruning.")
+        logger.warning(
+            "No columns survived document frequency pruning. "
+            "Returning the row-pruned matrix without column pruning."
+        )
+        return target_matrix, kept_row_indices, None
 
     # --- Step 3: Filter DF-eligible columns by Energy ---
     col_energy = cupy.bincount(
@@ -400,7 +404,14 @@ def prune_sparse_matrix(
     total_energy_in_subset = float(energy_in_keepable_cols.sum())
 
     if energy_in_keepable_cols.size == 0 or total_energy_in_subset == 0.0:
-        raise ValueError("Zero keepable energy after DF pruning; cannot proceed.")
+        logger.warning(
+            "Zero keepable energy after DF pruning; cannot proceed with energy pruning. "
+            "Returning the DF-pruned matrix."
+        )
+        pruned_matrix = target_matrix[:, df_keepable_cols]
+        pruned_matrix.eliminate_zeros()
+        pruned_matrix.sort_indices()
+        return pruned_matrix, kept_row_indices, df_keepable_cols
 
     # Sort the keepable columns by their energy
     order = cupy.argsort(energy_in_keepable_cols)[::-1]
@@ -414,7 +425,11 @@ def prune_sparse_matrix(
     kept_column_indices = df_keepable_cols[order[:num_cols_for_cutoff]]
 
     if kept_column_indices.size == 0:
-        raise ValueError("All columns were removed during energy pruning.")
+        logger.warning(
+            "All columns were removed during energy pruning. "
+            "Returning the row-pruned matrix without column pruning."
+        )
+        return target_matrix, kept_row_indices, None
 
     logger.debug(
         "Pruning columns: kept %d/%d (DF: min_df=%d, max_df=%d) | energy_cutoff=%.3f",
