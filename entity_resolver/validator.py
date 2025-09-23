@@ -14,8 +14,7 @@ This class uses memory-efficient, GPU-native strategies including:
 import cudf
 import cupy
 import logging
-import pandas as pd
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple
 from cudf.api.types import (
     is_categorical_dtype,
     is_string_dtype,
@@ -51,6 +50,9 @@ class ClusterValidator:
         """
         self.config = validation_config
         self.vectorizer_config = vectorizer_config
+
+        # *** NOTE: Must move to config file at some point ***
+        self.MIN_STATE_BATCH_SIZE: int = 24 # minimum rows to process for similarity
         
         # Cache for similarity computations, cleared after each main run.
         self._similarity_cache = {}
@@ -383,7 +385,11 @@ class ClusterValidator:
         state_groups = self._group_entities_by_state(batch)
 
         for state, state_batch in state_groups:
-            if state_batch.empty:
+            if len(state_batch) < self.MIN_STATE_BATCH_SIZE:
+                logger.debug(
+                    f"Skipping state '{state}' with {len(state_batch)} items, "
+                    f"which is below the minimum threshold of {self.MIN_STATE_BATCH_SIZE}."
+                )
                 continue
 
             # Get candidate clusters for this state

@@ -238,6 +238,37 @@ def calculate_similarity_gpu(
         vectors_a_proc.sort_indices()
         vectors_b_proc.sort_indices()
 
+        # --- Stably Format Matrices Before Final Calculation ---
+        # Enforce canonical format and data types for stability and performance.
+        # This conditionally creates a copy only if a matrix is a complex view
+        # or has a non-standard format, preventing memory corruption errors.
+        
+        # Process vectors_a_proc
+        vectors_a_proc.data    = vectors_a_proc.data.astype(cupy.float32, copy=False)
+        vectors_a_proc.indices = vectors_a_proc.indices.astype(cupy.int32,  copy=False)
+        vectors_a_proc.indptr  = vectors_a_proc.indptr.astype(cupy.int32,  copy=False)
+        needs_copy_a = (
+            (vectors_a_proc.data.base is not None) or
+            (vectors_a_proc.indices.base is not None) or
+            (vectors_a_proc.indptr.base is not None) or
+            (getattr(vectors_a_proc, "has_canonical_format", True) is False)
+        )
+        if needs_copy_a:
+            vectors_a_proc = vectors_a_proc.copy()
+
+        # Process vectors_b_proc
+        vectors_b_proc.data    = vectors_b_proc.data.astype(cupy.float32, copy=False)
+        vectors_b_proc.indices = vectors_b_proc.indices.astype(cupy.int32,  copy=False)
+        vectors_b_proc.indptr  = vectors_b_proc.indptr.astype(cupy.int32,  copy=False)
+        needs_copy_b = (
+            (vectors_b_proc.data.base is not None) or
+            (vectors_b_proc.indices.base is not None) or
+            (vectors_b_proc.indptr.base is not None) or
+            (getattr(vectors_b_proc, "has_canonical_format", True) is False)
+        )
+        if needs_copy_b:
+            vectors_b_proc = vectors_b_proc.copy()
+
         assert vectors_a_proc.shape == vectors_b_proc.shape, (
             f"Vector shapes don't match after synchronized pruning.\n"
             f"Shape A: {vectors_a_proc.shape}\n"
