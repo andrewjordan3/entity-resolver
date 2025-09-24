@@ -7,6 +7,7 @@ resolved entities.
 
 import cudf
 import logging
+from typing import Optional
 
 # Set up a logger for this module.
 logger = logging.getLogger(__name__)
@@ -48,39 +49,46 @@ def _find_cross_cluster_duplicates(gdf: cudf.DataFrame, cluster_col: str) -> cud
     return unique_clusters_per_key[unique_clusters_per_key > 1]
 
 
-def validate_no_duplicates(gdf: cudf.DataFrame, cluster_col: str = 'final_cluster') -> bool:
+def validate_no_duplicates(
+        gdf: cudf.DataFrame, 
+        cluster_col: str = 'final_cluster',
+        context: Optional[str] = None,
+    ) -> bool:
     """
     Validates that no identical name+address combination exists in different clusters.
 
     Args:
         gdf: The cuDF DataFrame to validate.
         cluster_col: The name of the cluster column ('cluster' or 'final_cluster').
+        context: Optional label for the pipeline stage (e.g. 'merging', 'refining')
+                 used only for clearer log messages.
 
     Returns:
         True if validation passes, False otherwise.
     """
-    logger.info(f"Validating for cross-cluster duplicates in column '{cluster_col}'...")
+    phase = f" during {context}" if context else ""
+    logger.info(f"Validating for cross-cluster duplicates in column '{cluster_col}'{phase}...")
     if cluster_col not in gdf.columns:
-        logger.error(f"Validation FAILED: Column '{cluster_col}' not found in DataFrame.")
+        logger.error(f"Validation FAILED{phase}: Column '{cluster_col}' not found in DataFrame.")
         return False
 
     # We only need to check records that have been assigned to a cluster.
     clustered_gdf = gdf[gdf[cluster_col] != -1].copy()
     if clustered_gdf.empty:
-        logger.info("No clustered records to validate. Validation PASSED.")
+        logger.info(f"No clustered records to validate{phase}. Validation PASSED.")
         return True
 
     duplicates = _find_cross_cluster_duplicates(clustered_gdf, cluster_col)
 
     if not duplicates.empty:
-        logger.error(f"❌ VALIDATION FAILED: {len(duplicates)} entities appear in multiple clusters!")
+        logger.error(f"❌ VALIDATION FAILED{phase}: {len(duplicates)} entities appear in multiple clusters!")
         # Log the first few examples for quick debugging.
         for entity_key, cluster_count in duplicates.head(5).to_pandas().items():
             name, addr = entity_key.split('|||', 1)
             logger.error(f"  '{name}' at '{addr}' appears in {cluster_count} different clusters.")
         return False
 
-    logger.info("✅ Validation PASSED: No cross-cluster duplicates found.")
+    logger.info("✅ Validation PASSED{phase}: No cross-cluster duplicates found.")
     return True
 
 
