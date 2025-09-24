@@ -223,12 +223,20 @@ class ClusterRefiner:
     def _number_chain_entities(self, canonical_map_gdf: cudf.DataFrame) -> cudf.DataFrame:
         """Finds and numbers entities with the same name at different addresses."""
         logger.info("Identifying and numbering chain entities...")
+
+        if canonical_map_gdf.empty:
+            return canonical_map_gdf
         
         # Count how many unique addresses each canonical name is associated with.
-        name_to_address_counts = canonical_map_gdf.groupby('canonical_name')['canonical_address'].nunique()
+        name_to_address_counts = (
+            canonical_map_gdf
+                .groupby('canonical_name')
+                .agg(address_count=('canonical_address', 'nunique'))  # dropna=True by default
+                .reset_index()
+        )
         
         # Identify names that appear at more than one address.
-        chain_names = name_to_address_counts[name_to_address_counts > 1].index
+        chain_names = name_to_address_counts.loc[name_to_address_counts['address_count'] > 1, 'canonical_name']
         
         if chain_names.empty:
             logger.info("No chain entities found.")
@@ -236,17 +244,39 @@ class ClusterRefiner:
 
         logger.info(f"Found {len(chain_names)} entity names with multiple addresses.")
         
-        chains_gdf = canonical_map_gdf[canonical_map_gdf['canonical_name'].isin(chain_names)].copy()
-        non_chains_gdf = canonical_map_gdf[~canonical_map_gdf['canonical_name'].isin(chain_names)]
-        
-        # Sort for deterministic numbering.
-        chains_gdf = chains_gdf.sort_values(['canonical_name', 'canonical_address'])
-        
-        # Assign a unique number to each address within a name group.
-        chains_gdf['chain_num'] = chains_gdf.groupby('canonical_name').cumcount() + 1
-        
-        # Append the number to the canonical name.
-        chains_gdf['canonical_name'] = chains_gdf['canonical_name'] + " - " + chains_gdf['chain_num'].astype(str)
-        
-        # Recombine with the non-chain entities.
-        return cudf.concat([non_chains_gdf, chains_gdf.drop(columns=['chain_num'])])
+        unique_name_address = (
+            canonical_map_gdf.loc[
+                canonical_map_gdf['canonical_name'].isin(chain_names),
+                ['canonical_name', 'canonical_address']
+            ]
+            .drop_duplicates()
+            .sort_values(['canonical_name', 'canonical_address'])
+            .reset_index(drop=True)
+        )
+
+        unique_name_address['chain_num'] = (
+            unique_name_address
+                .groupby('canonical_name')
+                .cumcount()
+                .astype('int32') + 1
+        )
+
+        # 4) Join numbers back to ALL rows; rows for non-chains will get null chain_num
+        out = canonical_map_gdf.merge(
+            unique_name_address,
+            on=['canonical_name', 'canonical_address'],
+            how='left'
+        )
+
+        # 5) Append " - N" only where chain_num exists
+        chain_mask = out['chain_num'].notnull()
+        if chain_mask.any():
+            out.loc[chain_mask, 'canonical_name'] = (
+                out.loc[chain_mask, 'canonical_name'] + " - " +
+                out.loc[chain_mask, 'chain_num'].astype('int32').astype('str')
+            )
+
+        # 6) Clean up temp column
+        out = out.drop(columns=['chain_num'])
+
+        return out
