@@ -1,129 +1,256 @@
 # entity_resolver/config/schema.py
+# -*- coding: utf-8 -*-
 """
-Entity Resolution Pipeline Configuration Schema
+Pydantic Schema for GPU-Accelerated Entity Resolution Pipeline Configuration.
 
-This module defines all Pydantic-based configuration models for the GPU-accelerated 
-entity resolution pipeline using RAPIDS (cuML, cuDF, cuPy).
+This module serves as the single source of truth for all configuration parameters 
+governing the entity resolution and deduplication pipeline. It leverages Pydantic 
+to define a clear, hierarchical, and type-safe schema. All computationally intensive 
+stages of the pipeline are designed to be accelerated on NVIDIA GPUs using the 
+RAPIDS ecosystem (cuDF, cuML, cuPy).
 
-Using Pydantic models provides:
-- Type-hinting for better IDE support and code clarity
-- Automatic validation with descriptive error messages
-- Self-documentation through field descriptions
-- Easy serialization/deserialization to/from YAML
-- Default values with optional overrides
-- Strict validation preventing unknown fields (extra='forbid')
+The use of Pydantic provides several key advantages:
+1.  **Type Safety & Validation**: All configuration values are automatically parsed, 
+    validated, and cast to their correct types at runtime. This prevents common 
+    configuration errors and ensures that downstream components receive data in 
+    the expected format.
+2.  **Rich Error Messages**: When validation fails, Pydantic raises descriptive 
+    errors that pinpoint exactly which parameter is incorrect and why, dramatically 
+    simplifying debugging.
+3.  **Self-Documentation**: The schema itself, with its type hints, descriptions, 
+    and default values, acts as comprehensive documentation for every available 
+    pipeline parameter.
+4.  **IDE Support**: The strongly-typed nature of the configuration objects provides 
+    excellent autocompletion, type-checking, and navigation in modern IDEs like 
+    VS Code or PyCharm.
+5.  **Serialization**: Configurations can be easily loaded from and saved to common 
+    formats like YAML or JSON, facilitating reproducibility and experiment tracking.
+6.  **Strictness**: By setting `extra='forbid'`, the schema prevents unknown or 
+    misspelled parameters from being passed in, catching potential typos early.
 
-The main ResolverConfig class composes all subordinate configurations for each stage 
-of the entity resolution process, creating a single source of truth for all parameters.
+The primary entry point is the `ResolverConfig` class, which aggregates all 
+stage-specific configurations (e.g., `VectorizerConfig`, `ClustererConfig`) into 
+a single, cohesive object.
 """
 
-from typing import List, Dict, Set, Any, Optional, Literal, Tuple
-from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
+# ======================================================================================
+# Core Library Imports
+# ======================================================================================
+
+# --- Standard Library Imports ---
+# The `typing` module provides support for type hints, which are crucial for making
+# the Pydantic models explicit and enabling static analysis.
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
+
+# --- Third-Party Library Imports ---
+# Pydantic is the core library used for data validation and settings management.
+# Its models define the structure, types, and constraints of the configuration.
+from pydantic import (
+    BaseModel,          # The base class for all configuration models.
+    ConfigDict,         # A dictionary-like object for configuring model behavior.
+    Field,              # Used to customize model fields with defaults, validation, etc.
+    field_validator,    # A decorator for creating custom per-field validation logic.
+    model_validator,    # A decorator for creating custom validation logic for the entire model.
+)
+
+# RAPIDS cuPy is the GPU-accelerated equivalent of NumPy. It is imported here
+# primarily to handle and validate GPU-specific data types (e.g., `cupy.dtype`)
+# that are passed to other RAPIDS libraries like cuML.
 import cupy
 
-class SvdEigshFallbackConfig(BaseModel):
-    """Parameters for the robust SVD fallback mechanism."""
-    # No arbitrary types allowed; all fields must be serializable.
-    model_config = ConfigDict(extra='forbid')
+# ======================================================================================
+# Re-usable Helper Models & Validators
+# ======================================================================================
 
+def _validate_dtype_string(v: Any) -> str:
+    """
+    Shared helper to validate that a raw input value is a valid CuPy float dtype string.
+    
+    This is a 'before' validator, so it accepts `Any` to handle potentially
+    invalid user input (e.g., an integer or None). It then enforces that the
+    input is a string representing a floating-point type.
+    """
+    if not isinstance(v, str):
+        raise TypeError("Dtype must be provided as a string (e.g., 'float64').")
+    try:
+        dtype = cupy.dtype(v)
+        # Enforce floating-point types, as integer dtypes are unsuitable for these matrices.
+        if dtype.kind != 'f':
+            raise ValueError(f"Dtype must be a floating-point type, but '{v}' is not.")
+    except TypeError as e:
+        raise ValueError(f"'{v}' is not a valid cupy dtype name.") from e
+    return v
+
+def _convert_string_to_dtype(v: str) -> Any:
+    """
+    Shared helper to convert a validated string into a cupy.dtype object.
+    
+    This is an 'after' validator. It runs after _validate_dtype_string, so it
+    can safely assume `v` is a valid dtype string and proceeds with conversion.
+    The return type is `Any` because `cupy.dtype` is not a standard type.
+    """
+    return cupy.dtype(v)
+
+# ======================================================================================
+# Helper & Utility Configurations
+# ======================================================================================
+
+class SvdEigshFallbackConfig(BaseModel):
+    """
+    Configuration for the robust SVD fallback mechanism.
+
+    This configuration governs a series of preprocessing and solver steps that are
+    invoked when the primary sparse SVD solver (`cupyx.scipy.sparse.linalg.svds`)
+    fails to converge. Such failures can occur with ill-conditioned or rank-deficient
+    matrices. This fallback uses a more stable, albeit potentially slower, method based
+    on the eigenvalue decomposition of the covariance matrix (eigsh), combined with
+    aggressive data pruning and cleaning to improve numerical stability.
+    """
+    # Configure the Pydantic model.
+    # - `extra='forbid'`: Disallows any fields not explicitly defined in the model.
+    # - `arbitrary_types_allowed=True`: Explicitly permits non-standard types like
+    #   `cupy.dtype` to be stored in the model's fields after validation. This is
+    #   necessary because we convert the string 'float64' into a cupy.dtype object.
+    model_config = ConfigDict(extra='forbid', arbitrary_types_allowed=True)
+
+    # --- Solver Parameters ---
     fallback_dtype: Any = Field(
         default="float64",
-        description="String name of the CuPy dtype for the eigsh solver ('float64' is recommended for stability)."
+        description=(
+            "The CuPy dtype to use for the eigsh solver. 'float64' (double precision) "
+            "is strongly recommended as it provides greater numerical stability, which "
+            "is critical in a fallback scenario where the matrix may be ill-conditioned. "
+            "'float32' can be used to conserve memory but increases the risk of non-convergence."
+        )
     )
     eigsh_restarts: int = Field(
         default=3,
         ge=0,
-        description="Number of times to restart the eigsh solver on failure before raising an error."
+        le=10,
+        description=(
+            "Number of times to restart the `eigsh` solver on convergence failure. "
+            "Each restart can use a slightly different internal state, sometimes "
+            "allowing it to find a solution. Setting this above 0 adds resilience. "
+            "A value between 1 and 5 is typical."
+        )
     )
+
+    # --- Pruning & Clipping Parameters ---
     prune_min_row_sum: float = Field(
         default=1e-9,
         ge=0.0,
-        description="Rows with a total sum of values less than this threshold will be removed before SVD."
+        description=(
+            "Rows in the feature matrix with a total sum of values less than this "
+            "threshold will be removed before attempting SVD. This helps eliminate "
+            "near-empty or zero-energy records that contribute little information "
+            "but can cause numerical instability."
+        )
     )
     prune_min_df: int = Field(
         default=2,
         ge=1,
-        description="Columns that appear in fewer than `min_df` documents (rows) will be removed."
+        description=(
+            "The minimum document frequency (DF). Columns (features) that appear "
+            "in fewer than `min_df` documents (rows) will be removed. This is a standard "
+            "technique to filter out rare, noisy features that are unlikely to be useful."
+        )
     )
     prune_max_df_ratio: float = Field(
         default=0.98,
         gt=0.0,
         le=1.0,
-        description="Columns that appear in more than `max_df_ratio * n_rows` documents will be removed."
+        description=(
+            "The maximum document frequency (DF) as a ratio of the total number of "
+            "documents. Columns that appear in more than this fraction of documents "
+            "will be removed. This filters out overly common, non-discriminative "
+            "features (e.g., character n-grams like ' co' in company names)."
+        )
     )
     prune_energy_cutoff: float = Field(
         default=0.995,
         gt=0.0,
         le=1.0,
-        description="Keeps the smallest set of columns whose cumulative energy exceeds this ratio of the total."
+        description=(
+            "A threshold for pruning columns based on their cumulative energy (sum of "
+            "squared values). The process keeps the smallest set of columns whose "
+            "cumulative energy exceeds this ratio of the total, effectively removing "
+            "low-energy, low-information features."
+        )
     )
     winsorize_limits: Tuple[Optional[float], Optional[float]] = Field(
         default=(None, 0.999),
-        description="Quantile limits for clipping extreme values. Use None to disable a limit on one side."
+        description=(
+            "Quantile-based limits for clipping (Winsorizing) extreme values in the matrix. "
+            "This is a robust way to handle outliers that can destabilize SVD. For example, "
+            "`(0.01, 0.99)` clips all values below the 1st percentile and above the 99th. "
+            "Use `None` to disable clipping on one side (e.g., `(None, 0.999)` only clips high values)."
+        )
     )
 
-    @field_validator('fallback_dtype', mode='before')
-    @classmethod
-    def validate_dtype_string(cls, v: Any) -> str:
-        """Ensures the input is a string and represents a valid CuPy dtype name."""
-        if not isinstance(v, str):
-            raise TypeError("fallback_dtype must be provided as a string (e.g., 'float64').")
-        try:
-            cupy.dtype(v)
-        except TypeError:
-            raise ValueError(f"'{v}' is not a valid cupy dtype name.")
-        return v
-
-    @field_validator('fallback_dtype', mode='after')
-    @classmethod
-    def convert_string_to_dtype(cls, v: str) -> Any:
-        """Converts the validated string into a cupy.dtype object."""
-        return cupy.dtype(v)
+    # Assign the shared validators to this model's field.
+    _validate_dtype_str: classmethod = field_validator('fallback_dtype', 
+                                                       mode='before')(_validate_dtype_string)
+    _convert_to_dtype: classmethod = field_validator('fallback_dtype', 
+                                                     mode='after')(_convert_string_to_dtype)
 
     @field_validator('winsorize_limits')
     @classmethod
-    def validate_winsorize_limits(cls, v: Tuple[Optional[float], Optional[float]]) -> Tuple[Optional[float], Optional[float]]:
-        """Validates the winsorize limits tuple."""
+    def validate_winsorize_limits(
+        cls, 
+        v: Tuple[Optional[float], Optional[float]],
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Validates that the winsorize limits tuple is logical and within the [0, 1] range.
+        """
         lower, upper = v
         if lower is not None and not (0.0 <= lower <= 1.0):
             raise ValueError(f"Lower winsorize limit must be between 0.0 and 1.0, got {lower}")
         if upper is not None and not (0.0 <= upper <= 1.0):
             raise ValueError(f"Upper winsorize limit must be between 0.0 and 1.0, got {upper}")
         if lower is not None and upper is not None and lower >= upper:
-            raise ValueError(f"Lower limit ({lower}) cannot be >= upper limit ({upper})")
+            raise ValueError(f"Lower limit ({lower}) cannot be greater than or equal to the upper limit ({upper}).")
         return v
 
-# === Core Data and I/O Configurations ===
+# ======================================================================================
+# Core Data and I/O Configurations
+# ======================================================================================
 
 class ColumnConfig(BaseModel):
     """
-    Specifies the names of the input DataFrame columns to be used in the resolution process.
-    
-    This configuration tells the resolver which columns contain the entity names and 
-    address components. The resolver will look for these exact column names in your 
-    input cuDF DataFrame.
+    Specifies the names of the input DataFrame columns for the resolution process.
+
+    This crucial configuration acts as a map, telling the pipeline where to find the
+    primary entity identifier (e.g., a company name) and the associated address
+    component(s) within the input cuDF DataFrame. The pipeline will raise an error
+    during initialization if these columns are not found in the provided data.
     """
     model_config = ConfigDict(extra='forbid')
     
     entity_col: str = Field(
-        default='raw_name', 
+        default='entity', 
         min_length=1,
+        max_length=256,
+        pattern=r'^[a-zA-Z][a-zA-Z0-9_]*$', # Enforce python-style identifier
         description=(
-            "The name of the column containing the primary entity name to be resolved. "
-            "This should be the main business/organization name column in your data. "
-            "Examples: 'company_name', 'vendor_name', 'organization', 'business_name'"
+            "The name of the column containing the primary entity identifier to be resolved. "
+            "This is typically the main business or organization name. All matching and "
+            "clustering logic is centered around this column. The name must be a valid "
+            "identifier (letters, numbers, underscores) and cannot start with a number."
+            "Common examples: 'company_name', 'vendor', 'organization'."
         )
     )
     
     address_cols: List[str] = Field(
-        default_factory=lambda: ['Maintenance Service Vendor Address', 'Maintenance Service Vendor City', 
-                                'Maintenance Service Vendor State/Province', 'Maintenance Service Vendor Zip/Postal Code'], 
+        default_factory=lambda: ['address'], 
         min_length=1,
+        max_length=10, # Limit to a reasonable number of address components
         description=(
-            "A list of column names that together form the complete address. "
-            "These columns will be concatenated in order to create the full address string. "
-            "Can be a single column (e.g., ['full_address']) or multiple columns "
-            "(e.g., ['street', 'city', 'state', 'zip']). Order matters for concatenation."
+            "A list of one or more column names that constitute the full address. "
+            "These columns are concatenated in the provided order, separated by spaces, "
+            "to form a single address string for processing. The order is critical. "
+            "For structured data, a list like `['street', 'city', 'state', 'zip']` "
+            "is appropriate. For unstructured data, a single column `['full_address']` "
+            "can be used."
         )
     )
 
@@ -131,33 +258,60 @@ class ColumnConfig(BaseModel):
     @classmethod
     def validate_address_columns(cls, v: List[str]) -> List[str]:
         """
-        Validates that address columns are non-empty strings with no duplicates.
+        Validates that address columns are non-empty, unique, valid identifier strings.
         
+        This check prevents common errors such as empty strings, whitespace, or duplicate
+        column names being passed in the address column list, which could lead to
+        unexpected behavior or errors during processing.
+
         Args:
-            v: List of address column names
+            v: The list of address column names from the configuration.
             
         Returns:
-            Validated list of column names
+            The validated list of address column names.
             
         Raises:
-            ValueError: If columns are empty strings or duplicates exist
+            ValueError: If the list is empty, any column name is invalid, or if duplicates exist.
         """
+        if not v:
+            raise ValueError("`address_cols` cannot be an empty list.")
+        
         seen = set()
         for i, col in enumerate(v):
             if not isinstance(col, str) or not col.strip():
-                raise ValueError(f"address_cols[{i}] must be a non-empty string, got: '{col}'")
+                raise ValueError(f"address_cols[{i}] must be a non-empty string, but got: '{col}'")
+            # This regex check is redundant if the pattern is enforced on a model level for all strings,
+            # but provides a more specific error message here.
+            if not col.replace('_', '').isalnum() or col[0].isdigit():
+                 raise ValueError(f"address_cols[{i}] ('{col}') is not a valid identifier.")
             if col in seen:
-                raise ValueError(f"Duplicate column name in address_cols: '{col}'")
+                raise ValueError(f"Duplicate column name found in address_cols: '{col}'. All column names must be unique.")
             seen.add(col)
         return v
 
+    @model_validator(mode='after')
+    def check_column_overlap(self) -> 'ColumnConfig':
+        """
+        Ensures the entity_col is not duplicated in the address_cols list.
+        
+        The entity column must be distinct from the address columns to maintain a clear
+        separation between the primary identifier and its location attributes.
+        This validation prevents logical errors in the downstream feature engineering.
+        """
+        if self.entity_col in self.address_cols:
+            raise ValueError(
+                f"The `entity_col` ('{self.entity_col}') cannot also be present in the "
+                f"`address_cols` list: {self.address_cols}"
+            )
+        return self
 
 class OutputConfig(BaseModel):
     """
     Configuration for output formatting, logging verbosity, and manual review thresholds.
     
-    Controls how the final resolved entities are formatted and which entities should
-    be flagged for human review based on confidence scores.
+    Controls how the final resolved entities are formatted, which entities should be
+    flagged for human review based on confidence scores, and also manages the
+    verbosity of the pipeline's logging output during its run.
     """
     model_config = ConfigDict(extra='forbid')
     
@@ -165,10 +319,10 @@ class OutputConfig(BaseModel):
         default='proper',
         description=(
             "The case style for the final canonical entity names:\n"
-            "- 'proper': Title Case (e.g., 'Acme Corporation')\n"
-            "- 'raw': Keep original case as-is from the most representative cluster member\n"
-            "- 'upper': UPPERCASE (e.g., 'ACME CORPORATION')\n"
-            "- 'lower': lowercase (e.g., 'acme corporation')"
+            "- 'proper': Applies title casing (e.g., 'Acme Corporation').\n"
+            "- 'raw': Preserves the original casing from the most representative cluster member.\n"
+            "- 'upper': Converts all names to UPPERCASE (e.g., 'ACME CORPORATION').\n"
+            "- 'lower': Converts all names to lowercase (e.g., 'acme corporation')."
         )
     )
     
@@ -178,21 +332,23 @@ class OutputConfig(BaseModel):
         le=1.0,
         description=(
             "The confidence score threshold for flagging matches for manual review. "
-            "Matches with confidence below this value will be marked for human verification. "
-            "Range: 0.0 (flag everything) to 1.0 (flag nothing). "
-            "Recommended values: 0.7-0.8 for high precision requirements, 0.5-0.6 for high recall."
+            "Matches with a confidence score *below* this value will be marked. "
+            "This is a key parameter for controlling the precision-recall trade-off. "
+            "Set higher (e.g., 0.8-0.9) for high precision (fewer, more certain matches). "
+            "Set lower (e.g., 0.6-0.7) for high recall (more matches, some potentially incorrect)."
         )
     )
     
-    log_level: int = Field(
-        default=10,  # logging.DEBUG
+    log_level: Union[int, str] = Field(
+        default='INFO',
         description=(
-            "The logging verbosity level for console output:\n"
-            "- 10 (DEBUG): Detailed diagnostic output, useful for troubleshooting\n"
-            "- 20 (INFO): General informational messages about progress\n"
-            "- 30 (WARNING): Only warnings and errors\n"
-            "- 40 (ERROR): Only error messages\n"
-            "- 50 (CRITICAL): Only critical failures"
+            "The logging verbosity level. Can be specified as a standard logging integer "
+            "or a case-insensitive string:\n"
+            "- 'DEBUG' (10): Detailed diagnostic output, useful for troubleshooting.\n"
+            "- 'INFO' (20): General messages about pipeline progress (recommended default).\n"
+            "- 'WARNING' (30): Only warnings about potential issues and errors.\n"
+            "- 'ERROR' (40): Only error messages.\n"
+            "- 'CRITICAL' (50): Only critical failures that halt execution."
         )
     )
     
@@ -200,49 +356,64 @@ class OutputConfig(BaseModel):
         default=False,
         description=(
             "If True, the output cuDF DataFrame will include separate columns for each "
-            "canonical address component (street, city, state, zip). "
-            "If False, only a single concatenated canonical_address column is included. "
-            "Useful when downstream processes need structured address data."
+            "canonical address component (e.g., street, city, state, zip), parsed from the "
+            "canonical address. If False, only a single concatenated `canonical_address` "
+            "column is included. Enable this if downstream processes require structured addresses."
         )
     )
+    
+    @field_validator('log_level', mode='before')
+    @classmethod
+    def validate_and_normalize_log_level(cls, v: Union[int, str]) -> int:
+        """Converts string log levels to their integer equivalents and validates them."""
+        
+        log_level_map = {
+            'DEBUG': 10,
+            'INFO': 20,
+            'WARNING': 30,
+            'ERROR': 40,
+            'CRITICAL': 50
+        }
+        
+        if isinstance(v, str):
+            upper_v = v.upper()
+            if upper_v in log_level_map:
+                return log_level_map[upper_v]
+            raise ValueError(f"Invalid log level string: '{v}'. Must be one of {list(log_level_map.keys())}")
+        
+        if isinstance(v, int):
+            if v in log_level_map.values():
+                return v
+            raise ValueError(f"Invalid log level integer: {v}. Must be one of {list(log_level_map.values())}")
+        
+        raise TypeError(f"log_level must be a string or an integer, not {type(v).__name__}")
 
+# ======================================================================================
+# Preprocessing Configurations
+# ======================================================================================
 
-# === Preprocessing Configurations ===
 class NormalizationConfig(BaseModel):
     """
     Defines rules for cleaning and standardizing entity names before matching.
     
     This preprocessing step is crucial for matching variations of the same entity.
-    It handles common abbreviations, misspelllings, and removes legal suffixes that
-    don't contribute to entity identity. All operations are GPU-accelerated using cuDF.
+    It handles common abbreviations and removes "noise" terms like legal suffixes
+    that often don't contribute to the core identity of an entity. All operations
+    are GPU-accelerated using cuDF string methods for high performance.
     """
     model_config = ConfigDict(extra='forbid')
     
     replacements: Dict[str, str] = Field(
         default_factory=lambda: {
-            # Common misspellings
-            "traiier": "trailer",
-            # Abbreviations to expand
-            "rpr": "repair",
-            "svcs": "service",
             "svc": "service",
-            "ctr": "center",
-            "ctrs": "centers", 
-            "cntr": "center",
-            "trk": "truck",
-            "auto": "automotive",
-            "auth": "authorized",
-            "dist": "distribution",
-            "mfg": "manufacturing",
-            "mfr": "manufacturing",
+            "svcs": "services",
             "equip": "equipment",
-            "natl": "national",
-            "mgmt": "management",
-            "assoc": "associates"
+            "mfg": "manufacturing",
+            "dist": "distribution"
         },
         description=(
             "A dictionary mapping common abbreviations, acronyms, or misspellings to their "
-            "standardized forms. This operation is case-insensitive because it is applied "
+            "standardized forms. This operation is case-insensitive as it is applied "
             "AFTER the entire string has been converted to lowercase. "
             "Example: Both 'Svc' and 'SVC' will become 'service'."
         )
@@ -250,696 +421,1011 @@ class NormalizationConfig(BaseModel):
     
     suffixes_to_remove: Set[str] = Field(
         default_factory=lambda: {
-            # Legal entity types
-            "inc", "incorporated", "llc", "ll", "lp", "llp", 
-            "ltd", "limited", "corp", "corporation", "co", "company",
-            "plc", "pllc", "pa", "pc", "sc",
-            # Doing Business As indicators
-            "dba", "fka", "aka", "etal", "et al",
-            # Geographic/scope indicators
-            "international", "intl", "usa", "america", "us",
-            # Organizational structure
-            "group", "grp", "holdings", "ent"
+            # Standard legal entity types
+            "inc", "incorporated", "llc", "l l c", "limited liability company",
+            "lp", "l p", "llp", "l l p", "ltd", "limited", "corp", "corporation",
+            "co", "company", "plc", "pc", "pllc",
+            # Common business indicators
+            "group", "holding", "holdings", "associates", "partners", "sons",
+            # Common "Doing Business As" indicators
+            "dba", "fka", "aka", "c o", "o b o"
         },
         description=(
             "A set of common legal and organizational suffixes to remove from entity names. "
-            "Removal is case-insensitive and happens after custom replacements. The pattern "
-            "is designed to remove these terms when they appear as whole words, regardless "
-            "of their position in the string. "
-            "Example: Both 'Acme Corp LLC' and 'Acme Corp, a subsidiary' become 'acme'."
+            "Removal is case-insensitive and happens after custom replacements. The logic "
+            "removes these terms only when they appear as whole words. "
+            "Example: 'Acme Corp LLC' becomes 'acme'."
         )
     )
 
-# === Modeling Stage Configurations ===
+    @field_validator('replacements')
+    @classmethod
+    def validate_and_clean_replacements(cls, v: Dict[str, str]) -> Dict[str, str]:
+        """Ensures replacement keys/values are clean, lowercase, non-empty strings."""
+        cleaned_replacements = {}
+        for key, value in v.items():
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError(f"Replacement dictionary key must be a non-empty string, but got: '{key}'")
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Replacement dictionary value for key '{key}' must be a non-empty string, but got: '{value}'")
+            
+            cleaned_key = key.lower().strip()
+            cleaned_value = value.lower().strip()
+            
+            if not cleaned_key or not cleaned_value:
+                 raise ValueError("Replacement keys and values cannot be empty after stripping whitespace.")
+            
+            cleaned_replacements[cleaned_key] = cleaned_value
+        return cleaned_replacements
+
+    @field_validator('suffixes_to_remove')
+    @classmethod
+    def validate_and_clean_suffixes(cls, v: Set[str]) -> Set[str]:
+        """Ensures all suffixes are clean, lowercase, non-empty strings."""
+        cleaned_suffixes = set()
+        for item in v:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(f"Each item in `suffixes_to_remove` must be a non-empty string, but got: '{item}'")
+            
+            cleaned_item = item.lower().strip()
+            if not cleaned_item:
+                raise ValueError("Suffixes cannot be empty after stripping whitespace.")
+
+            cleaned_suffixes.add(cleaned_item)
+        return cleaned_suffixes
+
+    @model_validator(mode='after')
+    def check_replacement_suffix_overlap(self) -> 'NormalizationConfig':
+        """
+        Ensures that no term exists in both replacements and suffixes_to_remove.
+
+        A term cannot be both replaced and removed, as this creates ambiguity in the
+        preprocessing pipeline. This validator prevents such logical conflicts in the
+        configuration, forcing a clear choice for each normalization term.
+        """
+        replacement_keys = set(self.replacements.keys())
+        overlap = replacement_keys.intersection(self.suffixes_to_remove)
+        
+        if overlap:
+            raise ValueError(
+                "The following terms were found in both `replacements` and `suffixes_to_remove`, "
+                f"which is not allowed: {sorted(list(overlap))}. Please specify each term "
+                "in only one of the two configurations."
+            )
+        return self
+
+# ======================================================================================
+# Typed Sub-Models for Vectorizer Configuration
+# ======================================================================================
+
+class TfidfParams(BaseModel):
+    """Parameters for the cuML TfidfVectorizer, which converts text into a matrix of TF-IDF features."""
+    model_config = ConfigDict(extra='forbid', arbitrary_types_allowed=True)
+    analyzer: Literal["char", "word", "char_wb"] = Field(
+        default="char",
+        description="Level at which to generate features. 'char' is robust to typos. "
+                    "'char_wb' is similar but only creates n-grams from text inside word boundaries. "
+                    "The cuML TfidfVectorizer has had bugs with 'char_wb', so we default to 'char'"
+    )
+    ngram_range: Tuple[int, int] = Field(
+        default=(3, 5),
+        description="Range of n-gram sizes to extract. E.g., (3, 5) extracts 3-grams, 4-grams, and 5-grams."
+    )
+    max_features: Optional[int] = Field(
+        default=10000, gt=0,
+        description="Build a vocabulary that only considers the top `max_features` ordered by term frequency."
+    )
+    min_df: int = Field(
+        default=2, ge=1,
+        description="Minimum document frequency. A feature must appear in at least this many documents to be included."
+    )
+    sublinear_tf: bool = Field(
+        default=True,
+        description="Apply sublinear TF scaling (replaces tf with log(tf)). Dampens the effect of very frequent terms."
+    )
+    dtype: Any = Field(
+        default="float64",
+        description="Data type for the output matrix. 'float32' saves GPU memory, 'float64' offers more precision."
+    )
+
+    _validate_dtype_str: classmethod = field_validator('dtype', mode='before')(_validate_dtype_string)
+    _convert_to_dtype: classmethod = field_validator('dtype', mode='after')(_convert_string_to_dtype)
+
+    @field_validator('ngram_range')
+    @classmethod
+    def validate_ngram_range(cls, v: Tuple[int, int]) -> Tuple[int, int]:
+        """Ensures the n-gram range is logically ordered and contains positive integers."""
+        low, high = v
+        if not (isinstance(low, int) and isinstance(high, int) and low > 0 and high > 0):
+            raise ValueError("ngram_range values must be positive integers.")
+        if low > high:
+            raise ValueError(f"In ngram_range, the lower bound ({low}) cannot be greater than the upper bound ({high}).")
+        return v
+
+class TfidfSvdParams(BaseModel):
+    """
+    Parameters for the custom GPUTruncatedSVD on TF-IDF features. 
+    SVD is excellent for topic modeling and latent semantic analysis.
+    """
+    model_config = ConfigDict(extra='forbid')
+    n_components: int = Field(
+        default=512, 
+        gt=0, 
+        description="The target number of dimensions for the reduced data."
+    )
+    tol: float = Field(
+        default=1.0e-7, 
+        gt=0, 
+        description="Tolerance for the SVD solver's convergence. Smaller is more precise but slower."
+    )
+    ncv: Optional[int] = Field(
+        default=None, 
+        gt=0, 
+        description="Number of Lanczos vectors. Controls memory usage and convergence speed."
+    )
+    maxiter: Optional[int] = Field(
+        default=None, 
+        gt=0, 
+        description="Maximum number of iterations for the SVD solver."
+    )
+    
+    @model_validator(mode='after')
+    def set_and_validate_ncv(self) -> 'TfidfSvdParams':
+        """Sets a robust default for `ncv` if not provided and ensures it's valid."""
+        if self.ncv is None:
+            # Set a robust default ncv based on n_components, capped to avoid excessive memory use.
+            self.ncv = min(max(2 * self.n_components + 1, 32), 4096)
+        
+        if self.ncv <= self.n_components:
+            raise ValueError(
+                f"`ncv` ({self.ncv}) must be strictly greater than `n_components` "
+                f"({self.n_components}) for the underlying ARPACK SVD solver to function correctly."
+            )
+        return self
+
+class TfidfPcaParams(BaseModel):
+    """
+    Parameters for cuML PCA on TF-IDF features. PCA is effective at finding 
+    directions of maximum variance.
+    """
+    model_config = ConfigDict(extra='forbid')
+    n_components: int = Field(
+        default=128, 
+        gt=0, 
+        description="The target number of dimensions for the reduced data."
+    )
+
+class PhoneticParams(BaseModel):
+    """
+    Parameters for the cuML CountVectorizer on phonetic codes, creating a 
+    feature space based on how words sound.
+    """
+    model_config = ConfigDict(extra='forbid')
+    analyzer: Literal["word"] = Field(
+        default="word", 
+        description="Must be 'word' to treat each phonetic code as a distinct token."
+    )
+    binary: bool = Field(
+        default=True, 
+        description="If True, all non-zero counts are set to 1. Measures presence, not frequency."
+    )
+    max_features: Optional[int] = Field(
+        default=2000, 
+        gt=0, 
+        description="Maximum number of unique phonetic codes to consider."
+    )
+
+class PhoneticSvdParams(BaseModel):
+    """Parameters for GPUTruncatedSVD on phonetic features."""
+    model_config = ConfigDict(extra='forbid')
+    n_components: int = Field(
+        default=256, 
+        gt=0, 
+        description="Target dimensionality. Phonetic space is usually less complex than TF-IDF."
+    )
+
+class PhoneticPcaParams(BaseModel):
+    """Parameters for cuML PCA on phonetic features."""
+    model_config = ConfigDict(extra='forbid')
+    n_components: int = Field(
+        default=160, 
+        gt=0, 
+        description="Target dimensionality for the PCA reduction stage."
+    )
+
+class SimilarityTfidfParams(TfidfParams): # Inherits validation
+    """
+    Parameters for the fallback TF-IDF model, used for high-precision 
+    pairwise string similarity checks.
+    """
+    norm: Literal["l1", "l2", None] = Field(
+        default="l2", 
+        description="Vector normalization type. 'l2' (Euclidean) is standard for cosine similarity."
+    )
+    max_features: Optional[int] = Field(
+        default=50000, 
+        gt=0, 
+        description="Uses a larger vocabulary for more granular similarity comparisons."
+    )
+
+class SimilarityNnParams(BaseModel):
+    """
+    Parameters for the fallback cuML NearestNeighbors model, used to find 
+    the most similar candidates for unassigned entities.
+    """
+    model_config = ConfigDict(extra='forbid')
+    n_neighbors: int = Field(
+        default=24, 
+        gt=0, 
+        description="Number of nearest neighbors to find for each entity."
+    )
+    metric: Literal["cosine", "euclidean", "manhattan", "minkowski"] = Field(
+        default="cosine", 
+        description="'cosine' is ideal for comparing TF-IDF vectors."
+    )
+
+# ======================================================================================
+# Main Vectorizer Configuration
+# ======================================================================================
 
 class VectorizerConfig(BaseModel):
     """
     Parameters for GPU-accelerated feature extraction and dimensionality reduction.
     
     The vectorizer creates multiple complementary representations (streams) of each entity:
-    - TF-IDF: Captures character-level patterns and spelling variations (using cuML)
-    - Phonetic: Captures how names sound, helping match phonetically similar entities
-    - Semantic: Captures meaning using transformer embeddings (GPU-accelerated)
+    - TF-IDF: Captures character-level patterns and spelling variations (syntactic similarity).
+    - Phonetic: Captures how names sound, helping match phonetically similar entities.
+    - Semantic: Captures meaning using transformer embeddings (semantic similarity).
     
-    These streams are combined to create a rich representation for clustering.
-    All operations use RAPIDS (cuML, cuDF, cuPy) for GPU acceleration.
+    These streams are combined to create a rich, multi-faceted representation that is
+    then used for clustering. All operations leverage RAPIDS (cuML, cuDF, cuPy).
     """
     model_config = ConfigDict(extra='forbid')
     
-    # === Feature Stream Selection ===
-    encoders: List[Literal['tfidf', 'phonetic', 'semantic']] = Field(
-        default_factory=lambda: ['tfidf', 'phonetic', 'semantic'],
-        description=(
-            "List of feature extraction methods to use. Each creates a different view of the data:\n"
-            "- 'tfidf': Character n-gram features for spelling similarity (GPU-accelerated with cuML)\n"
-            "- 'phonetic': Sound-based encoding for phonetic matching\n"
-            "- 'semantic': Transformer embeddings for meaning similarity (GPU-accelerated)\n"
-            "Using all three provides the best accuracy but increases computation time."
-        )
+    # --- Feature Stream Selection ---
+    encoders: Set[Literal['tfidf', 'phonetic', 'semantic']] = Field(
+        default_factory=lambda: {'tfidf', 'phonetic', 'semantic'},
+        min_length=1,
+        description="Set of feature extraction methods to use. Using multiple streams "
+                    "provides a more robust and accurate representation of the data."
     )
     
-    sparse_reducers: List[Literal['svd', 'pca']] = Field(
-        default_factory=lambda: ['svd', 'pca'],
-        description=(
-            "Dimensionality reduction techniques applied to sparse feature matrices:\n"
-            "- 'svd': Custom GPUTruncatedSVD using cupyx.scipy.sparse.linalg.svds\n"
-            "- 'pca': cuML PCA (requires dense conversion but captures more variance)\n"
-            "Both are applied and their results concatenated for richer representations."
-        )
+    sparse_reducers: Set[Literal['svd', 'pca']] = Field(
+        default_factory=lambda: {'svd'},
+        min_length=1,
+        description="Dimensionality reduction techniques to apply to sparse feature "
+                    "matrices (TF-IDF and Phonetic). 'svd' is generally faster and "
+                    "more memory-efficient for sparse data than 'pca'."
     )
     
     use_address_in_encoding: bool = Field(
         default=True,
-        description=(
-            "If True, concatenates the normalized address to the entity name for TF-IDF encoding. "
-            "This helps distinguish entities with similar names but different locations. "
-            "Has no effect on phonetic or semantic streams."
-        )
+        description="If True, concatenates the normalized address to the entity name "
+                    "for TF-IDF encoding. Helps distinguish entities with similar names "
+                    "but different locations. Does not affect phonetic or semantic streams."
     )
     
-    # === Spectral Preprocessing ===
+    # --- Spectral Preprocessing ---
     damping_beta: float = Field(
-        default=0.4, 
-        ge=0.0, 
-        le=1.0,
-        description=(
-            "Controls spectral damping (variance normalization) strength:\n"
-            "- 0.0: No damping (preserve original variance structure)\n"
-            "- 1.0: Full whitening (all features have equal variance)\n"
-            "- 0.3-0.5: Balanced damping (recommended)\n"
-            "Helps prevent dominant features from overshadowing others."
-        )
+        default=0.4, ge=0.0, le=1.0,
+        description="Controls spectral damping (variance normalization) strength. "
+                    "0.0 means no damping, 1.0 means full whitening. A value "
+                    "between 0.3-0.5 is recommended to prevent dominant features from "
+                    "overshadowing others while preserving important variance."
     )
     
     epsilon: float = Field(
-        default=1.0e-8, 
-        gt=0,
-        description=(
-            "Small constant added to denominators to prevent division by zero. "
-            "Should be much smaller than your data scale (typically 1.0e-8 to 1.0e-10)."
-        )
+        default=1.0e-8, gt=0,
+        description="A small constant added to denominators during normalization to "
+                    "prevent division-by-zero errors, ensuring numerical stability."
     )
     
-    # === Semantic Stream Configuration ===
+    # --- Semantic Stream Configuration ---
     semantic_model: str = Field(
-        default='BAAI/bge-base-en-v1.5', 
-        min_length=1,
-        description=(
-            "HuggingFace sentence-transformer model for semantic encoding. "
-            "Should be a model name from https://huggingface.co/sentence-transformers. "
-            "The model is loaded on GPU for accelerated inference. Examples:\n"
-            "- 'all-mpnet-base-v2': General purpose, 768 dims (good default)\n"
-            "- 'all-MiniLM-L6-v2': Faster, 384 dims (for speed)\n"
-            "- 'BAAI/bge-base-en-v1.5': High quality, 768 dims (for accuracy)"
-        )
+        default='BAAI/bge-base-en-v1.5', min_length=1,
+        description="HuggingFace sentence-transformer model for semantic encoding. The "
+                    "model is downloaded on first use and loaded onto the GPU for "
+                    "high-throughput inference."
     )
     
     semantic_batch_size: int = Field(
-        default=1024, 
-        gt=0,
-        description=(
-            "Batch size for GPU semantic encoding. Larger values are faster but use more GPU memory. "
-            "Adjust based on GPU memory: 256-512 for small GPUs, 1024-2048 for large GPUs."
-        )
+        default=1024, gt=0,
+        description="Batch size for GPU semantic encoding. Adjust based on available "
+                    "GPU memory (VRAM). Larger is faster but uses more VRAM."
     )
     
-    # === TF-IDF Stream Configuration ===
-    tfidf_params: Dict[str, Any] = Field(
-        default_factory=lambda: {
-            "analyzer": "char",
-            "ngram_range": [3, 5],
-            "max_features": 10000,
-            "min_df": 2,
-            "sublinear_tf": True,
-            "dtype": "float64",
-        },
-        description=(
-            "Parameters passed to cuML's TfidfVectorizer (GPU-accelerated):\n"
-            "- analyzer: 'char' for character n-grams, 'word' for word n-grams\n"
-            "- ngram_range: [min_n, max_n] size of n-grams to extract\n"
-            "- max_features: Maximum number of features (vocabulary size)\n"
-            "- min_df: Minimum document frequency for a feature\n"
-            "- sublinear_tf: Use log(TF) instead of raw TF\n"
-            "- dtype: Data type for the matrix ('float32' saves GPU memory, 'float64' is more precise)"
-        )
+    # --- TF-IDF Stream Configuration ---
+    tfidf_params: TfidfParams = Field(
+        default_factory=TfidfParams, 
+        description="Base parameters for TF-IDF vectorization."
+    )
+    tfidf_svd_params: TfidfSvdParams = Field(
+        default_factory=TfidfSvdParams, 
+        description="SVD parameters for TF-IDF features."
+    )
+    tfidf_pca_params: TfidfPcaParams = Field(
+        default_factory=TfidfPcaParams, 
+        description="PCA parameters for TF-IDF features."
     )
     
-    tfidf_svd_params: Dict[str, Any] = Field(
-        default_factory=lambda: {
-            'n_components': 1536,
-            'tol': 1.0e-7,
-            'ncv': 6144,
-            'maxiter': 100000
-        },
-        description=(
-            "Parameters for custom GPUTruncatedSVD (handles sparse matrices on GPU):\n"
-            "- n_components: Number of dimensions to reduce to (typically 512-2048)\n"
-            "- tol: Convergence tolerance for cupyx.scipy.sparse.linalg.svds\n"
-            "- ncv: Number of Lanczos vectors for svds (should be > n_components)\n"
-            "- maxiter: Maximum iterations for svds convergence\n"
-            "Note: This uses a custom implementation since cuML doesn't support sparse matrices"
-        )
-    )
-    
-    tfidf_pca_params: Dict[str, Any] = Field(
-        default_factory=lambda: {'n_components': 1024},
-        description=(
-            "Parameters for cuML PCA applied to TF-IDF features:\n"
-            "- n_components: Target dimensionality (typically 256-1024)\n"
-            "Note: PCA will automatically receive random_state from global config"
-        )
-    )
-    
-    # === Phonetic Stream Configuration ===
+    # --- Phonetic Stream Configuration ---
     phonetic_max_words: int = Field(
-        default=5, 
-        ge=1,
-        le=10,
-        description=(
-            "Maximum number of words from entity name to encode phonetically. "
-            "Using more words increases accuracy but also computation time. "
-            "Typically 3-5 words capture the most important parts of a name."
-        )
+        default=10, ge=1, le=20,
+        description="Maximum number of words from the start of an entity name to use "
+                    "for phonetic encoding. Capping this can improve performance with long names."
+    )
+    phonetic_params: PhoneticParams = Field(
+        default_factory=PhoneticParams, 
+        description="Base parameters for phonetic vectorization."
+    )
+    phonetic_svd_params: PhoneticSvdParams = Field(
+        default_factory=PhoneticSvdParams, 
+        description="SVD parameters for phonetic features."
+    )
+    phonetic_pca_params: PhoneticPcaParams = Field(
+        default_factory=PhoneticPcaParams, 
+        description="PCA parameters for phonetic features."
     )
     
-    phonetic_params: Dict[str, Any] = Field(
-        default_factory=lambda: {
-            'analyzer': 'word',
-            'binary': True,
-            'max_features': 2000
-        },
-        description=(
-            "Parameters for CountVectorizer on phonetic codes (GPU-accelerated with cuML):\n"
-            "- analyzer: Should be 'word' to treat each phonetic code as a token\n"
-            "- binary: If True, use presence/absence rather than counts\n"
-            "- max_features: Maximum vocabulary size for phonetic codes"
-        )
-    )
-    
-    phonetic_svd_params: Dict[str, Any] = Field(
-        default_factory=lambda: {'n_components': 256},
-        description=(
-            "GPUTruncatedSVD parameters for phonetic features. Typically needs fewer components "
-            "than TF-IDF since phonetic features are less complex."
-        )
-    )
-    
-    phonetic_pca_params: Dict[str, Any] = Field(
-        default_factory=lambda: {'n_components': 160},
-        description=(
-            "cuML PCA parameters for phonetic features. Further reduces dimensionality "
-            "after SVD for a compact phonetic representation."
-        )
-    )
-    
-    # === Stream Balancing Configuration ===
+    # --- Stream Balancing Configuration ---
     stream_proportions: Dict[Literal['semantic', 'tfidf', 'phonetic'], float] = Field(
         default_factory=lambda: {
             'semantic': 0.45,
             'tfidf': 0.45,
             'phonetic': 0.10
         },
-        description=(
-            "Relative importance weights for each feature stream. Must sum to 1.0.\n"
-            "These control how much each stream contributes to the final representation:\n"
-            "- semantic: Weight for meaning-based features (0.3-0.5 typical)\n"
-            "- tfidf: Weight for spelling-based features (0.3-0.5 typical)\n"
-            "- phonetic: Weight for sound-based features (0.1-0.2 typical)\n"
-            "Adjust based on your data characteristics."
-        )
+        description="Relative importance weights for each active feature stream. These "
+                    "control how much each stream contributes to the final representation. "
+                    "Must sum to 1.0 and only contain keys for active encoders."
     )
     
-    # === String Similarity Fallback Configuration ===
-    similarity_tfidf: Dict[str, Any] = Field(
-        default_factory=lambda: {
-            'analyzer': 'char',
-            'ngram_range': [3, 5],
-            'min_df': 2,
-            'sublinear_tf': True,
-            'norm': 'l2',
-            'max_features': 50000
-        },
-        description=(
-            "TF-IDF parameters for the string similarity fallback matcher (cuML). "
-            "Used when entities can't be confidently assigned to clusters. "
-            "Typically uses more features than the main TF-IDF for higher precision."
-        )
+    # --- String Similarity Fallback Configuration ---
+    similarity_tfidf: SimilarityTfidfParams = Field(
+        default_factory=SimilarityTfidfParams, 
+        description="TF-IDF settings for the high-precision fallback similarity matcher."
     )
-    
-    similarity_nn: Dict[str, Any] = Field(
-        default_factory=lambda: {
-            'n_neighbors': 24,
-            'metric': 'cosine'
-        },
-        description=(
-            "cuML nearest neighbor search parameters for similarity fallback:\n"
-            "- n_neighbors: Number of similar entities to retrieve (10-50 typical)\n"
-            "- metric: Distance metric ('cosine' for normalized, 'euclidean' for raw)"
-        )
+    similarity_nn: SimilarityNnParams = Field(
+        default_factory=SimilarityNnParams, 
+        description="Nearest neighbor settings for the fallback similarity matcher."
     )
 
-    # === SVD Eigsh Fallback Configuration ===
+    # --- SVD Eigsh Fallback Configuration ---
     eigsh_fallback_params: SvdEigshFallbackConfig = Field(
         default_factory=SvdEigshFallbackConfig,
-        description="Parameters for the robust SVD fallback mechanism used when the standard solver fails."
+        description="Parameters for the robust SVD fallback mechanism, used only if the primary solver fails."
     )
 
-    @field_validator('stream_proportions')
-    @classmethod
-    def validate_proportions_sum(cls, v: Dict[str, float]) -> Dict[str, float]:
-        """Ensures stream proportions sum to 1.0 within floating point tolerance."""
-        total = sum(v.values())
+    @model_validator(mode='after')
+    def validate_stream_proportions(self) -> 'VectorizerConfig':
+        """
+        Ensures stream_proportions are consistent with the selected encoders and sum to 1.0.
+
+        This critical validation step prevents logical errors where the weights for feature
+        streams do not match the streams that are actually enabled, ensuring the final
+        feature combination is correctly weighted.
+        """
+        active_encoders = self.encoders
+        proportion_keys = set(self.stream_proportions.keys())
+
+        if active_encoders != proportion_keys:
+            raise ValueError(
+                "The keys in `stream_proportions` must exactly match the values in `encoders`.\n"
+                f"Currently enabled encoders: {sorted(list(active_encoders))}\n"
+                f"Proportion keys provided: {sorted(list(proportion_keys))}"
+            )
+        
+        total = sum(self.stream_proportions.values())
         if abs(total - 1.0) > 1.0e-6:
             raise ValueError(
-                f"stream_proportions must sum to 1.0, but got {total:.6f}. "
-                f"Current values: {v}"
+                f"The values in `stream_proportions` must sum to 1.0, but got {total:.6f} for values: "
+                f"{self.stream_proportions}"
             )
-        return v
+        
+        return self
     
-    @field_validator('tfidf_params', mode='before')
+    @model_validator(mode='after')
+    def validate_sparse_reducer_logic(self) -> 'VectorizerConfig':
+        """
+        Ensures the sparse reducer configuration is logically valid.
+
+        Rules enforced:
+        1. 'svd' must always be present, as it is the primary reducer and is
+           required to densify the matrix before PCA can be run.
+        2. If 'pca' is used, its `n_components` must be less than the `n_components`
+           of the preceding 'svd' step, as it is a further dimensionality reduction.
+        """
+        # Rule 1: 'svd' is mandatory for sparse reduction.
+        if 'svd' not in self.sparse_reducers:
+            raise ValueError(
+                "`sparse_reducers` must always include 'svd'. It is the primary reducer "
+                "for sparse matrices and is required before PCA can be applied."
+            )
+
+        # Rule 2: If using PCA, ensure its dimensionality is less than SVD's.
+        if 'pca' in self.sparse_reducers:
+            # --- Check TF-IDF dimensionality chain ---
+            svd_dims_tfidf = self.tfidf_svd_params.n_components
+            pca_dims_tfidf = self.tfidf_pca_params.n_components
+            if svd_dims_tfidf <= pca_dims_tfidf:
+                raise ValueError(
+                    "When using PCA on TF-IDF features, `tfidf_svd_params.n_components` "
+                    f"({svd_dims_tfidf}) must be strictly greater than `tfidf_pca_params.n_components` "
+                    f"({pca_dims_tfidf}) because PCA reduces the output of SVD."
+                )
+
+            # --- Check Phonetic dimensionality chain ---
+            svd_dims_phonetic = self.phonetic_svd_params.n_components
+            pca_dims_phonetic = self.phonetic_pca_params.n_components
+            if svd_dims_phonetic <= pca_dims_phonetic:
+                raise ValueError(
+                    "When using PCA on phonetic features, `phonetic_svd_params.n_components` "
+                    f"({svd_dims_phonetic}) must be strictly greater than `phonetic_pca_params.n_components` "
+                    f"({pca_dims_phonetic}) because PCA reduces the output of SVD."
+                )
+        
+        return self
+
+# ======================================================================================
+# Typed Sub-Models for Clusterer Configuration
+# ======================================================================================
+
+class UmapParams(BaseModel):
+    """
+    Base parameters for the cuML UMAP algorithm, which performs non-linear manifold learning.
+    """
+    model_config = ConfigDict(extra='forbid')
+    n_neighbors: int = Field(
+        default=15, 
+        gt=0, 
+        description="Size of the local neighborhood. Larger values preserve more global structure."
+    )
+    n_components: int = Field(
+        default=48, 
+        gt=0, 
+        description="The target dimensionality of the embedded space."
+    )
+    min_dist: float = Field(
+        default=0.05, 
+        ge=0.0, 
+        lt=1.0, 
+        description="Minimum distance between embedded points. Lower values create tighter clusters."
+    )
+    spread: float = Field(
+        default=0.5, 
+        gt=0.0, 
+        description="The effective scale of the embedded points. Determines how far apart clusters are."
+    )
+    metric: Literal["cosine", "euclidean", "manhattan", "minkowski"] = Field(
+        default="cosine", 
+        description="The distance metric to use."
+    )
+    init: Literal["spectral", "random"] = Field(
+        default="spectral", 
+        description="Initialization method. 'spectral' is more deterministic."
+    )
+    n_epochs: int = Field(
+        default=400, 
+        gt=0, 
+        description="Number of training epochs. More epochs can lead to a better embedding but take longer."
+    )
+    negative_sample_rate: int = Field(
+        default=7, 
+        ge=0, 
+        description="Number of negative samples per positive sample. Higher values increase optimization accuracy."
+    )
+    repulsion_strength: float = Field(
+        default=1.0, 
+        ge=0.0, 
+        description="Weighting of repulsive forces in the embedding. Higher values push points apart more."
+    )
+    learning_rate: float = Field(
+        default=0.5, 
+        gt=0.0, 
+        description="The initial learning rate for the optimization algorithm."
+    )
+
+    @model_validator(mode='after')
+    def validate_spread_vs_min_dist(self) -> 'UmapParams':
+        """Ensures that `spread` is strictly greater than `min_dist`, a requirement for UMAP."""
+        if self.spread <= self.min_dist:
+            raise ValueError(
+                f"UMAP parameter `spread` ({self.spread}) must be strictly greater than `min_dist` ({self.min_dist})."
+            )
+        return self
+
+class UmapEnsembleSamplingConfig(BaseModel):
+    """
+    Parameter ranges for creating a robust UMAP ensemble by training multiple models with randomized hyperparameters.
+    """
+    model_config = ConfigDict(extra='forbid')
+    local_view_ratio: float = Field(
+        default=0.7, 
+        ge=0.0, 
+        le=1.0, 
+        description="Fraction of UMAP runs that will focus on local structure by using the 'local' n_neighbors range."
+    )
+    n_neighbors_local: Tuple[int, int] = Field(
+        default=(10, 35), 
+        description="[min, max] range for `n_neighbors` for local-focused UMAP runs."
+    )
+    n_neighbors_global: Tuple[int, int] = Field(
+        default=(40, 70), 
+        description="[min, max] range for `n_neighbors` for global-focused UMAP runs."
+    )
+    min_dist: Tuple[float, float] = Field(
+        default=(0.0, 0.15), 
+        description="[min, max] range to sample `min_dist` from."
+    )
+    spread: Tuple[float, float] = Field(
+        default=(0.5, 2.0), 
+        description="[min, max] range to sample `spread` from."
+    )    
+    n_epochs: Tuple[int, int] = Field(
+        default=(200, 500), 
+        description="[min, max] range to sample `n_epochs` from."
+    )
+    learning_rate: Tuple[float, float] = Field(
+        default=(0.5, 1.5), 
+        description="[min, max] range to sample `learning_rate` from."
+    )
+    repulsion_strength: Tuple[float, float] = Field(
+        default=(0.5, 1.5), 
+        description="[min, max] range to sample `repulsion_strength` from."
+    )
+    negative_sample_rate: Tuple[int, int] = Field(
+        default=(5, 20), 
+        description="[min, max] range to sample `negative_sample_rate` from."
+    )
+    init_strategies: List[Literal["spectral", "random"]] = Field(
+        default_factory=lambda: ["spectral", "random"], 
+        description="List of initialization strategies to sample from."
+    )
+
+    @field_validator('*')
     @classmethod
-    def validate_tfidf_dtype_string(cls, v: Dict[str, Any]) -> Dict[str, Any]:
-        """Validates that the dtype in tfidf_params is a valid string."""
-        if 'dtype' in v:
-            dtype_str = v['dtype']
-            if not isinstance(dtype_str, str):
-                raise TypeError(f"tfidf_params['dtype'] must be a string, but got {type(dtype_str)}")
-            try:
-                cupy.dtype(dtype_str)
-            except TypeError:
-                raise ValueError(f"'{dtype_str}' is not a valid cupy dtype name for tfidf_params.")
+    def validate_range_logic(cls, v: Any, field_info) -> Any:
+        """Generic validator to ensure that for any tuple `(min, max)`, `min <= max`."""
+        if isinstance(v, tuple) and len(v) == 2:
+            low, high = v
+            if low > high:
+                raise ValueError(f"In parameter range for '{field_info.field_name}', the lower bound ({low}) cannot be greater than the upper bound ({high}).")
         return v
 
-    @field_validator('tfidf_params', mode='after')
-    @classmethod
-    def convert_tfidf_dtype(cls, v: Dict[str, Any]) -> Dict[str, Any]:
-        """Converts the validated dtype string in tfidf_params to a cupy.dtype object."""
-        if 'dtype' in v:
-            v['dtype'] = cupy.dtype(v['dtype'])
-        return v
+    @model_validator(mode='after')
+    def validate_neighbor_ranges(self) -> 'UmapEnsembleSamplingConfig':
+        """Ensures the local and global n_neighbors ranges are distinct and do not overlap."""
+        local_min, local_max = self.n_neighbors_local
+        global_min, global_max = self.n_neighbors_global
+        if local_max >= global_min:
+            raise ValueError(
+                f"The `n_neighbors_local` range [{local_min}, {local_max}] must not overlap with "
+                f"the `n_neighbors_global` range [{global_min}, {global_max}]. "
+                f"The max of local must be less than the min of global."
+            )
+        return self
 
+class HdbscanParams(BaseModel):
+    """
+    Parameters for the cuML HDBSCAN clustering algorithm, a density-based algorithm excellent for discovering clusters of varying shapes.
+    """
+    model_config = ConfigDict(extra='forbid')
+    min_cluster_size: int = Field(
+        default=2, 
+        ge=2, 
+        description="The minimum number of samples in a group for it to be considered a cluster."
+    )
+    min_samples: int = Field(
+        default=1, 
+        ge=1, 
+        description="Number of samples in a neighborhood for a point to be considered a core point."
+    )
+    cluster_selection_epsilon: float = Field(
+        default=0.0, 
+        ge=0.0, 
+        description="A distance threshold. Two clusters will be merged if they are closer than this value."
+    )
+    prediction_data: bool = Field(
+        default=True, 
+        description="Must be True to generate data needed for soft clustering probabilities and predicting new points."
+    )
+    alpha: float = Field(
+        default=0.9, 
+        gt=0.0, 
+        description="A parameter for scaling distance. Affects how density is measured."
+    )
+    cluster_selection_method: Literal["eom", "leaf"] = Field(
+        default="leaf", 
+        description="'leaf' selects smaller, more granular clusters. 'eom' (Excess of Mass) selects more stable, prominent clusters."
+    )
+
+class SnnClusteringParams(BaseModel):
+    """
+    Parameters for Shared Nearest Neighbor (SNN) graph clustering, performed with cuGraph. Often reveals different structural aspects than HDBSCAN.
+    """
+    model_config = ConfigDict(extra='forbid')
+    k_neighbors: int = Field(
+        default=48, 
+        gt=0, 
+        description="Number of neighbors to use when constructing the SNN graph."
+    )
+    louvain_resolution: float = Field(
+        default=0.60, 
+        gt=0.0, 
+        description="Resolution parameter for the Louvain community detection algorithm. Higher values lead to more, smaller communities."
+    )
+
+class NoiseAttachmentParams(BaseModel):
+    """
+    Parameters for the algorithm that attempts to assign noise points (outliers) from HDBSCAN to existing clusters.
+    """
+    model_config = ConfigDict(extra='forbid')
+    k_neighbors: int = Field(
+        default=15, 
+        gt=0, 
+        description="Number of neighbors to consider when checking for a potential cluster attachment."
+    )
+    similarity_threshold: float = Field(
+        default=0.82, 
+        ge=0.0, 
+        le=1.0, 
+        description="Minimum similarity score required to attach a noise point to a cluster."
+    )
+    min_neighbor_matches: int = Field(
+        default=2, 
+        ge=1, 
+        description="The noise point must have at least this many neighbors that belong to the same target cluster."
+    )
+    ambiguity_ratio_threshold: float = Field(
+        default=1.5, 
+        ge=1.0, 
+        description="A ratio to prevent ambiguous attachments. The score for the best cluster must be this much higher than the score for the second-best cluster."
+    )
+
+class EnsembleParams(BaseModel):
+    """
+    Parameters for the final ensembling logic that combines the results from HDBSCAN and SNN clustering to produce a final, stable set of clusters.
+    """
+    model_config = ConfigDict(extra='forbid')
+    purity_min: float = Field(
+        default=0.75, 
+        ge=0.0, 
+        le=1.0, 
+        description="Minimum purity score for a cluster to be accepted without further validation."
+    )
+    min_overlap: int = Field(
+        default=3, 
+        ge=1, 
+        description="Minimum number of shared entities required to consider two clusters (one from HDBSCAN, one from SNN) as representing the same group."
+    )
+    allow_new_snn_clusters: bool = Field(
+        default=True, 
+        description="If True, allows clusters found by SNN but not HDBSCAN to be included in the final result."
+    )
+    min_newcluster_size: int = Field(
+        default=4, 
+        ge=2, 
+        description="The minimum size for a new cluster introduced by SNN to be considered valid."
+    )
+    default_rescue_conf: float = Field(
+        default=0.60, 
+        ge=0.0, 
+        le=1.0, 
+        description="The default confidence score to assign to noise points that are 'rescued' and attached to a cluster."
+    )
+
+# ======================================================================================
+# Main Clusterer Configuration
+# ======================================================================================
 
 class ClustererConfig(BaseModel):
     """
     Configuration for GPU-accelerated manifold learning (UMAP) and clustering (HDBSCAN/SNN).
     
     This is the core of the entity resolution process. UMAP learns a low-dimensional
-    representation that preserves entity similarity, then clustering algorithms
-    group similar entities together. All operations use cuML for GPU acceleration.
+    representation that preserves entity similarity, then multiple clustering algorithms
+    (HDBSCAN and SNN) group similar entities together. A final ensemble step combines
+    these results for a robust final clustering. All operations use cuML and cuGraph
+    for maximum GPU acceleration.
     """
     model_config = ConfigDict(extra='forbid')
     
-    # === UMAP Ensemble Configuration ===
+    # --- UMAP Ensemble Configuration ---
     umap_n_runs: int = Field(
         default=12, 
-        ge=1,
-        le=50,
-        description=(
-            "Number of cuML UMAP models to train with different parameters. "
-            "Multiple runs with parameter variation improves robustness. "
-            "More runs = better quality but longer runtime. "
-            "Recommended: 3-5 for speed, 10-20 for quality, 30+ for production."
-        )
+        ge=1, 
+        le=50, 
+        description="Number of cuML UMAP models to train in the ensemble. More runs improve robustness but increase runtime."
+    )
+    umap_params: UmapParams = Field(
+        default_factory=UmapParams, 
+        description="Base parameters for each UMAP run."
+    )
+    umap_ensemble_sampling_config: UmapEnsembleSamplingConfig = Field(
+        default_factory=UmapEnsembleSamplingConfig, 
+        description="Hyperparameter ranges for the UMAP ensemble."
     )
     
-    umap_params: Dict[str, Any] = Field(
-        default_factory=lambda: {
-            "n_neighbors": 15,
-            "n_components": 48,
-            "min_dist": 0.05,
-            "spread": 0.5,
-            "metric": "cosine",
-            "init": "spectral",
-            "n_epochs": 400,
-            "negative_sample_rate": 7,
-            "repulsion_strength": 1.0,
-            "learning_rate": 0.5,
-        },
-        description=(
-            "Base cuML UMAP parameters (some will be randomized in ensemble):\n"
-            "- n_neighbors: Size of local neighborhood (5-50, higher preserves more global structure)\n"
-            "- n_components: Output dimensions (20-100, higher preserves more information)\n"
-            "- min_dist: Minimum distance between points (0-0.99, lower allows tighter clusters)\n"
-            "- spread: Scale of embedded points (must be > min_dist, typically 0.5-2.0)\n"
-            "- metric: Distance metric ('cosine' for normalized, 'euclidean' for raw)\n"
-            "- init: Initialization ('spectral' for deterministic, 'random' for stochastic)\n"
-            "- n_epochs: Training iterations (200-500 typical)\n"
-            "- negative_sample_rate: Negative sampling rate (5-20, higher prevents overfitting)\n"
-            "- repulsion_strength: Force between points (0.5-2.0, higher spreads clusters)\n"
-            "- learning_rate: Optimization step size (0.5-1.5 typical)"
-        )
-    )
-    
-    umap_ensemble_sampling_config: Dict[str, Any] = Field(
-        default_factory=lambda: {
-            'local_view_ratio': 0.7,
-            'n_neighbors_local': [10, 35],
-            'n_neighbors_global': [40, 70],
-            'min_dist': [0.0, 0.15],
-            'spread': [0.5, 2.0],
-            'n_epochs': [200, 500],
-            'learning_rate': [0.5, 1.5],
-            'repulsion_strength': [0.5, 1.5],
-            'negative_sample_rate': [5, 20],
-            'init_strategies': ['spectral', 'random']
-        },
-        description=(
-            "Parameter ranges for randomized UMAP ensemble:\n"
-            "- local_view_ratio: Fraction of models using local vs global neighborhoods\n"
-            "- n_neighbors_local: Range for local neighborhood models [min, max]\n"
-            "- n_neighbors_global: Range for global neighborhood models [min, max]\n"
-            "- min_dist: Range for minimum distance parameter\n"
-            "- spread: Range for spread parameter\n"
-            "- n_epochs: Range for training iterations\n"
-            "- learning_rate: Range for learning rate\n"
-            "- repulsion_strength: Range for repulsion force\n"
-            "- negative_sample_rate: Range for negative sampling\n"
-            "- init_strategies: Initialization methods to sample from"
-        )
-    )
-    
-    # === Consensus Embedding Configuration ===
+    # --- Consensus Embedding Configuration ---
     cosine_consensus_n_samples: int = Field(
         default=8192, 
-        ge=1000,
-        le=50000,
-        description=(
-            "Number of samples for kernel PCA consensus embedding (GPU-accelerated). "
-            "Higher values give better consensus but use more GPU memory. "
-            "Should be min(total_entities, 8192) for most datasets."
-        )
+        ge=1000, 
+        le=50000, 
+        description="Number of samples for kernel PCA consensus embedding. Higher values give better results but use more GPU memory."
     )
-    
     cosine_consensus_batch_size: int = Field(
         default=2048, 
-        ge=128,
-        le=8192,
-        description=(
-            "Batch size for GPU consensus embedding computation. "
-            "Larger batches are faster but use more GPU memory. "
-            "Adjust based on available VRAM."
-        )
+        ge=128, 
+        le=8192, 
+        description="Batch size for GPU consensus embedding computation. Adjust based on available VRAM."
     )
     
-    # === HDBSCAN Clustering Configuration ===
+    # --- HDBSCAN Clustering Configuration ---
     max_noise_rate_warn: float = Field(
         default=0.95, 
         ge=0.0, 
-        le=1.0,
-        description=(
-            "Threshold for warning about high noise rates in cuML HDBSCAN. "
-            "If more than this fraction of points are noise, a warning is issued. "
-            "High noise might indicate parameters need adjustment."
-        )
+        le=1.0, 
+        description="Threshold for warning about high noise rates in HDBSCAN. A high rate may indicate suboptimal UMAP parameters."
+    )
+    hdbscan_params: HdbscanParams = Field(
+        default_factory=HdbscanParams, 
+        description="Parameters for the primary HDBSCAN clustering algorithm."
     )
     
-    hdbscan_params: Dict[str, Any] = Field(
-        default_factory=lambda: {
-            'min_cluster_size': 2,
-            'min_samples': 1,
-            'cluster_selection_epsilon': 0.0,
-            'prediction_data': True,
-            'alpha': 0.9,
-            'cluster_selection_method': 'leaf'
-        },
-        description=(
-            "cuML HDBSCAN clustering parameters:\n"
-            "- min_cluster_size: Minimum size for a cluster (2+ for entity resolution)\n"
-            "- min_samples: Conservative parameter (usually 1 for ER)\n"
-            "- cluster_selection_epsilon: Distance threshold for cluster selection\n"
-            "- prediction_data: Generate data for soft clustering (keep True)\n"
-            "- alpha: Distance scaling parameter (0.8-1.0 typical)\n"
-            "- cluster_selection_method: 'leaf' for fine-grained, 'eom' for stable clusters"
-        )
+    # --- SNN (Shared Nearest Neighbor) Configuration ---
+    snn_clustering_params: SnnClusteringParams = Field(
+        default_factory=SnnClusteringParams, 
+        description="Parameters for the secondary SNN graph clustering algorithm."
+    )
+    noise_attachment_params: NoiseAttachmentParams = Field(
+        default_factory=NoiseAttachmentParams, 
+        description="Parameters for re-attaching HDBSCAN noise points to clusters."
     )
     
-    # === SNN (Shared Nearest Neighbor) Configuration ===
-    snn_clustering_params: Dict[str, Any] = Field(
-        default_factory=lambda: {
-            'k_neighbors': 48,
-            'louvain_resolution': 0.60
-        },
-        description=(
-            "SNN graph clustering parameters (GPU-accelerated with cugraph):\n"
-            "- k_neighbors: Number of neighbors for graph construction (30-100 typical)\n"
-            "- louvain_resolution: Community detection resolution (0.4-1.0, higher = smaller clusters)"
-        )
-    )
-    
-    noise_attachment_params: Dict[str, Any] = Field(
-        default_factory=lambda: {
-            'k_neighbors': 15,
-            'similarity_threshold': 0.82,
-            'min_neighbor_matches': 2,
-            'ambiguity_ratio_threshold': 1.5
-        },
-        description=(
-            "Parameters for attaching noise points to clusters:\n"
-            "- k_neighbors: Number of neighbors to check for attachment\n"
-            "- similarity_threshold: Similarity threshold for attachment (0.7-0.9 typical)\n"
-            "- min_neighbor_matches: Minimum shared neighbors required\n"
-            "- ambiguity_ratio_threshold: Ratio test for confident attachment"
-        )
-    )
-    
-    # === Cluster Merging Configuration ===
+    # --- Cluster Merging Configuration ---
     merge_median_threshold: float = Field(
         default=0.84, 
         ge=0.0, 
-        le=1.0,
-        description=(
-            "Minimum median similarity between clusters to consider merging. "
-            "Higher values = more conservative merging. "
-            "0.80-0.85 typical for entity resolution."
-        )
+        le=1.0, 
+        description="Minimum median similarity between two clusters to consider merging them."
     )
-    
     merge_max_threshold: float = Field(
         default=0.90, 
         ge=0.0, 
-        le=1.0,
-        description=(
-            "Minimum maximum similarity (best pair) required for merging. "
-            "Ensures at least one very strong connection exists. "
-            "Should be higher than merge_median_threshold."
-        )
+        le=1.0, 
+        description="Minimum maximum similarity (i.e., the single best pair) between two clusters to consider merging."
     )
-    
     merge_sample_size: int = Field(
         default=32, 
-        ge=5,
-        le=2048,
-        description=(
-            "Number of points to sample from large clusters for merge checks. "
-            "Prevents O(n²) comparison complexity. Higher = more accurate but slower."
-        )
+        ge=5, 
+        le=2048, 
+        description="Number of points to sample from large clusters for merge similarity checks to avoid O(n^2) complexity."
     )
-    
     centroid_similarity_threshold: float = Field(
         default=0.75, 
         ge=0.0, 
-        le=1.0,
-        description=(
-            "Pre-filter threshold for cluster centroid similarity. "
-            "Only cluster pairs with centroids above this are checked in detail. "
-            "Lower values check more pairs but take longer."
-        )
+        le=1.0, 
+        description="Pre-filter threshold for cluster centroid similarity. Only pairs above this threshold are considered for full merge checks."
     )
-    
     merge_batch_size: int = Field(
         default=2048, 
-        ge=128,
+        ge=128, 
         description="Batch size for vectorized GPU merge computations."
     )
-    
     centroid_sample_size: int = Field(
         default=2048, 
-        ge=128,
-        description="Sample size for computing cluster centroids on GPU."
+        ge=128, 
+        description="Sample size for computing cluster centroids on GPU for large clusters."
     )
     
-    # === Ensemble Configuration ===
-    ensemble_params: Dict[str, Any] = Field(
-        default_factory=lambda: {
-            'purity_min': 0.75,
-            'min_overlap': 3,
-            'allow_new_snn_clusters': True,
-            'min_newcluster_size': 4,
-            'default_rescue_conf': 0.60
-        },
-        description=(
-            "Parameters for combining HDBSCAN and SNN results:\n"
-            "- purity_min: Minimum purity to accept a cluster without validation\n"
-            "- min_overlap: Minimum entities shared to match clusters\n"
-            "- allow_new_snn_clusters: Whether SNN can introduce new clusters\n"
-            "- min_newcluster_size: Minimum size for new SNN clusters\n"
-            "- default_rescue_conf: Default confidence for rescued noise points"
-        )
+    # --- Ensemble Configuration ---
+    ensemble_params: EnsembleParams = Field(
+        default_factory=EnsembleParams, 
+        description="Parameters for combining HDBSCAN and SNN clustering results."
     )
-    
+
     @model_validator(mode='after')
-    def validate_umap_spread(self) -> 'ClustererConfig':
-        """Ensures UMAP spread is strictly greater than min_dist to prevent errors."""
-        min_dist = self.umap_params.get('min_dist', 0)
-        spread = self.umap_params.get('spread', 1)
-        if spread <= min_dist:
+    def validate_merge_thresholds(self) -> 'ClustererConfig':
+        """Ensures the merge thresholds are logically consistent."""
+        if self.merge_max_threshold < self.merge_median_threshold:
             raise ValueError(
-                f"UMAP 'spread' ({spread}) must be strictly greater than 'min_dist' ({min_dist}). "
-                f"Recommended: spread = min_dist + 0.1 to 1.0"
+                f"`merge_max_threshold` ({self.merge_max_threshold}) cannot be less than "
+                f"`merge_median_threshold` ({self.merge_median_threshold}). A high maximum "
+                f"similarity should be a stricter requirement than a high median."
             )
-        return self
-    
-    @model_validator(mode='after')
-    def validate_neighbor_ranges(self) -> 'ClustererConfig':
-        """Ensures n_neighbors_local and n_neighbors_global ranges don't overlap."""
-        sampling = self.umap_ensemble_sampling_config
-        
-        # Extract ranges
-        local_min, local_max = sampling.get('n_neighbors_local', [10, 35])
-        global_min, global_max = sampling.get('n_neighbors_global', [40, 70])
-        
-        # Check for overlap
-        if local_max >= global_min:
-            raise ValueError(
-                f"n_neighbors_local range [{local_min}, {local_max}] overlaps with "
-                f"n_neighbors_global range [{global_min}, {global_max}]. "
-                f"The maximum of n_neighbors_local ({local_max}) must be less than "
-                f"the minimum of n_neighbors_global ({global_min}) to maintain distinct "
-                f"local and global neighborhood views."
-            )
-        
         return self
 
+# ======================================================================================
+# Typed Sub-Models for Validation Configuration
+# ======================================================================================
+
+class ReassignmentWeights(BaseModel):
+    """
+    Defines the weights for scoring potential cluster reassignments for entities that
+    were flagged during validation. The scores determine the best new cluster for an entity.
+    """
+    model_config = ConfigDict(extra='forbid')
+
+    name_similarity: float = Field(
+        default=0.40, 
+        ge=0.0, 
+        le=1.0, 
+        description="Weight for the fuzzy string similarity score of the entity's name against the target cluster's canonical name."
+    )
+    address_similarity: float = Field(
+        default=0.40, 
+        ge=0.0, 
+        le=1.0, 
+        description="Weight for the fuzzy string similarity of the entity's address against the target cluster's canonical address."
+    )
+    cluster_size: float = Field(
+        default=0.10, 
+        ge=0.0, 
+        le=1.0, 
+        description="Weight for the size of the target cluster. This acts as a tie-breaker, preferring larger, more established clusters."
+    )
+    cluster_probability: float = Field(
+        default=0.10, 
+        ge=0.0, 
+        le=1.0, 
+        description="Weight for the entity's soft clustering probability (from HDBSCAN) for the target cluster."
+    )
+
+    @model_validator(mode='after')
+    def validate_weights_sum_to_one(self) -> 'ReassignmentWeights':
+        """Ensures the weights sum to 1.0, maintaining a normalized scoring system."""
+        total = sum(self.dict().values())
+        if abs(total - 1.0) > 1.0e-6:
+            raise ValueError(
+                f"Reassignment weights must sum to 1.0, but got {total:.6f} for values: {self.dict()}"
+            )
+        return self
+
+
+# ======================================================================================
+# Main Validation Configuration
+# ======================================================================================
 
 class ValidationConfig(BaseModel):
     """
     Configuration for validating and refining cluster assignments.
     
-    After initial clustering, this stage checks that entities in the same cluster
-    are truly the same real-world entity by validating names, addresses, and other
-    business rules. All operations use GPU-accelerated string matching where possible.
+    After initial clustering, this stage checks that entities within the same cluster
+    are truly the same real-world entity by applying a series of checks on names,
+    addresses, and other business rules. All string comparisons are GPU-accelerated.
     """
     model_config = ConfigDict(extra='forbid')
     
     street_number_threshold: int = Field(
-        default=30, 
-        ge=0,
-        le=1000,
-        description=(
-            "Maximum allowed difference between street numbers in the same cluster. "
-            "For example, with threshold=50, addresses '123 Main St' and '150 Main St' "
-            "could be in the same cluster, but '123 Main St' and '200 Main St' could not. "
-            "Set to 0 to require exact street number matches."
-        )
+        default=30, ge=0, le=1000,
+        description="Maximum allowed absolute difference between street numbers for two "
+                    "entities to be in the same cluster. Set to 0 to require exact matches."
     )
     
     address_fuzz_ratio: int = Field(
-        default=89, 
-        ge=0, 
-        le=100,
-        description=(
-            "Minimum fuzzy string match score (0-100) for addresses in the same cluster. "
-            "Uses GPU-accelerated Levenshtein distance. Higher = stricter matching. "
-            "85-90 allows minor typos, 95+ requires near-exact matches."
-        )
+        default=89, ge=0, le=100,
+        description="Minimum fuzzy string match score (0-100) for addresses in the same "
+                    "cluster, based on Levenshtein distance. Higher is stricter."
     )
     
     name_fuzz_ratio: int = Field(
-        default=89, 
-        ge=0, 
-        le=100,
-        description=(
-            "Minimum fuzzy string match score (0-100) for entity names in the same cluster. "
-            "Similar to address_fuzz_ratio but applied to entity names. "
-            "Can be different from address threshold if names are more/less reliable."
-        )
+        default=89, ge=0, le=100,
+        description="Minimum fuzzy string match score (0-100) for entity names in the same "
+                    "cluster. Can be different from the address threshold if names are "
+                    "more or less reliable in the source data."
     )
     
     enforce_state_boundaries: bool = Field(
         default=True,
-        description=(
-            "If True, entities in different states cannot be in the same cluster. "
-            "Prevents matching 'Acme Corp' in Texas with 'Acme Corp' in California. "
-            "Set to False if entities legitimately span state boundaries."
-        )
+        description="If True, entities with addresses in different states cannot be in "
+                    "the same cluster, unless explicitly allowed by `allow_neighboring_states`."
     )
     
     allow_neighboring_states: List[List[str]] = Field(
         default_factory=list,
-        description=(
-            "List of state pairs that can be matched across borders. "
-            "Example: [['IL', 'WI'], ['NY', 'NJ']] allows Illinois-Wisconsin "
-            "and New York-New Jersey matches. Only used if enforce_state_boundaries=True. "
-            "Useful for metro areas that span state lines."
-        )
+        description="A list of state pairs that are allowed to be matched across borders, "
+                    "e.g., [['NY', 'NJ']] for the NYC metro area. Only has an effect "
+                    "if `enforce_state_boundaries` is True."
     )
     
     profile_comparison_max_pairs_per_chunk: int = Field(
-        default=1_000_000, 
-        ge=10000,
-        le=10_000_000,
-        description=(
-            "Maximum number of entity pairs to compare in each batch during validation. "
-            "Prevents GPU memory overflow on large datasets. Lower values use less VRAM "
-            "but take longer. Adjust based on available GPU memory."
-        )
+        default=1_000_000, ge=10000, le=10_000_000,
+        description="Maximum number of entity pairs to compare in a single batch during "
+                    "validation. A crucial parameter to prevent GPU out-of-memory errors."
     )
     
-    reassignment_scoring_weights: Dict[str, float] = Field(
-        default_factory=lambda: {
-            'name_similarity': 0.40,
-            'address_similarity': 0.40,
-            'cluster_size': 0.10,
-            'cluster_probability': 0.10
-        },
-        description=(
-            "Weights for scoring potential cluster reassignments. Must sum to 1.0.\n"
-            "- name_similarity: Weight for name match quality (0.3-0.5 typical)\n"
-            "- address_similarity: Weight for address match quality (0.3-0.5 typical)\n"
-            "- cluster_size: Prefer larger clusters (0.05-0.15 typical)\n"
-            "- cluster_probability: Weight for clustering confidence (0.05-0.15 typical)"
-        )
+    reassignment_scoring_weights: ReassignmentWeights = Field(
+        default_factory=ReassignmentWeights,
+        description="The weighted components used to score and choose the best new cluster for a reassigned entity."
     )
     
     validate_cluster_batch_size: int = Field(
-        default=1024, 
-        ge=32,
-        le=10000,
-        description=(
-            "Batch size for GPU cluster validation operations. "
-            "Larger batches are faster but use more GPU memory."
-        )
+        default=1024, ge=32, le=10000,
+        description="The number of clusters to process in a single batch during validation operations on the GPU."
     )
 
-    @field_validator('reassignment_scoring_weights')
-    @classmethod
-    def validate_weights_sum(cls, v: Dict[str, float]) -> Dict[str, float]:
-        """Ensures reassignment weights sum to 1.0."""
-        total = sum(v.values())
-        if abs(total - 1.0) > 1.0e-6:
-            raise ValueError(
-                f"reassignment_scoring_weights must sum to 1.0, but got {total:.6f}. "
-                f"Current values: {v}"
-            )
-        return v
-    
     @field_validator('allow_neighboring_states')
     @classmethod
     def validate_state_pairs(cls, v: List[List[str]]) -> List[List[str]]:
-        """Validates that state pairs are properly formatted."""
+        """Validates that state pairs are properly formatted as pairs of 2-letter uppercase strings."""
+        validated_pairs = []
         for i, pair in enumerate(v):
             if not isinstance(pair, list) or len(pair) != 2:
                 raise ValueError(
-                    f"allow_neighboring_states[{i}] must be a list of exactly 2 state codes, "
-                    f"got: {pair}"
+                    f"allow_neighboring_states[{i}] must be a list of exactly 2 state codes, got: {pair}"
                 )
-            if not all(isinstance(state, str) and len(state) == 2 for state in pair):
-                raise ValueError(
-                    f"allow_neighboring_states[{i}] must contain 2-letter state codes, "
-                    f"got: {pair}"
-                )
-        return v
+            
+            validated_pair = []
+            for state in pair:
+                if not isinstance(state, str):
+                    raise ValueError(f"State codes must be strings, but got {type(state)} in pair {i}.")
+                
+                state_upper = state.strip().upper()
+                if len(state_upper) != 2:
+                    raise ValueError(
+                        f"State codes must be 2 letters long, but got '{state}' in pair {i}."
+                    )
+                validated_pair.append(state_upper)
+            
+            # Ensure the pair is sorted to make lookups deterministic, e.g., ['NY', 'NJ'] is the same as ['NJ', 'NY']
+            validated_pairs.append(sorted(validated_pair))
+        
+        return validated_pairs
 
+# ======================================================================================
+# Typed Sub-Models for Confidence Scoring Configuration
+# ======================================================================================
+
+class ConfidenceWeights(BaseModel):
+    """
+    Defines the weighted components used to calculate the final confidence score for
+    each entity's cluster assignment. A higher score indicates a more reliable match.
+    """
+    model_config = ConfigDict(extra='forbid')
+
+    cluster_probability: float = Field(
+        default=0.25, 
+        ge=0.0, 
+        le=1.0, 
+        description="Weight for the soft clustering probability from HDBSCAN. Represents the model's fundamental belief in the assignment."
+    )
+    name_similarity: float = Field(
+        default=0.20, 
+        ge=0.0, 
+        le=1.0, 
+        description="Weight for the average fuzzy name similarity of an entity against all other members of its cluster."
+    )
+    address_confidence: float = Field(
+        default=0.25, 
+        ge=0.0, 
+        le=1.0, 
+        description="Weight for a composite score based on address similarity and geographic consistency within the cluster."
+    )
+    cohesion_score: float = Field(
+        default=0.15, 
+        ge=0.0, 
+        le=1.0, 
+        description="Weight for the geometric cohesion of the cluster in the UMAP embedding space. Tighter clusters are more confident."
+    )
+    cluster_size_factor: float = Field(
+        default=0.15, 
+        ge=0.0, 
+        le=1.0, 
+        description="Weight for a factor that rewards larger clusters, as they represent stronger evidence of a real-world entity."
+    )
+
+    @model_validator(mode='after')
+    def validate_weights_sum_to_one(self) -> 'ConfidenceWeights':
+        """Ensures the weights sum to 1.0, maintaining a normalized scoring system."""
+        total = sum(self.dict().values())
+        if abs(total - 1.0) > 1.0e-6:
+            raise ValueError(
+                f"Confidence weights must sum to 1.0, but got {total:.6f} for values: {self.dict()}"
+            )
+        return self
+
+# ======================================================================================
+# Main Confidence Scoring Configuration
+# ======================================================================================
 
 class ConfidenceScoringConfig(BaseModel):
     """
@@ -950,37 +1436,11 @@ class ConfidenceScoringConfig(BaseModel):
     """
     model_config = ConfigDict(extra='forbid')
     
-    weights: Dict[str, float] = Field(
-        default_factory=lambda: {
-            'cluster_probability': 0.25,
-            'name_similarity': 0.20,
-            'address_confidence': 0.25,
-            'cohesion_score': 0.15,
-            'cluster_size_factor': 0.15
-        },
-        description=(
-            "Component weights for final confidence score. Must sum to 1.0.\n"
-            "Components:\n"
-            "- cluster_probability: HDBSCAN's soft clustering probability (0.2-0.3 typical)\n"
-            "- name_similarity: Average name similarity within cluster (0.15-0.25 typical)\n"
-            "- address_confidence: Address match quality score (0.2-0.3 typical)\n"
-            "- cohesion_score: How tightly clustered entities are (0.1-0.2 typical)\n"
-            "- cluster_size_factor: Bonus for larger clusters (0.05-0.15 typical)\n"
-            "Adjust weights based on which signals are most reliable in your data."
-        )
+    weights: ConfidenceWeights = Field(
+        default_factory=ConfidenceWeights,
+        description="The weighted components that are combined to produce the "
+                    "final confidence score for each resolved entity."
     )
-
-    @field_validator('weights')
-    @classmethod
-    def validate_weights_sum(cls, v: Dict[str, float]) -> Dict[str, float]:
-        """Ensures confidence weights sum to 1.0."""
-        total = sum(v.values())
-        if abs(total - 1.0) > 1.0e-6:
-            raise ValueError(
-                f"Confidence weights must sum to 1.0, but got {total:.6f}. "
-                f"Current values: {v}"
-            )
-        return v
 
 
 # === Master Configuration ===
@@ -1021,71 +1481,70 @@ class ResolverConfig(BaseModel):
     """
     model_config = ConfigDict(extra='forbid')
     
-    # === Sub-configurations ===
+    # --- Sub-configurations ---
     columns: ColumnConfig = Field(
         default_factory=ColumnConfig,
-        description="Configuration for input cuDF DataFrame columns"
+        description="Configuration for input cuDF DataFrame columns."
     )
     
     output: OutputConfig = Field(
         default_factory=OutputConfig,
-        description="Configuration for output formatting and review"
+        description="Configuration for output formatting, logging, and review thresholds."
     )
     
     normalization: NormalizationConfig = Field(
         default_factory=NormalizationConfig,
-        description="Text normalization and cleaning rules"
+        description="Configuration for text normalization and cleaning rules."
     )
     
     vectorizer: VectorizerConfig = Field(
         default_factory=VectorizerConfig,
-        description="GPU-accelerated feature extraction and encoding parameters"
+        description="Configuration for GPU-accelerated feature extraction and encoding."
     )
     
     clusterer: ClustererConfig = Field(
         default_factory=ClustererConfig,
-        description="GPU-accelerated clustering algorithm parameters"
+        description="Configuration for GPU-accelerated clustering and manifold learning."
     )
     
     validation: ValidationConfig = Field(
         default_factory=ValidationConfig,
-        description="Cluster validation and refinement rules"
+        description="Configuration for cluster validation and refinement rules."
     )
     
     scoring: ConfidenceScoringConfig = Field(
         default_factory=ConfidenceScoringConfig,
-        description="Confidence scoring weights"
+        description="Configuration for final confidence scoring weights."
     )
     
-    # === Global Configuration ===
+    # --- Global Configuration ---
     random_state: Optional[int] = Field(
         default=42,
         ge=0,
-        le=2**32-1,
-        description=(
-            "Global random seed for reproducibility. "
-            "Set to None for non-deterministic behavior. "
-            "This seed is propagated to all stochastic components "
-            "(cuML PCA, cuML UMAP, sampling, etc.) to ensure consistent results "
-            "across runs with the same data and configuration."
-        )
+        le=2**32 - 1,
+        description="Global random seed for reproducibility. Propagated to "
+                    "all stochastic components (e.g., PCA, UMAP) to ensure "
+                    "consistent results. Set to None for non-deterministic behavior."
     )
 
     @model_validator(mode='after')
     def propagate_random_state(self) -> 'ResolverConfig':
         """
-        Propagates the global random_state to all components that need it.
+        Propagates the global `random_state` to all sub-components that require it.
         
-        This ensures reproducibility across the entire pipeline by using
-        the same seed for all stochastic operations in cuML and other libraries.
+        This crucial step ensures that the entire pipeline is reproducible by seeding
+        all stochastic algorithms (like PCA and UMAP) with the same value.
         """
         if self.random_state is not None:
-            # Propagate to cuML PCA components
-            self.vectorizer.tfidf_pca_params["random_state"] = self.random_state
-            self.vectorizer.phonetic_pca_params["random_state"] = self.random_state
+            # Propagate to cuML PCA components in the vectorizer
+            if hasattr(self.vectorizer, 'tfidf_pca_params'):
+                self.vectorizer.tfidf_pca_params["random_state"] = self.random_state
+            if hasattr(self.vectorizer, 'phonetic_pca_params'):
+                self.vectorizer.phonetic_pca_params["random_state"] = self.random_state
             
-            # Propagate to cuML UMAP
-            self.clusterer.umap_params["random_state"] = self.random_state
+            # Propagate to cuML UMAP in the clusterer
+            if hasattr(self.clusterer, 'umap_params'):
+                self.clusterer.umap_params["random_state"] = self.random_state
         
         return self
 
