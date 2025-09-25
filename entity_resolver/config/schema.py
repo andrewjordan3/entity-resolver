@@ -230,13 +230,13 @@ class ColumnConfig(BaseModel):
         default='entity', 
         min_length=1,
         max_length=256,
-        pattern=r'^[a-zA-Z][a-zA-Z0-9_]*$', # Enforce python-style identifier
+        pattern=r'^[A-Za-z](?:[A-Za-z0-9_\s]*[A-Za-z0-9_])?$', 
         description=(
             "The name of the column containing the primary entity identifier to be resolved. "
             "This is typically the main business or organization name. All matching and "
             "clustering logic is centered around this column. The name must be a valid "
             "identifier (letters, numbers, underscores) and cannot start with a number."
-            "Common examples: 'company_name', 'vendor', 'organization'."
+            "Common examples: 'company_name', 'Vendor Name', 'organization'."
         )
     )
     
@@ -260,7 +260,7 @@ class ColumnConfig(BaseModel):
         """
         Validates that address columns are non-empty, unique, valid identifier strings.
         
-        This check prevents common errors such as empty strings, whitespace, or duplicate
+        This check prevents common errors such as empty strings, leading or trailing whitespace, or duplicate
         column names being passed in the address column list, which could lead to
         unexpected behavior or errors during processing.
 
@@ -277,17 +277,23 @@ class ColumnConfig(BaseModel):
             raise ValueError("`address_cols` cannot be an empty list.")
         
         seen = set()
+        validated_list = []
         for i, col in enumerate(v):
-            if not isinstance(col, str) or not col.strip():
-                raise ValueError(f"address_cols[{i}] must be a non-empty string, but got: '{col}'")
-            # This regex check is redundant if the pattern is enforced on a model level for all strings,
-            # but provides a more specific error message here.
-            if not col.replace('_', '').isalnum() or col[0].isdigit():
-                 raise ValueError(f"address_cols[{i}] ('{col}') is not a valid identifier.")
-            if col in seen:
-                raise ValueError(f"Duplicate column name found in address_cols: '{col}'. All column names must be unique.")
-            seen.add(col)
-        return v
+            if not isinstance(col, str):
+                raise TypeError(f"address_cols[{i}] must be a string, but got type {type(col).__name__}")
+            
+            stripped_col = col.strip()
+            if not stripped_col:
+                raise ValueError(f"address_cols[{i}] ('{col}') cannot be empty or contain only whitespace.")
+            if col != stripped_col:
+                raise ValueError(f"address_cols[{i}] ('{col}') cannot have leading or trailing whitespace.")
+            
+            if stripped_col in seen:
+                raise ValueError(f"Duplicate column name found in address_cols: '{stripped_col}'. All column names must be unique.")
+            
+            seen.add(stripped_col)
+            validated_list.append(stripped_col)
+        return validated_list
 
     @model_validator(mode='after')
     def check_column_overlap(self) -> 'ColumnConfig':
@@ -515,13 +521,21 @@ class TfidfParams(BaseModel):
         default=10000, gt=0,
         description="Build a vocabulary that only considers the top `max_features` ordered by term frequency."
     )
-    min_df: int = Field(
-        default=2, ge=1,
+    max_df: Union[float, int] = Field(
+        default=0.99,
+        description="Ignore terms with a document frequency strictly higher than the given threshold (corpus-specific stop words)."
+    )
+    min_df: Union[float, int] = Field(
+        default=2,
         description="Minimum document frequency. A feature must appear in at least this many documents to be included."
     )
     sublinear_tf: bool = Field(
         default=True,
         description="Apply sublinear TF scaling (replaces tf with log(tf)). Dampens the effect of very frequent terms."
+    )
+    norm: Literal["l1", "l2", None] = Field(
+        default="l2",
+        description="Vector normalization type. 'l2' (Euclidean) is standard for cosine similarity."
     )
     dtype: Any = Field(
         default="float64",
@@ -540,6 +554,19 @@ class TfidfParams(BaseModel):
             raise ValueError("ngram_range values must be positive integers.")
         if low > high:
             raise ValueError(f"In ngram_range, the lower bound ({low}) cannot be greater than the upper bound ({high}).")
+        return v
+    
+    @field_validator('min_df', 'max_df')
+    @classmethod
+    def validate_df(cls, v: Union[float, int], field_info) -> Union[float, int]:
+        """Validates that min_df and max_df values are within their logical ranges."""
+        name = field_info.field_name
+        if isinstance(v, float):
+            if not (0.0 <= v <= 1.0):
+                raise ValueError(f"If `{name}` is a float, it must be in the range [0.0, 1.0].")
+        elif isinstance(v, int):
+            if v < 1:
+                raise ValueError(f"If `{name}` is an int, it must be >= 1.")
         return v
 
 class TfidfSvdParams(BaseModel):
@@ -614,6 +641,22 @@ class PhoneticParams(BaseModel):
         gt=0, 
         description="Maximum number of unique phonetic codes to consider."
     )
+    min_df: Union[float, int] = Field(
+        default=1,
+        description="Ignore terms with a document frequency strictly lower than the given threshold."
+    )
+
+    @field_validator('min_df')
+    @classmethod
+    def validate_min_df(cls, v: Union[float, int]) -> Union[float, int]:
+        """Validates that min_df value is within its logical range."""
+        if isinstance(v, float):
+            if not (0.0 <= v <= 1.0):
+                raise ValueError("If `min_df` is a float, it must be in the range [0.0, 1.0].")
+        elif isinstance(v, int):
+            if v < 1:
+                raise ValueError("If `min_df` is an int, it must be >= 1.")
+        return v
 
 class PhoneticSvdParams(BaseModel):
     """Parameters for GPUTruncatedSVD on phonetic features."""
