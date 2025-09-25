@@ -621,6 +621,11 @@ class TfidfPcaParams(BaseModel):
         gt=0, 
         description="The target number of dimensions for the reduced data."
     )
+    random_state: Optional[int] = Field(
+        default=None, 
+        exclude=True, 
+        description="Seed for reproducibility, propagated from global config."
+    )
 
 class PhoneticParams(BaseModel):
     """
@@ -674,6 +679,11 @@ class PhoneticPcaParams(BaseModel):
         default=160, 
         gt=0, 
         description="Target dimensionality for the PCA reduction stage."
+    )
+    random_state: Optional[int] = Field(
+        default=None, 
+        exclude=True, 
+        description="Seed for reproducibility, propagated from global config."
     )
 
 class SimilarityTfidfParams(TfidfParams): # Inherits validation
@@ -965,6 +975,11 @@ class UmapParams(BaseModel):
         default=0.5, 
         gt=0.0, 
         description="The initial learning rate for the optimization algorithm."
+    )
+    random_state: Optional[int] = Field(
+        default=None, 
+        exclude=True, 
+        description="Seed for reproducibility, propagated from global config."
     )
 
     @model_validator(mode='after')
