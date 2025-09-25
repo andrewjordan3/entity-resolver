@@ -1580,14 +1580,14 @@ class ResolverConfig(BaseModel):
         """
         if self.random_state is not None:
             # Propagate to cuML PCA components in the vectorizer
-            if hasattr(self.vectorizer, 'tfidf_pca_params'):
-                self.vectorizer.tfidf_pca_params["random_state"] = self.random_state
-            if hasattr(self.vectorizer, 'phonetic_pca_params'):
-                self.vectorizer.phonetic_pca_params["random_state"] = self.random_state
+            if self.vectorizer and self.vectorizer.tfidf_pca_params:
+                self.vectorizer.tfidf_pca_params.random_state = self.random_state
+            if self.vectorizer and self.vectorizer.phonetic_pca_params:
+                self.vectorizer.phonetic_pca_params.random_state = self.random_state
             
             # Propagate to cuML UMAP in the clusterer
-            if hasattr(self.clusterer, 'umap_params'):
-                self.clusterer.umap_params["random_state"] = self.random_state
+            if self.clusterer and self.clusterer.umap_params:
+                self.clusterer.umap_params.random_state = self.random_state
         
         return self
 
