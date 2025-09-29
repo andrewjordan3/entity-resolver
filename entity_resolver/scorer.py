@@ -10,7 +10,7 @@ import logging
 
 # --- Local Package Imports ---
 from .config import ConfidenceScoringConfig, OutputConfig, VectorizerConfig, ColumnConfig
-from . import utils
+from .utils import calculate_similarity_gpu
 
 # Set up a logger for this module
 logger = logging.getLogger(__name__)
@@ -63,12 +63,12 @@ class ConfidenceScorer:
         
         # --- Step 1: Calculate individual similarity components ---
         # These form the base of the confidence score.
-        gdf['name_similarity'] = utils.calculate_similarity_gpu(
+        gdf['name_similarity'] = calculate_similarity_gpu(
             gdf['normalized_text'], 
             gdf['canonical_name'].str.lower(),
             self.vectorizer_config.similarity_tfidf
         )
-        gdf['address_confidence'] = utils.calculate_similarity_gpu(
+        gdf['address_confidence'] = calculate_similarity_gpu(
             gdf['addr_normalized_key'], 
             gdf['canonical_address'],
             self.vectorizer_config.similarity_tfidf
@@ -104,16 +104,16 @@ class ConfidenceScorer:
         
         # Combine all weighted components into a single base score.
         base_score = (
-            gdf['cluster_probability'].fillna(0) * weights['cluster_probability'] +
-            gdf['name_similarity'] * weights['name_similarity'] +
-            gdf['address_confidence'] * weights['address_confidence'] +
-            gdf['cohesion_score'] * weights['cohesion_score'] +
-            cluster_size_factor * weights['cluster_size_factor']
+            gdf['cluster_probability'].fillna(0) * weights.cluster_probability +
+            gdf['name_similarity'] * weights.name_similarity +
+            gdf['address_confidence'] * weights.address_confidence +
+            gdf['cohesion_score'] * weights.cohesion_score +
+            cluster_size_factor * weights.cluster_size_factor
         )
         
         # --- Step 4: Apply penalties for specific conditions ---
         # Calculate how much the original name changed to become the canonical name.
-        change_magnitude = 1 - utils.calculate_similarity_gpu(
+        change_magnitude = 1 - calculate_similarity_gpu(
             gdf[self.column_config.entity_col], gdf['canonical_name'], self.vectorizer_config.similarity_tfidf
         )
         # Apply a small penalty for significant name changes.
@@ -150,7 +150,7 @@ class ConfidenceScorer:
             raise ValueError("Must run scoring before flagging. Call score_and_flag().")
 
         # Calculate the magnitude of change between the original and canonical names.
-        change_magnitude = 1 - utils.calculate_similarity_gpu(
+        change_magnitude = 1 - calculate_similarity_gpu(
             gdf[self.column_config.entity_col], gdf['canonical_name'], self.vectorizer_config.similarity_tfidf
         )
         
