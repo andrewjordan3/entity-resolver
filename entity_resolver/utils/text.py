@@ -218,17 +218,32 @@ def _calculate_centrality_score(
     min_for_df = 20 # Need to make this a parameter eventually
     n_unique = len(unique_names)
     
-    # If we have too few unique names, similarity is meaningless
+    # For very small groups, use edit distance instead of TF-IDF
     if n_unique < min_unique_for_similarity:
-        # Return just the frequency weights as the centrality score
-        # This makes the most frequent name the most "central"
-        total_items = name_counts.sum()
-        freq_weights = name_counts / total_items
+        if n_unique == 1:
+            # Single name - it's 100% central by definition
+            return cupy.ones(1)
+        
+        # Calculate edit distance matrix
+        similarity_matrix = cupy.zeros((n_unique, n_unique))
+        
+        for i in range(n_unique):
+            # Get edit distances from name i to all names
+            distances = unique_names.str.edit_distance(unique_names.iloc[i])
+            
+            # Convert distances to similarities (0 to 1 scale)
+            # Using exponential decay: similarity = exp(-distance/max_len)
+            max_len = unique_names.str.len().max()
+            similarities = cupy.exp(-cupy.asarray(distances.values) / max_len)
+            similarity_matrix[i, :] = similarities
+        
+        # Weight similarities by frequency
+        centrality_score = similarity_matrix @ freq_weights
+        
         logger.debug(
-            f"Only {n_unique} unique names (< {min_unique_for_similarity}), "
-            f"using frequency weights as centrality scores"
+            f"Using edit distance for {n_unique} unique names (< {min_unique_for_similarity})"
         )
-        return cupy.asarray(freq_weights.values)
+        return centrality_score
     
     exclude_keys = {'min_df', 'max_df'} if n_unique < min_for_df else set()
 

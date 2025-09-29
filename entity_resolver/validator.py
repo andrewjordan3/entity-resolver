@@ -647,7 +647,7 @@ class ClusterValidator:
         )
         
         # --- Calculate final match scores ---
-        weights = self.config.reassignment_scoring_weights
+        weights = self.config.reassignment_scoring_weights.copy()
         
         # Normalize cluster size with log scale
         size_values = pairs['size'].values
@@ -655,10 +655,10 @@ class ClusterValidator:
         
         # Compute raw match score
         raw_match_score = (
-            weights['name_similarity'] * adjusted_name_score +
-            weights['address_similarity'] * adjusted_addr_score +
-            weights['cluster_size'] * cudf.Series(size_factor, index=pairs.index) +
-            weights['cluster_probability'] * pairs['avg_probability']
+            weights.name_similarity * adjusted_name_score +
+            weights.address_similarity * adjusted_addr_score +
+            weights.cluster_size * cudf.Series(size_factor, index=pairs.index) +
+            weights.cluster_probability * pairs['avg_probability']
         )
         
         # Apply state penalty to final score
