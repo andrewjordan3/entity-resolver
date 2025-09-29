@@ -392,7 +392,7 @@ class MultiStreamVectorizer:
         
         if is_training:
             # Configure and fit new TF-IDF vectorizer
-            tfidf_params = self.config.tfidf_params.copy()
+            tfidf_params = self.config.tfidf_params.to_kwargs()
             
             logger.debug(f"Fitting TF-IDF with params: {tfidf_params}")
             model = TfidfVectorizer(**tfidf_params)

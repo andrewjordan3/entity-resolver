@@ -568,6 +568,19 @@ class TfidfParams(BaseModel):
             if v < 1:
                 raise ValueError(f"If `{name}` is an int, it must be >= 1.")
         return v
+    
+    def to_kwargs(self) -> dict:
+        """Return parameters for TfidfVectorizer initialization."""
+        return {
+            'analyzer': self.analyzer,
+            'ngram_range': self.ngram_range,
+            'max_features': self.max_features,
+            'max_df': self.max_df,
+            'min_df': self.min_df,
+            'sublinear_tf': self.sublinear_tf,
+            'norm': self.norm,
+            'dtype': self.dtype  # Will pass the actual cupy.dtype object
+        }
 
 class TfidfSvdParams(BaseModel):
     """
