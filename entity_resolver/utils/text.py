@@ -29,10 +29,10 @@ import pandas as pd
 import re
 import cudf
 import cupy
-from typing import Dict, Any
 import unicodedata2
 from cuml.feature_extraction.text import TfidfVectorizer
 from cuml.metrics.pairwise_distances import pairwise_distances
+from ..config import SimilarityTfidfParams
 
 # Set up a logger for this module.
 logger = logging.getLogger(__name__)
@@ -198,7 +198,7 @@ _ASCII_TRANSLATION_TABLE = str.maketrans(_ASCII_COMPAT_MAP)
 def _calculate_centrality_score(
     unique_names: cudf.Series,
     name_counts: cudf.Series,
-    tfidf_params: Dict[str, Any]
+    tfidf_params: SimilarityTfidfParams,
 ) -> cupy.ndarray:
     """
     Calculates a centrality score for each unique name.
@@ -215,7 +215,7 @@ def _calculate_centrality_score(
         A CuPy array of centrality scores, one for each unique name.
     """
     # Using character n-grams is effective for capturing misspellings and variations.
-    vectorizer = TfidfVectorizer(**tfidf_params)
+    vectorizer = TfidfVectorizer(**tfidf_params.model_dump())
     # We must reset the index before vectorizing to avoid potential cuML errors.
     tfidf_matrix = vectorizer.fit_transform(unique_names.reset_index(drop=True))
 
@@ -256,7 +256,10 @@ def _calculate_length_bonus(unique_names: cudf.Series) -> cupy.ndarray:
     return cupy.asarray(length_bonus)
 
 
-def get_canonical_name_gpu(name_series: cudf.Series, tfidf_params: Dict[str, Any]) -> str:
+def get_canonical_name_gpu(
+        name_series: cudf.Series, 
+        tfidf_params: SimilarityTfidfParams,
+    ) -> str:
     """
     Selects the best canonical name from a Series of candidates on the GPU.
 
@@ -268,6 +271,7 @@ def get_canonical_name_gpu(name_series: cudf.Series, tfidf_params: Dict[str, Any
 
     Args:
         name_series: A cuDF Series containing all name candidates for a single group.
+        tfidf_params: Parameters for the TfidfVectorizer.
 
     Returns:
         The string of the highest-scoring canonical name, or an empty string
