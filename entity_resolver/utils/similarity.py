@@ -64,7 +64,8 @@ def _log_series_samples(
 def calculate_similarity_gpu(
     series_a: cudf.Series,
     series_b: cudf.Series,
-    tfidf_params: SimilarityTfidfParams
+    tfidf_params: SimilarityTfidfParams,
+    min_unique_for_tfidf: int = 24,
 ) -> cudf.Series:
     """
     Calculates the row-wise cosine similarity between two cuDF string series,
@@ -119,6 +120,49 @@ def calculate_similarity_gpu(
     # Initialize the final result series with a default similarity of 0.0.
     # This ensures that any rows we filter out will have a defined score.
     result_series = cudf.Series(cupy.zeros(len(series_a)), index=series_a.index, dtype='float32')
+
+    # --- Check if we should use edit distance instead of TF-IDF ---
+    # Count unique strings across both series to determine approach
+    combined_unique = cudf.concat([series_a_cleaned, series_b_cleaned]).unique()
+    n_unique = len(combined_unique)
+
+    # --- Use Edit Distance for Small Datasets ---
+    if n_unique < min_unique_for_tfidf:
+        logger.debug(f"Using vectorized edit distance for {n_unique} unique strings (< {min_unique_for_tfidf})")
+        
+        # 1. Filter out rows where either string is empty.
+        valid_mask = (series_a_cleaned.str.len() > 0) & (series_b_cleaned.str.len() > 0)
+        
+        if not valid_mask.any():
+            logger.debug("No valid non-empty string pairs found.")
+            return result_series
+            
+        # 2. Get the subset of series that will be processed.
+        # The original index is correctly preserved here.
+        valid_a = series_a_cleaned[valid_mask]
+        valid_b = series_b_cleaned[valid_mask]
+        
+        # 3. Perform all calculations in a vectorized way (NO LOOPS).
+        # Calculate raw Levenshtein distance for all pairs at once.
+        raw_distances = valid_a.str.edit_distance(valid_b)
+        
+        # Calculate lengths needed for normalization.
+        len_a = valid_a.str.len()
+        len_b = valid_b.str.len()
+        max_dist = len_a + len_b # This is the denominator in your formula
+        
+        # 4. Calculate normalized similarity using the formula for all pairs at once.
+        # We use .values to get the underlying CuPy arrays for the calculation.
+        similarities_array = cupy.exp(-2.0 * raw_distances.values / max_dist.values)
+        
+        # Create the final series with the correct index.
+        similarities_series = cudf.Series(similarities_array, index=valid_a.index, dtype='float32')
+
+        # 5. Update the result series. This remains the same.
+        result_series.update(similarities_series)
+        
+        logger.debug(f"Edit distance similarity calculation complete. Mean similarity: {similarities_array.mean():.4f}")
+        return result_series
 
     # --- 2. Identify Rows Valid for N-gram Processing ---
     # Determine the minimum n-gram size from the TF-IDF parameters.
@@ -322,11 +366,10 @@ def calculate_similarity_gpu(
         similarities_series = similarities_series.astype("float32", copy=True)
 
         # Place the calculated similarities back into the full result series.
-        # Using the boolean mask with .loc for assignment is a clean and direct
-        # way to do this. It assigns values from `similarities_series` to the
-        # locations in `result_series` where the mask is True, automatically
-        # aligning by index to ensure correctness.
-        result_series.loc[active_index] = similarities_series
+        # The `Series.update()` method modifies `result_series` in-place.
+        # It aligns on the index, overwriting the default zero scores with the
+        # new values from `similarities_series`.
+        result_series.update(similarities_series)
 
     except RuntimeError as e:
         logger.error(f"A runtime error occurred in 'calculate_similarity_gpu' during TF-IDF processing: {e}", exc_info=True)
