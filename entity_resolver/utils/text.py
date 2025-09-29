@@ -199,6 +199,7 @@ def _calculate_centrality_score(
     unique_names: cudf.Series,
     name_counts: cudf.Series,
     tfidf_params: SimilarityTfidfParams,
+    min_unique_for_similarity: int = 5,
 ) -> cupy.ndarray:
     """
     Calculates a centrality score for each unique name.
@@ -214,10 +215,31 @@ def _calculate_centrality_score(
     Returns:
         A CuPy array of centrality scores, one for each unique name.
     """
+    n_unique = len(unique_names)
+    
+    # If we have too few unique names, similarity is meaningless
+    if n_unique < min_unique_for_similarity:
+        # Return just the frequency weights as the centrality score
+        # This makes the most frequent name the most "central"
+        total_items = name_counts.sum()
+        freq_weights = name_counts / total_items
+        logger.debug(
+            f"Only {n_unique} unique names (< {min_unique_for_similarity}), "
+            f"using frequency weights as centrality scores"
+        )
+        return cupy.asarray(freq_weights.values)
+    
     # Using character n-grams is effective for capturing misspellings and variations.
     vectorizer = TfidfVectorizer(**tfidf_params.model_dump())
     # We must reset the index before vectorizing to avoid potential cuML errors.
     tfidf_matrix = vectorizer.fit_transform(unique_names.reset_index(drop=True))
+
+    # Check if we got meaningful features
+    if tfidf_matrix.shape[1] == 0:
+        logger.warning("TF-IDF produced no features, falling back to frequency weights")
+        total_items = name_counts.sum()
+        freq_weights = name_counts / total_items
+        return cupy.asarray(freq_weights.values)
 
     # Calculate the cosine similarity between all pairs of unique names.
     similarity_matrix = 1 - pairwise_distances(tfidf_matrix, metric='cosine')
@@ -233,7 +255,6 @@ def _calculate_centrality_score(
     centrality_score = similarity_matrix @ freq_weights.values
 
     return cupy.asarray(centrality_score)
-
 
 def _calculate_length_bonus(unique_names: cudf.Series) -> cupy.ndarray:
     """
