@@ -217,6 +217,9 @@ def _calculate_centrality_score(
     """
     min_for_df = 20 # Need to make this a parameter eventually
     n_unique = len(unique_names)
+    # Calculate frequency weights (proportion of total).
+    total_items = name_counts.sum()
+    freq_weights = (name_counts / total_items).values
     
     # For very small groups, use edit distance instead of TF-IDF
     if n_unique < min_unique_for_similarity:
@@ -261,22 +264,16 @@ def _calculate_centrality_score(
     # Check if we got meaningful features
     if tfidf_matrix.shape[1] == 0:
         logger.warning("TF-IDF produced no features, falling back to frequency weights")
-        total_items = name_counts.sum()
-        freq_weights = name_counts / total_items
-        return cupy.asarray(freq_weights.values)
+        return cupy.asarray(freq_weights)
 
     # Calculate the cosine similarity between all pairs of unique names.
     similarity_matrix = 1 - pairwise_distances(tfidf_matrix, metric='cosine')
-
-    # Calculate frequency weights (proportion of total).
-    total_items = name_counts.sum()
-    freq_weights = name_counts / total_items
 
     # The core of the centrality score: for each name, sum the similarities
     # to all other names, weighted by how frequent those other names are.
     # A high score means "I am similar to other popular names."
     # The '@' operator performs matrix multiplication.
-    centrality_score = similarity_matrix @ freq_weights.values
+    centrality_score = similarity_matrix @ freq_weights
 
     return cupy.asarray(centrality_score)
 
