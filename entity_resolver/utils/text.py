@@ -215,6 +215,7 @@ def _calculate_centrality_score(
     Returns:
         A CuPy array of centrality scores, one for each unique name.
     """
+    min_for_df = 20 # Need to make this a parameter eventually
     n_unique = len(unique_names)
     
     # If we have too few unique names, similarity is meaningless
@@ -229,8 +230,16 @@ def _calculate_centrality_score(
         )
         return cupy.asarray(freq_weights.values)
     
+    exclude_keys = {'min_df', 'max_df'} if n_unique < min_for_df else set()
+
+    vec_params = tfidf_params.model_dump(
+        mode="python",
+        round_trip=True,
+        exclude=exclude_keys,
+        exclude_none=True,
+    )
     # Using character n-grams is effective for capturing misspellings and variations.
-    vectorizer = TfidfVectorizer(**tfidf_params.model_dump())
+    vectorizer = TfidfVectorizer(**vec_params)
     # We must reset the index before vectorizing to avoid potential cuML errors.
     tfidf_matrix = vectorizer.fit_transform(unique_names.reset_index(drop=True))
 
