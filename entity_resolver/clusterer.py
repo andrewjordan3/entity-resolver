@@ -329,7 +329,7 @@ class EntityClusterer:
         
         try:
             # Fit HDBSCAN
-            clusterer = HDBSCAN(**self.config.hdbscan_params)
+            clusterer = HDBSCAN(**self.config.hdbscan_params.model_dump())
             clusterer.fit(reduced_vectors)
             
         except Exception as e:
@@ -396,7 +396,7 @@ class EntityClusterer:
         
         # Stage 1: Community detection
         logger.info("SNN Stage 1: Building graph and finding communities")
-        k_neighbors = self.config.snn_clustering_params["k_neighbors"]
+        k_neighbors = self.config.snn_clustering_params.k_neighbors
         logger.debug(f"Building mutual rank graph with k={k_neighbors}")
         
         snn_graph, _ = build_mutual_rank_graph(vectors_norm, k_neighbors)
@@ -411,7 +411,7 @@ class EntityClusterer:
         )
         
         # Run Louvain community detection
-        resolution = self.config.snn_clustering_params["louvain_resolution"]
+        resolution = self.config.snn_clustering_params.louvain_resolution
         logger.debug(f"Running Louvain with resolution={resolution}")
         
         partitions_df, modularity = cugraph.louvain(snn_graph, resolution=resolution)
@@ -436,7 +436,7 @@ class EntityClusterer:
         labels_after_attachment = attach_noise_points(
             vectors_norm, 
             labels_to_use, 
-            **self.config.noise_attachment_params
+            **self.config.noise_attachment_params.model_dump()
         )
         
         attached_noise = initial_noise - int((labels_after_attachment == -1).sum())
