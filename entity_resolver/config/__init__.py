@@ -15,7 +15,10 @@ from .schema import (
     ValidationConfig,
     ConfidenceScoringConfig,
     OutputConfig,
-    ColumnConfig
+    ColumnConfig,
+    EnsembleParams,
+    SimilarityTfidfParams,
+    SimilarityNnParams,
 )
 from .loader import load_config
 
@@ -31,5 +34,8 @@ __all__ = [
     'ConfidenceScoringConfig',
     'OutputConfig',
     'ColumnConfig',
-    'load_config'
+    'EnsembleParams',
+    'SimilarityTfidfParams',
+    'SimilarityNnParams',
+    'load_config',
 ]

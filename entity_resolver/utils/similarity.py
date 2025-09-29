@@ -17,6 +17,7 @@ from .text import nfkc_normalize_series
 from .clean_mem import gpu_memory_cleanup
 from .matrix_ops import ensure_finite_matrix, prune_sparse_matrix, scale_by_frobenius_norm
 from .vector import normalize_rows
+from ..config import SimilarityTfidfParams, SimilarityNnParams
 
 # Set up a logger for this module.
 logger = logging.getLogger(__name__)
@@ -63,7 +64,7 @@ def _log_series_samples(
 def calculate_similarity_gpu(
     series_a: cudf.Series,
     series_b: cudf.Series,
-    tfidf_params: Dict
+    tfidf_params: SimilarityTfidfParams
 ) -> cudf.Series:
     """
     Calculates the row-wise cosine similarity between two cuDF string series,
@@ -123,8 +124,8 @@ def calculate_similarity_gpu(
     # Determine the minimum n-gram size from the TF-IDF parameters.
     # This is only necessary if the analyzer is character-based.
     min_n = 0
-    if tfidf_params.get('analyzer') in ['char', 'char_wb']:
-        min_n = min(tfidf_params.get('ngram_range', (1, 1)))
+    if tfidf_params.analyzer in ['char', 'char_wb']:
+        min_n = min(tfidf_params.ngram_range)
 
     # Create a single boolean mask to identify rows where BOTH strings are long enough.
     # This check is performed AFTER all cleaning to be as accurate as possible.
@@ -166,7 +167,7 @@ def calculate_similarity_gpu(
             logger.debug("Combined series for TF-IDF fitting is empty. No similarities to calculate.")
             return result_series
 
-        vectorizer = TfidfVectorizer(**tfidf_params)
+        vectorizer = TfidfVectorizer(**tfidf_params.model_dump())
         vectorizer.fit(combined_series)
         logger.debug(f"TF-IDF vectorizer fitted. Vocabulary size: {len(getattr(vectorizer, 'vocabulary_', {}))}")
 
@@ -379,8 +380,8 @@ def calculate_similarity_gpu(
 @gpu_memory_cleanup
 def find_similar_pairs(
     string_series: cudf.Series,
-    tfidf_params: Dict[str, Any],
-    nn_params: Dict[str, Any],
+    tfidf_params: SimilarityTfidfParams,
+    nn_params: SimilarityNnParams,
     distance_threshold: float
 ) -> cudf.DataFrame:
     """
@@ -410,11 +411,11 @@ def find_similar_pairs(
     logger.debug(f"Using distance threshold: {distance_threshold}")
 
     # Step 1: Vectorize the input strings into a TF-IDF matrix.
-    vectorizer = TfidfVectorizer(**tfidf_params)
+    vectorizer = TfidfVectorizer(**tfidf_params.model_dump())
     tfidf_matrix = vectorizer.fit_transform(string_series)
 
     # Step 2: Build and fit the NearestNeighbors model.
-    nn_model = NearestNeighbors(**nn_params)
+    nn_model = NearestNeighbors(**nn_params.model_dump())
     nn_model.fit(tfidf_matrix)
     distances, indices = nn_model.kneighbors(tfidf_matrix)
     logger.debug(f"Found neighbors for {len(indices)} items.")

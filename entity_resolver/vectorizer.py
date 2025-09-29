@@ -580,8 +580,15 @@ class MultiStreamVectorizer:
         current_vectors = vectors
         
         # Get stream-specific reduction parameters
-        svd_params = getattr(self.config, f"{stream_name}_svd_params")
-        pca_params = getattr(self.config, f"{stream_name}_pca_params", None)
+        if stream_name == 'tfidf':
+            svd_params = self.config.tfidf_svd_params
+            pca_params = self.config.tfidf_pca_params
+        elif stream_name == 'phonetic':
+            svd_params = self.config.phonetic_svd_params
+            pca_params = self.config.phonetic_pca_params
+        else:
+            # It's good practice to handle unexpected cases.
+            raise ValueError(f"Invalid stream name provided: '{stream_name}'")
 
         # Stage 1: SVD for initial reduction from sparse matrix
         if 'svd' in self.config.sparse_reducers:
@@ -648,7 +655,7 @@ class MultiStreamVectorizer:
         
         if is_training:
             logger.debug(f"Fitting TruncatedSVD for '{stream_name}' with params: {svd_params}")
-            svd_model = GPUTruncatedSVD(self.config.eigsh_fallback_params.model_dump(), svd_params)
+            svd_model = GPUTruncatedSVD(self.config.eigsh_fallback_params, svd_params)
             dense_vectors = svd_model.fit_transform(sparse_vectors)
             self.reduction_models[svd_key] = svd_model
             

@@ -36,7 +36,7 @@ Example:
 """
 
 import logging
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Union
 
 import cupy
 from cupyx.scipy.sparse import csr_matrix, spmatrix, isspmatrix_csr
@@ -48,7 +48,13 @@ from .utils import (
     prune_sparse_matrix,
     winsorize_matrix,
     scale_by_frobenius_norm,
-    create_initial_vector
+    create_initial_vector,
+    gpu_memory_cleanup,
+)
+from .config.schema import (
+    SvdEigshFallbackConfig, 
+    TfidfSvdParams, 
+    PhoneticSvdParams
 )
 
 # Set up module-level logger
@@ -99,43 +105,39 @@ class GPUTruncatedSVD:
 
     def __init__(
             self, 
-            fallback_config: Optional[Dict[str, Any]] = None, 
-            svds_kwargs: Optional[Dict[str, Any]] = None
+            fallback_config: SvdEigshFallbackConfig, 
+            svds_kwargs: Union[TfidfSvdParams, PhoneticSvdParams]
         ):
         """
-        Initialize the GPUTruncatedSVD transformer.
+        Initializes the GPUTruncatedSVD transformer.
 
         Args:
-            fallback_config:
-                A dictionary of parameters to control the robust SVD fallback mechanism.
-            svds_kwargs:
-                Additional keyword arguments to pass to the primary `svds` solver.
-                Common arguments include 'tol' for tolerance and 'maxiter' for
-                maximum iterations. `n_components` should also be passed here.
+            fallback_config: A validated `SvdEigshFallbackConfig` model instance
+                containing all parameters to control the robust SVD fallback mechanism.
+            svds_params: A validated Pydantic model instance, either `TfidfSvdParams`
+                or `PhoneticSvdParams`, which contains all parameters for the
+                primary `svds` solver, including `n_components`, `tol`, etc.
         """
-        self.svds_kwargs = svds_kwargs if svds_kwargs is not None else {}
-        self.n_components = self.svds_kwargs.pop('n_components', 256)
+        self.n_components = svds_kwargs.n_components
+        self.svds_kwargs = svds_kwargs.model_dump(exclude={'n_components'})
 
-        # Ensure fallback_config is a dict to prevent errors on .get() if it's None
-        safe_fallback_config = fallback_config or {}
+        self.fallback_config = fallback_config
 
         # --- Solver & Pre-processing Parameters ---
-        # Use .get() to safely retrieve each parameter from the config dictionary,
-        # providing a hardcoded default value if the key is not present.
         # Use high precision for the stable solver.
-        self.fallback_dtype = safe_fallback_config.get('fallback_dtype', cupy.float64)
+        self.fallback_dtype = fallback_config.fallback_dtype
         # Number of times to retry eigsh on failure.
-        self.eigsh_restarts = safe_fallback_config.get('eigsh_restarts', 3)
+        self.eigsh_restarts = fallback_config.eigsh_restarts
         # Threshold for removing near-empty rows.
-        self.prune_min_row_sum = safe_fallback_config.get('prune_min_row_sum', 1e-9)
+        self.prune_min_row_sum = fallback_config.prune_min_row_sum
         # Min document frequency for column pruning.
-        self.prune_min_df = safe_fallback_config.get('prune_min_df', 2)
+        self.prune_min_df = fallback_config.prune_min_df
         # Max document frequency ratio for column pruning.
-        self.prune_max_df_ratio = safe_fallback_config.get('prune_max_df_ratio', 0.98)
+        self.prune_max_df_ratio = fallback_config.prune_max_df_ratio
         # Preserve 99.5% of variance during column pruning.
-        self.prune_energy_cutoff = safe_fallback_config.get('prune_energy_cutoff', 0.995)
+        self.prune_energy_cutoff = fallback_config.prune_energy_cutoff
         # Clip top 0.1% of values to handle extreme outliers.
-        self.winsorize_limits: Tuple[Optional[float], Optional[float]] = safe_fallback_config.get('winsorize_limits', (None, 0.999))  
+        self.winsorize_limits = fallback_config.winsorize_limits
 
     def fit(self, input_matrix: spmatrix, target_variable: Optional[Any] = None) -> 'GPUTruncatedSVD':
         """
@@ -293,11 +295,7 @@ class GPUTruncatedSVD:
             )
 
             # --- Step 3c: Run `eigsh` with a Restart Mechanism ---
-            eigsh_parameters: Dict[str, Any] = {
-                'tol': self.svds_kwargs.get('tol', 1e-8),
-                'maxiter': self.svds_kwargs.get('maxiter', 20000),
-                'ncv': self.svds_kwargs.get('ncv', min(max(2 * self.n_components + 1, 20), augmented_matrix_dimension - 1))
-            }
+            eigsh_parameters: Dict[str, Any] = self.svds_kwargs.copy()
 
             eigenvalues, eigenvectors = None, None
             for attempt in range(self.eigsh_restarts):
@@ -344,6 +342,7 @@ class GPUTruncatedSVD:
 
         return transformed_matrix
 
+    @gpu_memory_cleanup
     def reset(self) -> None:
         """
         Resets the fitted model state to its initial, unfitted condition.
@@ -352,9 +351,8 @@ class GPUTruncatedSVD:
         `fit_transform` process, such as the SVD components and singular values.
         After calling `reset`, the instance is ready to be refitted on new data.
 
-        Note: This method does NOT explicitly free GPU memory. For that, call
-        `cupy.get_default_memory_pool().free_all_blocks()` separately after you
-        are finished with the SVD object and other large CuPy arrays.
+        Note: This method does NOT explicitly free GPU memory. For that, the
+        custom gpu_memory_cleanup decorator is used.
         """
         self.components_ = None
         self.singular_values_ = None

@@ -8,7 +8,7 @@ embeddings.
 import cupy
 import cupyx.scipy.sparse as cpx_sparse
 import logging
-from typing import Dict, List, Tuple, Union, Optional
+from typing import Dict, List, Tuple, Union, Optional, Literal
 
 # Set up a logger for this module
 logger = logging.getLogger(__name__)
@@ -806,7 +806,7 @@ def get_top_k_positive_eigenpairs(
 
 def balance_feature_streams(
     vector_streams: Dict[str, cupy.ndarray],
-    proportions: Dict[str, float]
+    proportions: Dict[Literal['semantic', 'tfidf', 'phonetic'], float]
 ) -> List[cupy.ndarray]:
     """
     Scales L2-normalized vector streams to their target energy proportions.

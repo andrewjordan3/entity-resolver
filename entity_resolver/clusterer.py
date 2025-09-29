@@ -33,8 +33,15 @@ from cuml.manifold import UMAP
 import cugraph
 
 # Local Package Imports
-from .config import ClustererConfig
-from . import utils
+from .config import ClustererConfig, EnsembleParams
+from .utils import (
+    normalize_rows,
+    build_mutual_rank_graph,
+    attach_noise_points,
+    merge_snn_clusters,
+    create_consensus_embedding,
+    gpu_memory_cleanup,
+)
 
 # Set up module-level logger
 logger = logging.getLogger(__name__)
@@ -74,15 +81,15 @@ class EntityClusterer:
         self.umap_ensemble: List[UMAP] = []
         
         # Extract random state for consistent seeding
-        self.random_state = self.config.umap_params.get("random_state", 42)
+        self.random_state = self.config.umap_params.random_state 
 
         # Initialize inverse vector mapping for UMAP input
         self._current_inverse_indices: cp.ndarray | None = None
         
         logger.info("Initialized EntityClusterer")
-        logger.debug(f"UMAP ensemble size: {config.umap_n_runs}")
-        logger.debug(f"HDBSCAN min_cluster_size: {config.hdbscan_params.get('min_cluster_size')}")
-        logger.debug(f"SNN k_neighbors: {config.snn_clustering_params.get('k_neighbors')}")
+        logger.debug(f"UMAP ensemble size: {self.config.umap_n_runs}")
+        logger.debug(f"HDBSCAN min_cluster_size: {self.config.hdbscan_params.min_cluster_size}")
+        logger.debug(f"SNN k_neighbors: {self.config.snn_clustering_params.k_neighbors}")
 
     # ========================================================================
     # PUBLIC API
@@ -278,7 +285,7 @@ class EntityClusterer:
         gdf["cluster"] = self.cluster_model.predict(reduced_vectors)
         
         # Assign default confidence for predictions
-        default_conf = float(self.config.ensemble_params.get("default_rescue_conf", 0.75))
+        default_conf = float(self.config.ensemble_params.default_rescue_conf)
         gdf["cluster_probability"] = cp.where(
             gdf["cluster"] != -1, 
             default_conf, 
@@ -385,14 +392,14 @@ class EntityClusterer:
         
         # Normalize vectors for cosine similarity - UMAP output is not normalized
         logger.debug("Normalizing vectors for cosine similarity")
-        vectors_norm = utils.normalize_rows(reduced_vectors, copy=True)
+        vectors_norm = normalize_rows(reduced_vectors, copy=True)
         
         # Stage 1: Community detection
         logger.info("SNN Stage 1: Building graph and finding communities")
         k_neighbors = self.config.snn_clustering_params["k_neighbors"]
         logger.debug(f"Building mutual rank graph with k={k_neighbors}")
         
-        snn_graph, _ = utils.build_mutual_rank_graph(vectors_norm, k_neighbors)
+        snn_graph, _ = build_mutual_rank_graph(vectors_norm, k_neighbors)
         
         if snn_graph.number_of_edges() == 0:
             logger.warning("SNN graph has no edges. All points treated as noise.")
@@ -426,7 +433,7 @@ class EntityClusterer:
 
         initial_noise = int((labels_to_use == -1).sum())
         
-        labels_after_attachment = utils.attach_noise_points(
+        labels_after_attachment = attach_noise_points(
             vectors_norm, 
             labels_to_use, 
             **self.config.noise_attachment_params
@@ -448,7 +455,7 @@ class EntityClusterer:
             'centroid_sample_size': self.config.centroid_sample_size,
         }
         
-        final_labels = utils.merge_snn_clusters(
+        final_labels = merge_snn_clusters(
             vectors_norm, 
             labels_after_attachment, 
             merge_params
@@ -465,6 +472,7 @@ class EntityClusterer:
         
         return final_labels
 
+    @gpu_memory_cleanup
     def _run_umap_ensemble(
         self, 
         vectors: cp.ndarray, 
@@ -587,7 +595,7 @@ class EntityClusterer:
         # Combine embeddings into consensus
         logger.info(f"Creating consensus from {len(umap_embeddings)} embeddings")
         
-        final_vectors = utils.create_consensus_embedding(
+        final_vectors = create_consensus_embedding(
             embeddings_list=umap_embeddings,
             n_anchor_samples=self.config.cosine_consensus_n_samples,
             batch_size=self.config.cosine_consensus_batch_size,
@@ -599,9 +607,8 @@ class EntityClusterer:
 
         # --- GPU Memory Cleanup ---
         # The umap_embeddings list can be very large. We delete it and
-        # call the garbage collector to free up GPU memory immediately.
+        # the decorator frees up GPU memory immediately.
         del umap_embeddings
-        cp.get_default_memory_pool().free_all_blocks()
         logger.debug("Cleaned up UMAP embedding list from GPU memory.")
         
         logger.info(f"UMAP ensemble complete: shape {final_vectors.shape}")
@@ -658,7 +665,7 @@ class EntityClusterer:
         )
         
         # Optionally mint new clusters
-        if params.get("allow_new_snn_clusters", True):
+        if params.allow_new_snn_clusters:
             new_clusters = self._mint_new_clusters(
                 final_labels, 
                 final_probs,
@@ -685,7 +692,7 @@ class EntityClusterer:
         self, 
         hdb_labels: cp.ndarray, 
         snn_labels: cp.ndarray,
-        params: Dict[str, Any]
+        params: EnsembleParams
     ) -> cudf.DataFrame:
         """
         Find best mapping from SNN clusters to HDBSCAN clusters.
@@ -723,8 +730,8 @@ class EntityClusterer:
         
         # Filter by purity and overlap thresholds
         valid_mappings = best_matches[
-            (best_matches["purity"] >= params["purity_min"]) &
-            (best_matches["overlap"] >= params["min_overlap"])
+            (best_matches["purity"] >= params.purity_min) &
+            (best_matches["overlap"] >= params.min_overlap)
         ][["snn", "hdb"]]
         
         logger.debug(f"Found {len(valid_mappings)} valid SNN->HDBSCAN mappings")
@@ -737,7 +744,7 @@ class EntityClusterer:
         noise_mask: cp.ndarray,
         snn_labels: cp.ndarray,
         snn_to_hdb_map: cudf.DataFrame,
-        params: Dict[str, Any]
+        params: EnsembleParams
     ) -> int:
         """
         Rescue HDBSCAN noise points using SNN clusters.
@@ -755,7 +762,7 @@ class EntityClusterer:
         final_labels[rescue_mask] = mapped_hdb_labels[rescue_mask]
         
         # Set confidence for rescued points
-        default_conf = float(params.get("default_rescue_conf", 0.75))
+        default_conf = float(params.default_rescue_conf)
         final_probs[rescue_mask] = default_conf
         
         return int(rescue_mask.sum())
@@ -767,7 +774,7 @@ class EntityClusterer:
         noise_mask: cp.ndarray,
         snn_labels: cp.ndarray,
         snn_to_hdb_map: cudf.DataFrame,
-        params: Dict[str, Any]
+        params: EnsembleParams
     ) -> int:
         """
         Create new clusters from large unmapped SNN groups.
@@ -783,7 +790,7 @@ class EntityClusterer:
         new_cluster_candidates = unmapped_snn[
             (unmapped_snn["snn"] != -1) & 
             unmapped_snn["hdb"].isnull() &
-            (unmapped_snn["size"] >= params["min_newcluster_size"])
+            (unmapped_snn["size"] >= params.min_newcluster_size)
         ]
         
         if new_cluster_candidates.empty:
@@ -807,7 +814,7 @@ class EntityClusterer:
         final_labels[assign_new_mask] = new_ids[assign_new_mask]
         
         # Set confidence for new clusters
-        default_conf = float(params.get("default_rescue_conf", 0.75))
+        default_conf = float(params.default_rescue_conf)
         final_probs[assign_new_mask] = default_conf
         
         return len(candidate_ids)
@@ -962,21 +969,21 @@ class EntityClusterer:
             Dictionary of UMAP parameters optimized for the chosen view type
         """
         # Start with base UMAP parameters as template
-        umap_params = self.config.umap_params.copy()
         sampling_config = self.config.umap_ensemble_sampling_config
+        umap_params = self.config.umap_params.model_dump()
         
         if run_index == 0:
             # First run: Use stable base parameters as anchor for ensemble.
             # This provides a consistent reference point across different random seeds
             # and helps prevent the ensemble from being too unstable.
             logger.debug("UMAP run 1: Using base parameters as stable anchor")
-            umap_params["random_state"] = self._get_run_seed(run_index)
+            umap_params['random_state'] = self._get_run_seed(run_index)
             return umap_params
         
         # For subsequent runs, generate diverse parameters with view-based correlation
         
         # Determine view type using configured probability
-        local_view_probability = sampling_config["local_view_ratio"]
+        local_view_probability = sampling_config.local_view_ratio
         is_local_view = rng.random() < local_view_probability
         view_type = "LOCAL" if is_local_view else "GLOBAL"
         
@@ -985,11 +992,11 @@ class EntityClusterer:
         # Global view uses upper portions for better separation
         if is_local_view:
             # Local view parameter range selections
-            n_neighbors_range = sampling_config["n_neighbors_local"]
+            n_neighbors_range = sampling_config.n_neighbors_local
             
             # Use lower 60% of min_dist range (logarithmic scale for multiplicative effect)
             min_dist_range = self._get_sub_range(
-                sampling_config.get("min_dist", [0.001, 0.1]),
+                sampling_config.min_dist,
                 start_percent=0.0,
                 end_percent=0.6,
                 use_log_scale=True
@@ -997,7 +1004,7 @@ class EntityClusterer:
             
             # Use lower 60% of spread range (linear scale for additive effect)
             spread_range = self._get_sub_range(
-                sampling_config.get("spread", [0.5, 1.5]),
+                sampling_config.spread,
                 start_percent=0.0,
                 end_percent=0.6,
                 use_log_scale=False
@@ -1010,11 +1017,11 @@ class EntityClusterer:
             
         else:
             # Global view parameter range selections
-            n_neighbors_range = sampling_config["n_neighbors_global"]
+            n_neighbors_range = sampling_config.n_neighbors_global
             
             # Use upper 60% of min_dist range (starting at 40%)
             min_dist_range = self._get_sub_range(
-                sampling_config.get("min_dist", [0.001, 0.1]),
+                sampling_config.min_dist,
                 start_percent=0.4,
                 end_percent=1.0,
                 use_log_scale=True
@@ -1022,7 +1029,7 @@ class EntityClusterer:
             
             # Use upper 60% of spread range
             spread_range = self._get_sub_range(
-                sampling_config.get("spread", [0.5, 1.5]),
+                sampling_config.spread,
                 start_percent=0.4,
                 end_percent=1.0,
                 use_log_scale=False
@@ -1036,7 +1043,7 @@ class EntityClusterer:
         # --- Sample Core Parameters ---
         
         # n_neighbors: uniformly sampled within the view-specific range
-        umap_params["n_neighbors"] = int(
+        umap_params['n_neighbors'] = int(
             rng.integers(low=n_neighbors_range[0], high=n_neighbors_range[1], endpoint=True)
         )
         
@@ -1049,7 +1056,7 @@ class EntityClusterer:
         
         # Repulsion strength: linear scaling (additive force effect)
         repulsion_sub_range = self._get_sub_range(
-            sampling_config["repulsion_strength"],
+            sampling_config.repulsion_strength,
             start_percent=repulsion_percent_range[0],
             end_percent=repulsion_percent_range[1],
             use_log_scale=False
@@ -1060,7 +1067,7 @@ class EntityClusterer:
         
         # Negative sample rate: logarithmic scaling (multiplicative optimization effect)
         negative_sample_sub_range = self._get_sub_range(
-            sampling_config["negative_sample_rate"],
+            sampling_config.negative_sample_rate,
             start_percent=negative_sample_percent_range[0],
             end_percent=negative_sample_percent_range[1],
             use_log_scale=True
@@ -1071,7 +1078,7 @@ class EntityClusterer:
         
         # Number of epochs: linear scaling (additive iteration effect)
         epochs_sub_range = self._get_sub_range(
-            sampling_config["n_epochs"],
+            sampling_config.n_epochs,
             start_percent=epochs_percent_range[0],
             end_percent=epochs_percent_range[1],
             use_log_scale=False
@@ -1087,14 +1094,14 @@ class EntityClusterer:
         
         # Learning rate: controls optimization step size
         # Full range sampling for diverse convergence behavior
-        learning_rate_range = sampling_config["learning_rate"]
+        learning_rate_range = sampling_config.learning_rate
         umap_params["learning_rate"] = float(
             rng.uniform(learning_rate_range[0], learning_rate_range[1])
         )
         
         # Initialization strategy: starting point for optimization
         # Random selection helps explore different local optima
-        init_strategies = sampling_config["init_strategies"]
+        init_strategies = sampling_config.init_strategies
         umap_params["init"] = rng.choice(init_strategies).item()
         
         # Set unique but deterministic random seed for this run
