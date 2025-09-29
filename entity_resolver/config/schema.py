@@ -686,20 +686,66 @@ class PhoneticPcaParams(BaseModel):
         description="Seed for reproducibility, propagated from global config."
     )
 
-class SimilarityTfidfParams(TfidfParams): # Inherits validation
+class SimilarityTfidfParams(BaseModel):
     """
     Parameters for the fallback TF-IDF model, used for high-precision 
     pairwise string similarity checks.
     """
-    norm: Literal["l1", "l2", None] = Field(
-        default="l2", 
-        description="Vector normalization type. 'l2' (Euclidean) is standard for cosine similarity."
+    model_config = ConfigDict(extra='forbid')
+    
+    # Explicitly define all fields you want (excluding dtype)
+    analyzer: Literal["char", "word", "char_wb"] = Field(
+        default="char",
+        description="Level at which to generate features."
+    )
+    ngram_range: Tuple[int, int] = Field(
+        default=(3, 5),
+        description="Range of n-gram sizes to extract."
     )
     max_features: Optional[int] = Field(
-        default=50000, 
-        gt=0, 
+        default=50000,  
+        gt=0,
         description="Uses a larger vocabulary for more granular similarity comparisons."
     )
+    max_df: Union[float, int] = Field(
+        default=0.99,
+        description="Ignore terms with a document frequency strictly higher than the given threshold."
+    )
+    min_df: Union[float, int] = Field(
+        default=2,
+        description="Minimum document frequency."
+    )
+    sublinear_tf: bool = Field(
+        default=True,
+        description="Apply sublinear TF scaling."
+    )
+    norm: Literal["l1", "l2", None] = Field(
+        default="l2",
+        description="Vector normalization type. 'l2' (Euclidean) is standard for cosine similarity."
+    )
+    
+    # Add the same validators you had in TfidfParams (minus dtype-related ones)
+    @field_validator('ngram_range')
+    @classmethod
+    def validate_ngram_range(cls, v: Tuple[int, int]) -> Tuple[int, int]:
+        low, high = v
+        if not (isinstance(low, int) and isinstance(high, int) and low > 0 and high > 0):
+            raise ValueError("ngram_range values must be positive integers.")
+        if low > high:
+            raise ValueError(f"In ngram_range, the lower bound ({low}) cannot be greater than the upper bound ({high}).")
+        return v
+    
+    @field_validator('min_df', 'max_df')
+    @classmethod
+    def validate_df(cls, v: Union[float, int], field_info) -> Union[float, int]:
+        name = field_info.field_name
+        if isinstance(v, float):
+            if not (0.0 <= v <= 1.0):
+                raise ValueError(f"If `{name}` is a float, it must be in the range [0.0, 1.0].")
+        elif isinstance(v, int):
+            if v < 1:
+                raise ValueError(f"If `{name}` is an int, it must be >= 1.")
+        return v
 
 class SimilarityNnParams(BaseModel):
     """

@@ -167,7 +167,7 @@ def calculate_similarity_gpu(
             logger.debug("Combined series for TF-IDF fitting is empty. No similarities to calculate.")
             return result_series
 
-        vectorizer = TfidfVectorizer(**tfidf_params.model_dump())
+        vectorizer = TfidfVectorizer(**tfidf_params)
         vectorizer.fit(combined_series)
         logger.debug(f"TF-IDF vectorizer fitted. Vocabulary size: {len(getattr(vectorizer, 'vocabulary_', {}))}")
 
@@ -411,7 +411,7 @@ def find_similar_pairs(
     logger.debug(f"Using distance threshold: {distance_threshold}")
 
     # Step 1: Vectorize the input strings into a TF-IDF matrix.
-    vectorizer = TfidfVectorizer(**tfidf_params.model_dump())
+    vectorizer = TfidfVectorizer(**tfidf_params)
     tfidf_matrix = vectorizer.fit_transform(string_series)
 
     # Step 2: Build and fit the NearestNeighbors model.
