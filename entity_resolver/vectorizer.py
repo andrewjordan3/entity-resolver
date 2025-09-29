@@ -434,7 +434,7 @@ class MultiStreamVectorizer:
         if is_training:
             # Configure and fit new phonetic vectorizer
             logger.debug(f"Fitting phonetic vectorizer with params: {self.config.phonetic_params}")
-            model = CountVectorizer(**self.config.phonetic_params)
+            model = CountVectorizer(**self.config.phonetic_params.model_dump())
             sparse_vectors = model.fit_transform(text_series)
             
             self.trained_encoders[encoder_key] = model
