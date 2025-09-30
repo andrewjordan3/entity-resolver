@@ -10,7 +10,7 @@ entities sharing common addresses.
 import re
 import logging
 from typing import Dict
-
+import pandas as pd
 import cudf
 
 # Local Package Imports
@@ -420,257 +420,203 @@ class TextNormalizer:
     
     def consolidate_by_address(self, gdf: cudf.DataFrame) -> cudf.DataFrame:
         """
-        Consolidate multiple entity names sharing the same address.
+        Consolidates multiple entity names at the same address using vectorized GPU operations.
 
-        For records sharing an address, this method identifies the best
-        canonical name to represent all entities at that location. This helps
-        resolve cases where the same business operates under slight name
-        variations at a single address.
+        This method identifies the single best canonical name to represent all entities
+        at each location, resolving name variations for the same business. All
+        operations are performed on the GPU to maximize performance.
 
         Args:
-            gdf: cuDF DataFrame with 'addr_normalized_key' and 'normalized_text' columns
+            gdf: A cuDF DataFrame containing 'addr_normalized_key' and 'normalized_text'.
 
         Returns:
-            cuDF DataFrame with consolidated names in 'normalized_text' column
+            A new cuDF DataFrame with the 'normalized_text' column updated with
+            canonical names.
 
         Raises:
-            KeyError: If required columns are missing
+            KeyError: If required columns are missing from the input DataFrame.
         """
-        # Reset consolidation stats
+        # --- 1. Initialization and Validation ---
         self._consolidation_stats = {
-            'total_addresses': 0,
-            'addresses_with_multiple_names': 0,
-            'records_affected': 0,
-            'names_changed': 0,
-            'unique_before': 0,
-            'unique_after': 0,
-            'empty_addresses_skipped': 0,
+            'total_addresses': 0, 'addresses_with_multiple_names': 0,
+            'records_affected': 0, 'names_changed': 0, 'unique_before': 0,
+            'unique_after': 0, 'empty_addresses_skipped': 0,
             'consolidation_examples': []
         }
-        
-        # Validate required columns
         required_columns = ['addr_normalized_key', 'normalized_text']
-        missing_columns = [col for col in required_columns if col not in gdf.columns]
-        if missing_columns:
-            raise KeyError(f"Missing required columns: {missing_columns}")
-        
+        if any(col not in gdf.columns for col in required_columns):
+            raise KeyError(f"Missing one or more required columns: {required_columns}")
+
         logger.info("=" * 60)
         logger.info("Starting address-based name consolidation")
         logger.info("=" * 60)
-        
-        # First, check how many addresses are empty or invalid
-        empty_addresses = (gdf['addr_normalized_key'] == '') | gdf['addr_normalized_key'].isna()
-        empty_count = empty_addresses.sum()
-        
-        if empty_count > 0:
-            logger.warning(f"Found {empty_count:,} records with empty/invalid addresses - these will be skipped")
-            self._consolidation_stats['empty_addresses_skipped'] = int(empty_count)
-        
-        # Filter out empty addresses for consolidation
-        valid_address_mask = ~empty_addresses
-        valid_gdf = gdf[valid_address_mask]
-        
-        if len(valid_gdf) == 0:
-            logger.warning("No valid addresses found for consolidation")
+
+        # --- 2. Identify Records to Process ---
+        empty_address_mask = (gdf['addr_normalized_key'] == '') | gdf['addr_normalized_key'].isna()
+        num_empty_addresses = int(empty_address_mask.sum())
+        self._consolidation_stats['empty_addresses_skipped'] = num_empty_addresses
+        if num_empty_addresses > 0:
+            logger.warning(f"Found {num_empty_addresses:,} records with empty addresses to be skipped.")
+
+        valid_records_gdf = gdf[~empty_address_mask]
+        if valid_records_gdf.empty:
+            logger.warning("No valid addresses found for consolidation.")
             return gdf
-        
-        # Count unique names per address (excluding empty addresses)
-        logger.info("Analyzing name variations per address...")
-        name_counts_per_address = valid_gdf.groupby('addr_normalized_key')['normalized_text'].nunique()
-        
-        # Get detailed statistics
-        total_unique_addresses = len(name_counts_per_address)
-        self._consolidation_stats['total_addresses'] = total_unique_addresses
-        
-        # Log distribution of name counts
-        name_count_distribution = name_counts_per_address.value_counts().sort_index()
-        logger.debug("Distribution of name counts per address:")
-        distribution_pd = name_count_distribution.head(10).to_pandas()
-        for count, freq in distribution_pd.items():
-            logger.debug(f"  - {count} names: {freq:,} addresses")
-        
-        # Identify addresses with multiple names
-        addresses_to_consolidate = name_counts_per_address[name_counts_per_address > 1].index
-        consolidation_needed = len(addresses_to_consolidate)
-        self._consolidation_stats['addresses_with_multiple_names'] = consolidation_needed
-        
-        if consolidation_needed == 0:
-            logger.info("No addresses found with multiple names - skipping consolidation")
+
+        self._consolidation_stats['unique_before'] = int(gdf['normalized_text'].nunique())
+
+        # --- 3. Find Addresses with Multiple Names ---
+        logger.info("Analyzing name variations per address on GPU...")
+        names_per_address = valid_records_gdf.groupby('addr_normalized_key')['normalized_text'].nunique()
+        self._consolidation_stats['total_addresses'] = len(names_per_address)
+
+        addresses_to_consolidate_index = names_per_address[names_per_address > 1].index
+        num_to_consolidate = len(addresses_to_consolidate_index)
+        self._consolidation_stats['addresses_with_multiple_names'] = num_to_consolidate
+
+        if num_to_consolidate == 0:
+            logger.info("No addresses found with multiple names. Skipping consolidation.")
             self._log_consolidation_summary()
             return gdf
-        
-        logger.info(
-            f"Found {consolidation_needed:,}/{total_unique_addresses:,} addresses "
-            f"({consolidation_needed/total_unique_addresses:.1%}) with multiple names"
-        )
-        
-        # Get statistics on name variations
-        name_variations = name_counts_per_address[addresses_to_consolidate]
-        max_names = int(name_variations.max())
-        avg_names = float(name_variations.mean())
-        median_names = float(name_variations.median())
-        
-        logger.info(f"Name variations statistics:")
-        logger.info(f"  - Maximum names at one address: {max_names}")
-        logger.info(f"  - Average names per address: {avg_names:.2f}")
-        logger.info(f"  - Median names per address: {median_names:.1f}")
-        
-        # Filter to relevant records
-        subset_gdf = gdf[gdf['addr_normalized_key'].isin(addresses_to_consolidate)]
-        affected_records = len(subset_gdf)
-        self._consolidation_stats['records_affected'] = affected_records
-        logger.info(f"Processing {affected_records:,} records for consolidation")
-        
-        # Track unique names before consolidation
-        unique_before = gdf['normalized_text'].nunique()
-        self._consolidation_stats['unique_before'] = int(unique_before)
-        
-        # Build canonical name mapping
-        logger.info("Determining canonical names for each address...")
-        address_to_canonical_map = self._build_canonical_mapping(
-            subset_gdf, 
-            addresses_to_consolidate
-        )
-        
-        if not address_to_canonical_map:
-            logger.warning("No canonical names determined - returning original DataFrame")
-            self._log_consolidation_summary()
-            return gdf
-        
-        # Apply consolidation
-        logger.info("Applying canonical name mapping...")
-        gdf = self._apply_canonical_mapping(gdf, address_to_canonical_map)
-        
-        # Track unique names after consolidation
-        unique_after = gdf['normalized_text'].nunique()
-        self._consolidation_stats['unique_after'] = int(unique_after)
-        
-        # Log summary
+
+        logger.info(f"Found {num_to_consolidate:,} addresses with multiple name variations to consolidate.")
+
+        # --- 4. Build and Apply Canonical Mapping ---
+        # Isolate only the records that are part of the consolidation effort.
+        consolidation_subset_gdf = valid_records_gdf[
+            valid_records_gdf['addr_normalized_key'].isin(addresses_to_consolidate_index)
+        ]
+        self._consolidation_stats['records_affected'] = len(consolidation_subset_gdf)
+        logger.info(f"Processing {len(consolidation_subset_gdf):,} records across {num_to_consolidate:,} addresses.")
+
+        # This is the core step. It produces a DataFrame mapping each address to its canonical name.
+        canonical_map_df = self._build_canonical_mapping(consolidation_subset_gdf)
+
+        # Merge the canonical names back into the original DataFrame.
+        # This adds a 'canonical_name' column, which will be null for addresses that didn't need consolidation.
+        gdf_with_canonicals = gdf.merge(canonical_map_df, on='addr_normalized_key', how='left')
+
+        # Apply the new names and calculate final statistics.
+        consolidated_gdf = self._apply_canonical_mapping(gdf_with_canonicals)
+
+        # --- 5. Finalize and Report ---
+        self._consolidation_stats['unique_after'] = int(consolidated_gdf['normalized_text'].nunique())
         self._log_consolidation_summary()
-        
-        return gdf
-    
-    def _build_canonical_mapping(
-        self, 
-        subset_gdf: cudf.DataFrame, 
-        addresses_to_consolidate: cudf.Index
-    ) -> Dict[str, str]:
+
+        return consolidated_gdf
+
+    def _build_canonical_mapping(self, consolidation_subset_gdf: cudf.DataFrame) -> cudf.DataFrame:
         """
-        Build mapping from addresses to canonical names.
-        
+        Builds a canonical name mapping using fully vectorized GPU operations.
+
+        This method groups records by address, applies a sophisticated name selection
+        function to each group in parallel on the GPU, and returns a DataFrame that
+        maps each address to its single chosen canonical name.
+
         Args:
-            subset_gdf: DataFrame filtered to addresses needing consolidation
-            addresses_to_consolidate: Index of addresses with multiple names
-            
+            consolidation_subset_gdf: A DataFrame containing only the records for
+                                      addresses that require consolidation.
+
         Returns:
-            Dictionary mapping address keys to canonical names
+            A cuDF DataFrame with two columns: 'addr_normalized_key' and 'canonical_name'.
         """
-        address_to_canonical_map = {}
-        
-        # Convert to list for processing
-        addresses_list = addresses_to_consolidate.to_pandas()
-        total_addresses = len(addresses_list)
-        
-        # Process in batches with progress tracking
-        batch_size = 1000
-        examples_collected = 0
-        max_examples = 10
-        
-        for i in range(0, total_addresses, batch_size):
-            batch = addresses_list[i:i+batch_size]
-            
-            for addr_key in batch:
-                # Get all names at this address
-                names_at_address = subset_gdf[
-                    subset_gdf['addr_normalized_key'] == addr_key
-                ]['normalized_text']
-                
-                # Skip if no names found (shouldn't happen but be safe)
-                if len(names_at_address) == 0:
-                    continue
-                
-                # Get unique names and their frequencies
-                name_counts = names_at_address.value_counts()
-                
-                # Collect examples for logging
-                if examples_collected < max_examples and len(name_counts) > 1:
-                    example = {
-                        'address': addr_key[:50] + '...' if len(addr_key) > 50 else addr_key,
-                        'names': name_counts.head(3).to_pandas().to_dict(),
-                        'canonical': None  # Will be set below
-                    }
-                    
-                    # Determine canonical name
-                    canonical_name = get_canonical_name_gpu(names_at_address, self.vectorizer_config.similarity_tfidf)
-                    example['canonical'] = canonical_name
-                    
-                    self._consolidation_stats['consolidation_examples'].append(example)
-                    examples_collected += 1
-                else:
-                    # Just determine canonical name without logging
-                    canonical_name = get_canonical_name_gpu(names_at_address, self.vectorizer_config.similarity_tfidf)
-                
-                address_to_canonical_map[addr_key] = canonical_name
-            
-            # Progress logging
-            if (i + batch_size) % 5000 == 0 or (i + batch_size) >= total_addresses:
-                progress = min(i + batch_size, total_addresses)
-                logger.debug(f"  - Processed {progress:,}/{total_addresses:,} addresses ({progress/total_addresses:.1%})")
-        
-        logger.info(f"Built canonical mapping for {len(address_to_canonical_map):,} addresses")
-        
-        # Log examples
-        if self._consolidation_stats['consolidation_examples']:
-            logger.debug("Sample consolidation decisions:")
-            for idx, example in enumerate(self._consolidation_stats['consolidation_examples'][:5], 1):
-                logger.debug(f"  Example {idx}:")
-                logger.debug(f"    Address: {example['address']}")
-                logger.debug(f"    Names found: {example['names']}")
-                logger.debug(f"    Canonical chosen: {example['canonical']}")
-        
-        return address_to_canonical_map
-    
-    def _apply_canonical_mapping(
-        self, 
-        gdf: cudf.DataFrame, 
-        address_to_canonical_map: Dict[str, str]
-    ) -> cudf.DataFrame:
+        # --- Step 1: Group by Address and Collect All Associated Names ---
+        # This is the core of the vectorization strategy. We perform a single
+        # `groupby` operation on the GPU. For each 'addr_normalized_key', we
+        # aggregate all 'normalized_text' values into a list. The result is a
+        # Series where the index is the unique address key.
+        logger.debug("Grouping names by address and applying canonical selection function on GPU...")
+        grouped_names_by_address = consolidation_subset_gdf.groupby('addr_normalized_key')['normalized_text'].agg('collect')
+
+        # --- Step 2: Apply the Canonical Name Function to Each Group ---
+        # The `.apply()` method executes a function on each list of names in
+        # parallel on the GPU, determining the single best name for that group.
+        def select_canonical_name(names_in_group: cudf.Series) -> str:
+            """UDF wrapper for the apply call for type clarity."""
+            return get_canonical_name_gpu(names_in_group, self.vectorizer_config.similarity_tfidf)
+
+        canonical_names_series = grouped_names_by_address.apply(select_canonical_name)
+
+        # --- Step 3: Log Examples and Format the Final Output ---
+        self._log_consolidation_examples(grouped_names_by_address, canonical_names_series)
+
+        # Convert the resulting Series (index='addr_normalized_key', value='canonical_name')
+        # into a two-column DataFrame, which is the final mapping table.
+        canonical_map_df = canonical_names_series.reset_index(name='canonical_name')
+        logger.info(f"Built canonical mapping for {len(canonical_map_df):,} addresses.")
+
+        return canonical_map_df
+
+    def _apply_canonical_mapping(self, gdf_with_canonicals: cudf.DataFrame) -> cudf.DataFrame:
         """
-        Apply canonical name mapping to DataFrame.
-        
+        Applies the canonical name mapping using vectorized GPU operations.
+
+        This method updates the 'normalized_text' column with canonical names where
+        available and calculates statistics about the changes made.
+
         Args:
-            gdf: Original DataFrame
-            address_to_canonical_map: Mapping from addresses to canonical names
-            
+            gdf_with_canonicals: The DataFrame with the 'canonical_name' column merged in.
+
         Returns:
-            DataFrame with consolidated names
+            A new DataFrame with consolidated names in the 'normalized_text' column.
         """
-        # Create mapping DataFrame for efficient merge
-        consolidation_map_gdf = cudf.DataFrame({
-            'addr_normalized_key': list(address_to_canonical_map.keys()),
-            'canonical_name': list(address_to_canonical_map.values())
-        })
+        logger.info("Applying canonical name mapping to the dataset...")
+        # Create a boolean mask to identify records that have a new canonical name.
+        has_canonical_mask = gdf_with_canonicals['canonical_name'].notna()
 
-        # Store original names as a temporary column to prevent index misalignment after merge
-        gdf['original_names_temp'] = gdf['normalized_text']
-        
-        # Merge and update normalized_text
-        gdf = gdf.merge(consolidation_map_gdf, on='addr_normalized_key', how='left')
-        gdf['normalized_text'] = gdf['canonical_name'].fillna(gdf['normalized_text'])
+        # Create a mask to identify where the name will actually change.
+        name_changed_mask = has_canonical_mask & (
+            gdf_with_canonicals['normalized_text'] != gdf_with_canonicals['canonical_name']
+        )
+        num_names_changed = int(name_changed_mask.sum())
+        self._consolidation_stats['names_changed'] = num_names_changed
 
-        affected_mask = gdf['canonical_name'].notna()
+        # Use .copy() to avoid modifying the original DataFrame in place.
+        result_gdf = gdf_with_canonicals.copy()
 
-        # Authoritative denominator: rows that actually had a canonical available
-        self._consolidation_stats['records_affected'] = int(affected_mask.sum())
+        # The core update operation. Where 'canonical_name' is not null, use it;
+        # otherwise, keep the existing 'normalized_text'. This is a fast, vectorized update.
+        result_gdf['normalized_text'] = result_gdf['canonical_name'].fillna(result_gdf['normalized_text'])
+
+        # Drop the temporary helper column.
+        result_gdf = result_gdf.drop(columns=['canonical_name'])
         
-        # Count changes
-        names_changed = (gdf['normalized_text'] != gdf['original_names_temp']).sum()
-        self._consolidation_stats['names_changed'] = int(names_changed)
+        logger.info(f"Applied canonical names: {num_names_changed:,} records had their names changed.")
+        return result_gdf
+
+    def _log_consolidation_examples(
+        self,
+        grouped_names: cudf.Series,
+        canonical_names: cudf.Series,
+        max_examples: int = 5
+    ):
+        """Logs a sample of consolidation decisions for debugging and transparency."""
+        # This helper function creates a sample of "before and after" data for logging.
+        if grouped_names.empty or not logger.isEnabledFor(logging.DEBUG):
+            return
+
+        examples_df = cudf.DataFrame({'all_names': grouped_names, 'canonical_name': canonical_names})
+        sample_size = min(len(examples_df), max_examples)
         
-        # Clean up temporary column
-        gdf = gdf.drop(columns=['canonical_name', 'original_names_temp'])
-        
-        return gdf
+        if sample_size == 0: return
+
+        # Transfer only the small sample to pandas for easy iteration and logging.
+        examples_to_log = examples_df.head(sample_size).to_pandas()
+
+        logger.debug("--- Sample of Address Consolidation Decisions ---")
+        for idx, (address, row) in enumerate(examples_to_log.iterrows(), 1):
+            name_counts = pd.Series(row['all_names']).value_counts().head(3).to_dict()
+            truncated_address = address[:70] + '...' if len(address) > 70 else address
+            logger.debug(f"  Example {idx} | Address: {truncated_address}")
+            logger.debug(f"    - Names Found:      {name_counts}")
+            logger.debug(f"    - Canonical Chosen: '{row['canonical_name']}'")
+
+            # Store the formatted example if a stats dictionary is configured.
+            self._consolidation_stats['consolidation_examples'].append({
+                'address': truncated_address,
+                'names': name_counts,
+                'canonical': row['canonical_name']
+            })
     
     def _log_consolidation_summary(self) -> None:
         """Log comprehensive summary of consolidation results."""

@@ -293,6 +293,17 @@ class ClusterRefiner:
         result_dataframe['canonical_address'] = result_dataframe['canonical_address'].fillna(
             result_dataframe['addr_normalized_key']
         )
+
+        # Convert the pipe-delimited key into a more human-readable address string
+        # by replacing pipes with spaces and normalizing any resulting whitespace.
+        # This is the last step before the address is considered final.
+        logger.debug("Formatting canonical_address for human readability...")
+        result_dataframe['canonical_address'] = (
+            result_dataframe['canonical_address']
+            .str.replace('|', ' ', regex=False)
+            .str.normalize_spaces()
+            .str.strip()
+        )
         
         # Apply final case formatting based on output configuration
         if self.output_config.output_format == 'proper':
@@ -391,10 +402,12 @@ class ClusterRefiner:
         # 2. Missing street name (primary indicator of incomplete address)
         # 3. Match the canonical city, state, and zip exactly
         missing_street_mask = (gdf['addr_street_name'].isna()) | (gdf['addr_street_name'] == '')
+        canonical_street_name_exists = (gdf['canonical_street_name'].notna()) & (gdf['canonical_street_name'] != '')
         
         enrichment_eligible_mask = (
             (gdf['cluster'] != -1) &
             missing_street_mask &
+            canonical_street_name_exists &
             (gdf['addr_city'] == gdf['canonical_city']) &
             (gdf['addr_state'] == gdf['canonical_state']) &
             (gdf['addr_zip'] == gdf['canonical_zip'])
@@ -581,9 +594,7 @@ class ClusterRefiner:
                         conflict_records_df
                         .groupby([
                             'final_cluster', 
-                            'addr_street_name', 
-                            'addr_zip', 
-                            'addr_street_number'
+                            'addr_normalized_key'
                         ])
                         .ngroup()
                     )

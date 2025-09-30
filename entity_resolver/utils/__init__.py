@@ -31,7 +31,8 @@ from .address import (
     safe_parse_address,
     create_address_key_gpu,
     calculate_address_score_gpu,
-    get_best_address_gpu
+    get_best_address_gpu,
+    normalize_us_states
 )
 
 # Similarity calculations
@@ -92,6 +93,7 @@ __all__ = [
     'create_address_key_gpu',
     'calculate_address_score_gpu',
     'get_best_address_gpu',
+    'normalize_us_states',
 
     # similarity.py
     'calculate_similarity_gpu',

@@ -25,6 +25,7 @@ from .utils import (
     find_graph_components, 
     find_similar_pairs, 
     calculate_address_score_gpu,
+    normalize_us_states,
 )
 
 # Set up module-level logger
@@ -66,14 +67,8 @@ class AddressProcessor:
         # Pre-compile regex patterns for maximum efficiency. Compiling them once
         # during initialization avoids the significant overhead of repeated
         # compilation when processing large datasets.
-        # This pattern identifies and removes zero-width, control, and non-standard
-        # space characters that can be invisible but disrupt tokenization.
-        self.ZW_CTRL_PATTERN = re.compile(r'[\u00A0\u1680\u180E\u2000-\u200D\u202F\u205F\u2060\u3000\uFEFF\u0000-\u001F\u007F]+')
         # This pattern finds common separators and is used to normalize them to a single space.
         self.SEPS_PATTERN = re.compile(r'[,\|;/]+')
-        # This pattern is used to identify and discard address fragments that contain
-        # only punctuation and whitespace, which are effectively noise.
-        self.PUNCT_ONLY_PATTERN = re.compile(r'^[\s.,;#_/\\-]+$')
         
         logger.info("Initialized AddressProcessor")
         logger.debug(f"Address columns configured: {column_config.address_cols}")
@@ -250,13 +245,6 @@ class AddressProcessor:
             # combining marks. This creates a canonical text representation for parsing.
             address_part = nfkc_normalize_series(address_part)
 
-            # Step 2: Remove disruptive characters and normalize separators. Zero-width,
-            # control, and non-standard space characters can break tokenization logic
-            # and are often invisible. Removing them prevents hard-to-debug parsing errors.
-            # Common separators are then collapsed into a single space for consistency.
-            #address_part = address_part.str.replace(self.ZW_CTRL_PATTERN.pattern, '', regex=True)
-            #address_part = address_part.str.replace(self.SEPS_PATTERN.pattern, ' ', regex=True)
-
             # Step 3: Convert to lowercase. libpostal is largely case-insensitive, but
             # providing a consistently cased string is a best practice that removes
             # any potential ambiguity for its statistical model.
@@ -267,9 +255,6 @@ class AddressProcessor:
             # that only contained "-"). These are effectively noise and should be
             # treated as empty strings to avoid junk tokens in the final address.
             address_part = address_part.str.strip()
-            # The `where` clause acts as a conditional replacement: if the part does NOT
-            # match the punctuation-only pattern, keep it; otherwise, replace it with ''.
-            #address_part = address_part.where(~address_part.str.match(self.PUNCT_ONLY_PATTERN.pattern), other='')
 
             address_parts.append(address_part)
 
@@ -383,6 +368,11 @@ class AddressProcessor:
             else:
                 out_gdf[new_col] = out_gdf[new_col].fillna("").astype("str")
         
+        # Normalize US state names to their full, lowercase form. This ensures
+        # consistency before the address key is created.
+        logger.debug("Normalizing US state names in 'addr_state' column")
+        out_gdf = normalize_us_states(out_gdf, "addr_state")
+
         # Create normalized address key
         logger.debug("Creating normalized address key")
         out_gdf["addr_normalized_key"] = create_address_key_gpu(out_gdf)
@@ -420,10 +410,15 @@ class AddressProcessor:
     
     def _consolidate_similar_addresses(self, gdf: cudf.DataFrame) -> cudf.DataFrame:
         """
-        Find and consolidate near-duplicate addresses.
+        Find and consolidate near-duplicate addresses with validation.
         
         This method identifies similar addresses using TF-IDF similarity
-        and graph components, then replaces variations with canonical forms.
+        and graph components, validates them against business rules,
+        then replaces variations with canonical forms.
+        
+        Validation includes:
+        - Street number difference threshold checking
+        - State boundary enforcement (optional)
         
         Args:
             gdf: DataFrame with parsed address components
@@ -431,9 +426,11 @@ class AddressProcessor:
         Returns:
             DataFrame with consolidated address keys
         """
-        logger.info("Starting address consolidation")
+        logger.info("Starting address consolidation with validation")
         
-        # Check required columns
+        # Define the set of columns required for the consolidation process. This
+        # check ensures that the input DataFrame has been properly prepared by
+        # earlier steps in the pipeline.
         required_cols = [
             "addr_street_number",
             "addr_street_name",
@@ -443,171 +440,351 @@ class AddressProcessor:
             "addr_normalized_key",
         ]
         
+        # Verify the presence of all required columns. If any are missing,
+        # consolidation cannot proceed, so we log an error and return.
         missing_cols = [c for c in required_cols if c not in gdf.columns]
         if missing_cols:
             logger.error(f"Cannot consolidate; missing columns: {missing_cols}")
             return gdf
         
-        # Get unique addresses before consolidation
+        # Record the number of unique addresses before consolidation to measure
+        # the effectiveness of the process.
         unique_before = gdf["addr_normalized_key"].nunique()
         logger.info(f"Unique addresses before consolidation: {unique_before:,}")
         
-        # Extract address components
+        # Create a clean copy containing only the columns needed for consolidation.
+        # This prevents accidental modification of the original DataFrame and
+        # simplifies the data passed to downstream methods.
         address_components_gdf = gdf[required_cols].copy()
         
-        # Get consolidation mapping
-        logger.debug("Building consolidation map")
+        # Build the consolidation map, which is the core of this process. This
+        # map will define which address keys should be replaced by their
+        # canonical (i.e., "master") equivalents.
+        logger.debug("Building consolidation map with validation")
         consolidation_map = self._get_consolidation_map(
             address_gdf=address_components_gdf,
             key_col="addr_normalized_key",
-            fuzz_ratio=self.validation_config.address_fuzz_ratio,
         )
         
+        # Proceed only if the consolidation map is not empty, meaning there are
+        # address variations to be consolidated.
         if consolidation_map is not None and not consolidation_map.empty:
-            # Apply consolidation
-            logger.info(f"Consolidating {len(consolidation_map):,} address variations")
+            logger.info(f"Consolidating {len(consolidation_map):,} validated address variations")
             
-            # Create a copy to avoid side effects
+            # Create a full copy of the input DataFrame to apply changes to.
             out_gdf = gdf.copy()
             
-            # Log sample mappings for debugging
-            if len(consolidation_map) > 0:
-                sample_size = min(5, len(consolidation_map))
-                sample = consolidation_map.head(sample_size)
-                logger.debug(f"Sample consolidation mappings:\n{sample}")
+            # Log a small sample of the mappings for debugging and transparency.
+            # This helps in understanding what kind of changes are being made.
+            sample_size = min(5, len(consolidation_map))
+            sample = consolidation_map.head(sample_size)
+            logger.debug(f"Sample consolidation mappings:\n{sample}")
             
-            # Apply mapping
+            # Store the original keys to later calculate how many were changed.
             original_keys = out_gdf["addr_normalized_key"].copy()
+            
+            # Apply the mapping. The `replace` method efficiently substitutes
+            # the old keys with their new canonical versions.
             out_gdf["addr_normalized_key"] = out_gdf["addr_normalized_key"].replace(consolidation_map)
             
-            # Count changes
+            # Calculate and log the impact of the consolidation.
             keys_changed = (out_gdf["addr_normalized_key"] != original_keys).sum()
             unique_after = out_gdf["addr_normalized_key"].nunique()
+            reduction_pct = (unique_before - unique_after) / unique_before if unique_before > 0 else 0
             
             logger.info(
                 f"Consolidation complete: {keys_changed:,} keys changed, "
                 f"{unique_before:,} -> {unique_after:,} unique addresses "
-                f"({(unique_before - unique_after) / unique_before:.1%} reduction)"
+                f"({reduction_pct:.1%} reduction)"
             )
             
             return out_gdf
         else:
-            logger.info("No similar addresses found for consolidation")
+            # If no valid pairs were found, no consolidation is needed.
+            logger.info("No valid similar addresses found for consolidation")
             return gdf
-    
+
     def _get_consolidation_map(
         self, 
         address_gdf: cudf.DataFrame, 
         key_col: str, 
-        fuzz_ratio: int
     ) -> Optional[cudf.Series]:
         """
-        Build mapping from address keys to canonical representatives.
+        Build a mapping from address keys to canonical representatives with validation.
         
         This method:
-        1. Finds similar address pairs using TF-IDF similarity
-        2. Builds a graph and finds connected components
-        3. Selects the best representative for each component
+        1. Finds similar address pairs using TF-IDF similarity.
+        2. Validates pairs against business rules (street numbers, states).
+        3. Builds a graph from validated pairs and finds connected components.
+        4. Selects the best representative for each component.
         
         Args:
-            address_gdf: DataFrame with address components
-            key_col: Column containing normalized address keys
-            fuzz_ratio: Similarity threshold (0-100, higher = stricter)
+            address_gdf: DataFrame with address components.
+            key_col: Column containing normalized address keys.
             
         Returns:
-            Series mapping original keys to canonical keys, or None
+            A Series mapping original keys to canonical keys, or None if no
+            consolidation is possible.
         """
-        logger.debug(f"Building consolidation map with fuzz_ratio={fuzz_ratio}")
+        # Retrieve validation parameters from the class configuration. This makes
+        # the method's signature cleaner and keeps configuration centralized.
+        fuzz_ratio = self.validation_config.address_fuzz_ratio
+
+        logger.debug(
+            f"Building consolidation map with validation: "
+            f"fuzz_ratio={fuzz_ratio}, "
+            f"street_number_threshold={self.validation_config.street_number_threshold}, "
+            f"enforce_state_boundaries={self.validation_config.enforce_state_boundaries}"
+        )
         
-        # Get frequency of each address (for scoring)
+        # Calculate the frequency of each address key. This is a crucial input
+        # for scoring, as more frequent addresses are better candidates for
+        # being the canonical representative.
         freq_map = address_gdf[key_col].value_counts()
         logger.debug(f"Address frequency distribution: {len(freq_map):,} unique addresses")
         
-        # Get unique addresses
-        unique_addresses = address_gdf.drop_duplicates(subset=[key_col]).reset_index(drop=True)
-        n_unique = len(unique_addresses)
+        # Deduplicate the address data to work only with unique addresses. This
+        # significantly improves performance for similarity calculations.
+        unique_addresses_df = address_gdf.drop_duplicates(subset=[key_col]).reset_index(drop=True)
+        n_unique = len(unique_addresses_df)
         
+        # If there's only one or zero unique addresses, no pairs can be formed.
         if n_unique < 2:
             logger.debug("Fewer than 2 unique addresses; no consolidation needed")
             return None
         
         logger.info(f"Finding similar pairs among {n_unique:,} unique addresses")
         
-        # Calculate similarity threshold
+        # Convert the fuzzy matching ratio (0-100) to a cosine distance
+        # threshold (0-1), as expected by the similarity function.
         distance_threshold = 1.0 - (float(fuzz_ratio) / 100.0)
         logger.debug(f"Using distance threshold: {distance_threshold:.3f}")
         
-        # Find similar address pairs
-        matched_pairs = find_similar_pairs(
-            string_series=unique_addresses[key_col],
+        # Find pairs of addresses that are textually similar based on TF-IDF
+        # vectorization and nearest neighbors search.
+        matched_pairs_df = find_similar_pairs(
+            string_series=unique_addresses_df[key_col],
             tfidf_params=self.vectorizer_config.similarity_tfidf,
             nn_params=self.vectorizer_config.similarity_nn,
             distance_threshold=distance_threshold,
         )
         
-        if matched_pairs.empty:
-            logger.info("No similar address pairs found")
+        if matched_pairs_df.empty:
+            logger.info("No similar address pairs found based on text similarity")
             return None
         
-        n_pairs = len(matched_pairs)
-        logger.info(f"Found {n_pairs:,} similar address pairs")
+        n_pairs_before_validation = len(matched_pairs_df)
+        logger.info(f"Found {n_pairs_before_validation:,} potential pairs before validation")
         
-        # Find connected components in similarity graph
-        logger.debug("Finding connected components in similarity graph")
-        components = find_graph_components(
-            edge_list_df=matched_pairs,
+        # Apply business logic to filter out pairs that are textually similar
+        # but logically distinct (e.g., different street numbers or states).
+        validated_pairs_df = self._validate_address_pairs(
+            matched_pairs_df=matched_pairs_df,
+            unique_addresses_df=unique_addresses_df,
+        )
+        
+        if validated_pairs_df.empty:
+            logger.info("No pairs passed business rule validation")
+            return None
+        
+        n_pairs_after_validation = len(validated_pairs_df)
+        pass_rate = n_pairs_after_validation / n_pairs_before_validation if n_pairs_before_validation > 0 else 0
+        logger.info(
+            f"Validated pairs: {n_pairs_after_validation:,}/{n_pairs_before_validation:,} "
+            f"({pass_rate:.1%} passed validation)"
+        )
+        
+        # Use the validated pairs as edges in a graph to find groups (connected
+        # components) of similar addresses.
+        logger.debug("Finding connected components in validated similarity graph")
+        components_df = find_graph_components(
+            edge_list_df=validated_pairs_df,
             output_vertex_column="unique_addr_idx",
             output_component_column="component_id"
         )
         
-        n_components = components["component_id"].nunique()
-        logger.info(f"Found {n_components:,} address groups (connected components)")
+        n_components = components_df["component_id"].nunique()
+        logger.info(f"Found {n_components:,} validated address groups (connected components)")
         
-        # Merge component IDs with unique addresses
-        unique_addresses = unique_addresses.merge(
-            components, 
+        # Join component IDs back to the unique address data.
+        unique_addresses_df = unique_addresses_df.merge(
+            components_df, 
             left_index=True, 
             right_on="unique_addr_idx",
-            how="inner"  # Only keep addresses that are in components
+            how="inner"  # Keep only addresses that are part of a component.
         )
         
-        if unique_addresses.empty:
-            logger.warning("No addresses matched to components")
+        if unique_addresses_df.empty:
+            logger.warning("No addresses were matched to any components after merge")
             return None
         
-        # Add frequency for scoring
-        unique_addresses["freq"] = unique_addresses[key_col].map(freq_map).fillna(1)
+        # Add the pre-calculated frequency to each unique address for scoring.
+        unique_addresses_df["freq"] = unique_addresses_df[key_col].map(freq_map).fillna(1)
         
-        # Determine canonical representative for each component
-        logger.debug("Selecting canonical representatives")
-        canonical_map = self._determine_canonical_representatives(
-            candidates_gdf=unique_addresses, 
+        # For each component, select the best address to be the canonical one.
+        logger.debug("Selecting canonical representatives for each component")
+        canonical_map_df = self._determine_canonical_representatives(
+            candidates_gdf=unique_addresses_df, 
             key_col=key_col
         )
         
-        if canonical_map.empty:
-            logger.warning("No canonical representatives determined")
+        if canonical_map_df.empty:
+            logger.warning("Could not determine any canonical representatives")
             return None
         
-        # Build final mapping
-        logger.debug("Building final consolidation mapping")
-        final_map_df = unique_addresses[[key_col, "component_id"]].merge(
-            canonical_map, 
+        # Join the canonical key for each component back to all addresses in that component.
+        logger.debug("Building final consolidation mapping from canonical representatives")
+        final_map_df = unique_addresses_df[[key_col, "component_id"]].merge(
+            canonical_map_df, 
             on="component_id",
             how="inner"
         )
         
-        # Only keep mappings where key differs from canonical
+        # The final map should only contain entries where an address key needs to
+        # be changed to its canonical form.
         final_map_df = final_map_df[final_map_df[key_col] != final_map_df["canonical_key"]]
         
         if final_map_df.empty:
-            logger.info("All addresses are already canonical")
+            logger.info("All addresses are already in their canonical form; no changes needed")
             return None
         
         logger.debug(f"Final consolidation map contains {len(final_map_df):,} mappings")
         
-        # Return as Series with index
+        # Convert the DataFrame to a Series for efficient use with `.replace()`.
+        # The index is the key to be replaced, and the value is the new canonical key.
         return final_map_df.set_index(key_col)["canonical_key"]
+
+    def _validate_address_pairs(
+        self,
+        matched_pairs_df: cudf.DataFrame,
+        unique_addresses_df: cudf.DataFrame,
+    ) -> cudf.DataFrame:
+        """
+        Validate address pairs against business rules to prevent incorrect consolidation.
+        
+        This method filters out pairs that violate:
+        1. Street number difference threshold (if street numbers are numeric).
+        2. State boundary enforcement (if enabled and states are present).
+        
+        Args:
+            matched_pairs_df: DataFrame with ['i', 'j'] columns representing pair indices.
+            unique_addresses_df: DataFrame with address components for validation.
+            
+        Returns:
+            A DataFrame containing only the pairs that passed all validation rules.
+        """
+        street_number_threshold = self.validation_config.street_number_threshold
+        enforce_state_boundaries = self.validation_config.enforce_state_boundaries
+
+        logger.debug("Validating address pairs against business rules")
+        
+        original_pair_count = len(matched_pairs_df)
+        if original_pair_count == 0:
+            return matched_pairs_df # Return early if there are no pairs to validate.
+
+        # --- Augment Pair Data ---
+        # To validate, we need the actual address components (street number, state)
+        # for both addresses in each pair. We merge this data from unique_addresses_df.
+        
+        # Define the component columns needed for validation.
+        component_cols = ['addr_street_number', 'addr_state', 'addr_normalized_key']
+
+        # Merge components for the first address in the pair (index 'i').
+        pairs_with_components_df = matched_pairs_df.merge(
+            unique_addresses_df[component_cols],
+            left_on='i', right_index=True, how='left'
+        ).rename(columns={
+            'addr_street_number': 'street_number_i',
+            'addr_state': 'state_i',
+            'addr_normalized_key': 'key_i'
+        })
+        
+        # Merge components for the second address in the pair (index 'j').
+        pairs_with_components_df = pairs_with_components_df.merge(
+            unique_addresses_df[component_cols],
+            left_on='j', right_index=True, how='left'
+        ).rename(columns={
+            'addr_street_number': 'street_number_j',
+            'addr_state': 'state_j',
+            'addr_normalized_key': 'key_j'
+        })
+
+        # Initialize a boolean mask where `True` means the pair is currently considered valid.
+        valid_pairs_mask = cudf.Series([True] * len(pairs_with_components_df), index=pairs_with_components_df.index)
+
+        # --- Rule 1: Validate Street Number Differences ---
+        logger.debug(f"Applying street number validation (threshold: {street_number_threshold})")
+        
+        # Isolate pairs where BOTH street numbers are purely numeric strings.
+        # This prevents errors from trying to convert non-numeric values (e.g., '123-A')
+        # and correctly ignores pairs where one or both numbers are missing.
+        street_num_i_is_numeric = pairs_with_components_df['street_number_i'].str.match(r'^\d+$')
+        street_num_j_is_numeric = pairs_with_components_df['street_number_j'].str.match(r'^\d+$')
+        both_are_numeric = street_num_i_is_numeric & street_num_j_is_numeric
+        
+        if both_are_numeric.any():
+            # Calculate the absolute difference only for the numeric pairs.
+            street_num_i = pairs_with_components_df['street_number_i'][both_are_numeric].astype('int32')
+            street_num_j = pairs_with_components_df['street_number_j'][both_are_numeric].astype('int32')
+            street_num_diff = (street_num_i - street_num_j).abs()
+            
+            # Identify which of these numeric pairs exceed the allowed difference.
+            exceeds_threshold = street_num_diff > street_number_threshold
+            
+            if exceeds_threshold.any():
+                # Get the original indices of the invalid pairs.
+                invalid_indices = exceeds_threshold[exceeds_threshold].index
+                # Update the main validation mask to mark these pairs as False (invalid).
+                valid_pairs_mask.loc[invalid_indices] = False
+                
+                num_invalid_street = len(invalid_indices)
+                logger.info(
+                    f"  Street number validation: {num_invalid_street:,} pairs rejected "
+                    f"(difference > {street_number_threshold})"
+                )
+        
+        # --- Rule 2: Validate State Boundaries ---
+        if enforce_state_boundaries:
+            logger.debug("Applying state boundary validation")
+            
+            # Isolate pairs where BOTH addresses have a non-empty state specified.
+            # If one or both states are missing, we cannot enforce this rule, so
+            # the pair is allowed to pass this check (treated as a wildcard).
+            state_i_present = (pairs_with_components_df['state_i'] != '') & pairs_with_components_df['state_i'].notna()
+            state_j_present = (pairs_with_components_df['state_j'] != '') & pairs_with_components_df['state_j'].notna()
+            both_states_present = state_i_present & state_j_present
+            
+            # For pairs where both states are present, check if they are different.
+            states_mismatch = pairs_with_components_df['state_i'] != pairs_with_components_df['state_j']
+            
+            # A pair is invalid under this rule if both states are present AND they do not match.
+            invalid_state_mask = both_states_present & states_mismatch
+            
+            if invalid_state_mask.any():
+                # Update the main mask: `valid_pairs_mask` becomes False where `invalid_state_mask` is True.
+                valid_pairs_mask = valid_pairs_mask & ~invalid_state_mask
+                
+                num_invalid_state = invalid_state_mask.sum()
+                logger.info(
+                    f"  State boundary validation: {num_invalid_state:,} pairs rejected (different states)"
+                )
+
+        # --- Final Filtering ---
+        # Apply the final mask to the original matched pairs DataFrame.
+        validated_pairs_df = matched_pairs_df[valid_pairs_mask]
+        
+        # Report the summary of the validation process.
+        num_rejected = original_pair_count - len(validated_pairs_df)
+        if num_rejected > 0:
+            rejection_rate = num_rejected / original_pair_count
+            logger.info(
+                f"Validation complete: {num_rejected:,}/{original_pair_count:,} pairs rejected "
+                f"({rejection_rate:.1%})"
+            )
+        else:
+            logger.info("All pairs passed validation rules")
+            
+        return validated_pairs_df
     
     def _determine_canonical_representatives(
         self, 

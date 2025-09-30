@@ -45,6 +45,32 @@ ADDRESS_SCORE_WEIGHTS = {
     'zip': 1          # A valid 5-digit zip code adds confidence.
 }
 
+# --- U.S. State and Territory Mappings ---
+# This single, comprehensive map is used for all state normalization operations.
+# It is defined at the module level for efficiency and is computed only once
+# when the module is imported. All keys and values are lowercase.
+STATE_NORMALIZATION_MAP = {
+    'al': 'alabama', 'ak': 'alaska', 'az': 'arizona', 'ar': 'arkansas',
+    'ca': 'california', 'co': 'colorado', 'ct': 'connecticut', 'de': 'delaware',
+    'fl': 'florida', 'ga': 'georgia', 'hi': 'hawaii', 'id': 'idaho',
+    'il': 'illinois', 'in': 'indiana', 'ia': 'iowa', 'ks': 'kansas',
+    'ky': 'kentucky', 'la': 'louisiana', 'me': 'maine', 'md': 'maryland',
+    'ma': 'massachusetts', 'mi': 'michigan', 'mn': 'minnesota',
+    'ms': 'mississippi', 'mo': 'missouri', 'mt': 'montana', 'ne': 'nebraska',
+    'nv': 'nevada', 'nh': 'new hampshire', 'nj': 'new jersey',
+    'nm': 'new mexico', 'ny': 'new york', 'nc': 'north carolina',
+    'nd': 'north dakota', 'oh': 'ohio', 'ok': 'oklahoma', 'or': 'oregon',
+    'pa': 'pennsylvania', 'ri': 'rhode island', 'sc': 'south carolina',
+    'sd': 'south dakota', 'tn': 'tennessee', 'tx': 'texas', 'ut': 'utah',
+    'vt': 'vermont', 'va': 'virginia', 'wa': 'washington',
+    'wv': 'west virginia', 'wi': 'wisconsin', 'wy': 'wyoming',
+    'dc': 'district of columbia', 'as': 'american samoa', 'gu': 'guam',
+    'mp': 'northern mariana islands', 'pr': 'puerto rico', 'vi': 'us virgin islands',
+    'd.c.': 'district of columbia', 'd c': 'district of columbia',
+    'calif': 'california', 'cal': 'california', 'penn': 'pennsylvania',
+    'penna': 'pennsylvania', 'mass': 'massachusetts', 'conn': 'connecticut',
+    'okla': 'oklahoma'
+}
 
 # ============================================================================
 # CPU-Based Address Parsing (libpostal)
@@ -356,3 +382,59 @@ def get_best_address_gpu(address_gdf: cudf.DataFrame) -> cudf.DataFrame:
 
     # Drop intermediate columns used for ranking before returning.
     return best_candidate.drop(columns=['score', 'frequency'])
+
+def normalize_us_states(gdf: cudf.DataFrame, state_col: str) -> cudf.DataFrame:
+    """
+    Normalizes a column of U.S. state names and abbreviations to their full, lowercase names,
+    while correctly preserving any null values.
+
+    This function performs all operations on the GPU. It handles various input
+    formats including full names, two-letter codes, and common aliases,
+    converting them all to a consistent, full lowercase state name (e.g., "IL" -> "illinois").
+
+    The normalization process is as follows:
+    1.  The locations of any null values in the input column are recorded.
+    2.  The column is cleaned (converted to lowercase, stripped of whitespace).
+    3.  A pre-computed dictionary replaces all recognizable state variations.
+    4.  The original null values are restored to their correct positions.
+
+    Args:
+        gdf: The input cuDF DataFrame.
+        state_col: The name of the column containing state information to normalize.
+
+    Returns:
+        A new cuDF DataFrame with the specified state column normalized.
+    """
+    if state_col not in gdf.columns:
+        raise KeyError(f"Column '{state_col}' not found in the DataFrame.")
+
+    # --- Step 1: Preserve Nulls ---
+    # Create a boolean mask to identify the locations of null values. This allows
+    # us to reintroduce them at the end, preserving the important distinction
+    # between missing data and an empty string.
+    original_nulls_mask = gdf[state_col].isna()
+
+    # --- Step 2: Prepare and Clean the Data ---
+    # Temporarily fill nulls with an empty string to allow vectorized string
+    # operations to run without errors. Then, clean the series by converting
+    # to lowercase and stripping whitespace.
+    cleaned_states = gdf[state_col].fillna('').astype('str').str.lower().str.strip()
+
+    # --- Step 3: Apply the Normalization Mapping ---
+    # Use the highly efficient .replace() method with the pre-computed Python
+    # dictionary. This GPU operation swaps all recognizable state variations
+    # with their full, lowercase names. Unmatched items remain unchanged.
+    normalized_states = cleaned_states.replace(STATE_NORMALIZATION_MAP)
+
+    # --- Step 4: Restore Nulls and Update the DataFrame ---
+    # Create a copy of the input DataFrame to avoid modifying it in place.
+    result_gdf = gdf.copy()
+    
+    # Use the mask to restore nulls. The .where() method is perfect for this:
+    # - Where the mask is False (i.e., the original value was NOT null),
+    #   it keeps the value from `normalized_states`.
+    # - Where the mask is True (i.e., the original value WAS null),
+    #   it inserts a null value (None).
+    result_gdf[state_col] = normalized_states.where(~original_nulls_mask, None)
+
+    return result_gdf
