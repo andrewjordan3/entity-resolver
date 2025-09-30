@@ -667,7 +667,7 @@ class AddressProcessor:
         2. State boundary enforcement (if enabled and states are present).
         
         Args:
-            matched_pairs_df: DataFrame with ['i', 'j'] columns representing pair indices.
+            matched_pairs_df: DataFrame with ['source', 'destination'] columns representing pair indices.
             unique_addresses_df: DataFrame with address components for validation.
             
         Returns:
@@ -689,20 +689,20 @@ class AddressProcessor:
         # Define the component columns needed for validation.
         component_cols = ['addr_street_number', 'addr_state', 'addr_normalized_key']
 
-        # Merge components for the first address in the pair (index 'i').
+        # Merge components for the first address in the pair (index 'source').
         pairs_with_components_df = matched_pairs_df.merge(
             unique_addresses_df[component_cols],
-            left_on='i', right_index=True, how='left'
+            left_on='source', right_index=True, how='left'
         ).rename(columns={
             'addr_street_number': 'street_number_i',
             'addr_state': 'state_i',
             'addr_normalized_key': 'key_i'
         })
         
-        # Merge components for the second address in the pair (index 'j').
+        # Merge components for the second address in the pair (index 'destination').
         pairs_with_components_df = pairs_with_components_df.merge(
             unique_addresses_df[component_cols],
-            left_on='j', right_index=True, how='left'
+            left_on='destination', right_index=True, how='left'
         ).rename(columns={
             'addr_street_number': 'street_number_j',
             'addr_state': 'state_j',
