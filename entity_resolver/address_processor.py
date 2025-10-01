@@ -714,6 +714,10 @@ class AddressProcessor:
 
         # --- Rule 1: Validate Street Number Differences ---
         logger.debug(f"Applying street number validation (threshold: {street_number_threshold})")
+
+        # Create a boolean mask to identify pairs that violate the street number rule.
+        # Initialize all to False (no violation).
+        violates_street_num_rule = cudf.Series([False] * len(pairs_with_components_df), index=pairs_with_components_df.index)
         
         # Isolate pairs where BOTH street numbers are purely numeric strings.
         # This prevents errors from trying to convert non-numeric values (e.g., '123-A')
@@ -731,18 +735,20 @@ class AddressProcessor:
             # Identify which of these numeric pairs exceed the allowed difference.
             exceeds_threshold = street_num_diff > street_number_threshold
             
-            if exceeds_threshold.any():
-                # Get the original indices of the invalid pairs.
-                invalid_indices = exceeds_threshold[exceeds_threshold].index
-                # Update the main validation mask to mark these pairs as False (invalid).
-                valid_pairs_mask.loc[invalid_indices] = False
-                
-                num_invalid_street = len(invalid_indices)
+            # Map the results from the subset back to our full-length violation mask.
+            # This correctly aligns the partial results with the full DataFrame index.
+            violates_street_num_rule.loc[both_are_numeric] = exceeds_threshold
+
+            num_invalid_street = violates_street_num_rule.sum()
+            if num_invalid_street > 0:
                 logger.info(
-                    f"  Street number validation: {num_invalid_street:,} pairs rejected "
+                    f"  Street number validation: {int(num_invalid_street):,} pairs rejected "
                     f"(difference > {street_number_threshold})"
                 )
         
+        # Update the main validation mask by marking any pairs that violated the rule as invalid.
+        valid_pairs_mask = valid_pairs_mask & ~violates_street_num_rule
+
         # --- Rule 2: Validate State Boundaries ---
         if enforce_state_boundaries:
             logger.debug("Applying state boundary validation")

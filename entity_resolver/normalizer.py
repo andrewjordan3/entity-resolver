@@ -526,6 +526,10 @@ class TextNormalizer:
         # aggregate all 'normalized_text' values into a list. The result is a
         # Series where the index is the unique address key.
         logger.debug("Grouping names by address and applying canonical selection function on GPU...")
+
+        # ensure GPU string dtype (not object)
+        consolidation_subset_gdf["normalized_text"] = consolidation_subset_gdf["normalized_text"].astype("str")
+
         grouped_names_by_address = consolidation_subset_gdf.groupby('addr_normalized_key')['normalized_text'].agg('collect')
 
         # --- Step 2: Apply the Canonical Name Function to Each Group ---
