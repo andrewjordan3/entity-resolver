@@ -776,8 +776,13 @@ class AddressProcessor:
                 )
 
         # --- Final Filtering ---
-        # Apply the final mask to the original matched pairs DataFrame.
-        validated_pairs_df = matched_pairs_df[valid_pairs_mask]
+        # Apply the final mask to the DataFrame that contains the augmented component data,
+        # as this is the DataFrame that is correctly aligned with the mask's index.
+        validated_pairs_with_components_df = pairs_with_components_df[valid_pairs_mask]
+
+        # After filtering, select only the original 'source' and 'destination' columns
+        # to return a clean edge list for the next step.
+        validated_pairs_df = validated_pairs_with_components_df[['source', 'destination']]
         
         # Report the summary of the validation process.
         num_rejected = original_pair_count - len(validated_pairs_df)
