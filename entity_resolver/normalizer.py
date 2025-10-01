@@ -520,21 +520,21 @@ class TextNormalizer:
         Returns:
             A cuDF DataFrame with two columns: 'addr_normalized_key' and 'canonical_name'.
         """
+        def select_canonical_name(names_in_group: cudf.Series) -> str:
+            """UDF wrapper for the apply call for type clarity."""
+            return get_canonical_name_gpu(names_in_group, self.vectorizer_config.similarity_tfidf)
+
         # --- Step 1: Group by Address and Collect All Associated Names ---
         # This is the core of the vectorization strategy. We perform a single
         # `groupby` operation on the GPU. For each 'addr_normalized_key', we
         # aggregate all 'normalized_text' values into a list. The result is a
         # Series where the index is the unique address key.
         logger.debug("Grouping names by address and applying canonical selection function on GPU...")
-        grouped_names_by_address = consolidation_subset_gdf.groupby('addr_normalized_key')['normalized_text'].agg(list)
+        grouped_names_by_address = consolidation_subset_gdf.groupby('addr_normalized_key')['normalized_text']
 
         # --- Step 2: Apply the Canonical Name Function to Each Group ---
         # The `.apply()` method executes a function on each list of names in
         # parallel on the GPU, determining the single best name for that group.
-        def select_canonical_name(names_in_group: cudf.Series) -> str:
-            """UDF wrapper for the apply call for type clarity."""
-            return get_canonical_name_gpu(names_in_group, self.vectorizer_config.similarity_tfidf)
-
         canonical_names_series = grouped_names_by_address.apply(select_canonical_name)
 
         # --- Step 3: Log Examples and Format the Final Output ---
