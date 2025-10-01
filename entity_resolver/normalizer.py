@@ -406,7 +406,7 @@ class TextNormalizer:
         # Log some example normalizations if in debug mode
         if logger.isEnabledFor(logging.DEBUG) and len(gdf) > 0:
             sample_size = min(5, len(gdf))
-            sample_df = gdf[[entity_col, 'normalized_text']].head(sample_size)
+            sample_df = gdf[[entity_col, 'normalized_text']].sample(sample_size)
             logger.debug("Sample normalizations:")
             for idx, row in enumerate(sample_df.to_pandas().itertuples()):
                 logger.debug(f"  '{row[1]}' -> '{row[2]}'")
@@ -592,7 +592,7 @@ class TextNormalizer:
     ):
         """Logs a sample of consolidation decisions for debugging and transparency."""
         # This helper function creates a sample of "before and after" data for logging.
-        if grouped_names.empty or not logger.isEnabledFor(logging.DEBUG):
+        if grouped_names.count().empty or not logger.isEnabledFor(logging.DEBUG):
             return
 
         examples_df = cudf.DataFrame({'all_names': grouped_names, 'canonical_name': canonical_names})
