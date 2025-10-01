@@ -538,7 +538,7 @@ class TextNormalizer:
         canonical_names_series = grouped_names_by_address.apply(select_canonical_name)
 
         # --- Step 3: Log Examples and Format the Final Output ---
-        self._log_consolidation_examples(grouped_names_by_address, canonical_names_series)
+        #self._log_consolidation_examples(grouped_names_by_address, canonical_names_series) *** Need to work on this ***
 
         # Convert the resulting Series (index='addr_normalized_key', value='canonical_name')
         # into a two-column DataFrame, which is the final mapping table.
