@@ -56,8 +56,8 @@ class ClusterMerger:
         ##################################################
         # Need to make the following into parameters
         ###################################################
-        self.name_merging_distance_threshold: float = 0.08
-        self.address_merging_distance_threshold: float = 0.06
+        self.name_merging_distance_threshold: float = 0.02
+        self.address_merging_distance_threshold: float = 0.01
 
     def merge_clusters(self, entity_dataframe: cudf.DataFrame) -> cudf.DataFrame:
         """
