@@ -85,142 +85,145 @@ class ClusterMerger:
 
     def _merge_similar_clusters(self, entity_dataframe: cudf.DataFrame) -> cudf.DataFrame:
         """
-        Merge clusters representing the same real-world entity using GPU-accelerated
+        Merges clusters that represent the same real-world entity using GPU-accelerated
         graph algorithms and similarity computations.
-        
-        This method:
-        1. Creates canonical profiles for each cluster
-        2. Builds a similarity graph between clusters
-        3. Identifies connected components in the graph
-        4. Merges clusters within each component
-        
+
+        This method is the core of the post-clustering refinement stage. It operates under
+        the principle that if two clusters are highly similar in both their canonical name
+        and address, they should be merged into a single entity. It finds these relationships
+        transitively (i.e., if A is similar to B, and B is similar to C, then A, B, and C
+        are all merged together).
+
+        The process is as follows:
+        1.  **Profile Creation**: A single, representative profile is created for each
+            cluster, containing its canonical name, address, and size.
+        2.  **Index Mapping**: A crucial step where a mapping is created between the
+            cluster IDs and the temporary positional indices required by k-NN algorithms.
+        3.  **Graph Construction**: Two similarity graphs are built—one for names and one
+            for addresses. The function then finds the intersection of these graphs,
+            creating a final edge list where an edge exists only if two clusters are
+            similar in BOTH name AND address.
+        4.  **Component Analysis**: A graph algorithm finds all connected components in the
+            final similarity graph. Each component represents a group of clusters that
+            should be merged.
+        5.  **Mapping and Application**: For each component, a "winner" cluster is chosen
+            (typically the largest), and a mapping is created to merge all other clusters
+            in that component into the winner. This mapping is then applied to the main
+            DataFrame in a single, efficient GPU operation.
+
         Args:
-            entity_dataframe: DataFrame with entities and their cluster assignments
-            
+            entity_dataframe: The main DataFrame containing all entities and their current
+                              cluster assignments from the previous stage.
+
         Returns:
-            cudf.DataFrame: DataFrame with updated cluster assignments after merging
+            A cuDF DataFrame with the 'cluster' column updated to reflect the merged assignments.
         """
         logger.info("Starting GPU-accelerated cluster similarity merging process...")
         
-        # Filter to only clustered entities (exclude noise points with cluster=-1)
-        clustered_entities = entity_dataframe[entity_dataframe['cluster'] != -1]
+        # Isolate only the records that were successfully clustered, excluding noise.
+        clustered_entities = entity_dataframe[entity_dataframe['cluster'] != -1].copy()
         
-        if len(clustered_entities) == 0:
+        if clustered_entities.empty:
             logger.info("No clusters found for merging.")
             return entity_dataframe
         
-        # --- Step 1: Create cluster profiles using GPU-native operations ---
-        logger.debug("Building cluster profiles with canonical representations...")
-        
-        # Group by cluster and compute canonical representations in parallel
+        # --- Step 1: Create Cluster Profiles and Positional Index Mapping ---
+        logger.debug("Building canonical profiles for each cluster...")
         cluster_profiles = self._build_cluster_profiles_gpu(clustered_entities)
         
-        if cluster_profiles is None or len(cluster_profiles) == 0:
-            logger.info("No valid cluster profiles created.")
+        if cluster_profiles is None or cluster_profiles.empty:
+            logger.info("No valid cluster profiles were created; skipping merge.")
             return entity_dataframe
         
-        # Reset index to ensure positional indices are sequential
-        # This ensures find_similar_pairs indices map correctly to cluster profiles
-        cluster_profiles_with_sequential_index = cluster_profiles.reset_index(drop=True)
+        # CRITICAL: The find_similar_pairs function uses k-NN, which operates on
+        # positional indices (0, 1, 2, ...). However, our cluster IDs are arbitrary
+        # numbers. We must create a mapping to translate between these two systems.
+        # First, ensure the profiles have a clean, sequential 0-based index.
+        profiles_with_sequential_index = cluster_profiles.reset_index(drop=True)
         
-        # Create GPU-native bidirectional mapping between positional index and cluster_id
-        # This allows us to convert k-NN results (which use positional indices) back to cluster IDs
-        positional_index_to_cluster_id_series = cluster_profiles_with_sequential_index['cluster_id']
+        # Now, create a Series that maps the new positional index to the original cluster_id.
+        # This will be our lookup table to convert the k-NN results back to cluster IDs.
+        positional_index_to_cluster_id = profiles_with_sequential_index['cluster_id']
         
-        # Also create reverse mapping for validation (cluster_id -> positional_index)
-        cluster_id_to_positional_index_map = cudf.DataFrame({
-            'cluster_id': cluster_profiles_with_sequential_index['cluster_id'],
-            'positional_index': cudf.Series(range(len(cluster_profiles_with_sequential_index)), dtype='int32')
-        })
-
-        # --- Step 2: Build similarity graph between clusters ---
+        # --- Step 2: Build Similarity Graph Between Clusters ---
         logger.info("Constructing cluster similarity graph for merge detection...")
         
-        # Compute name-based similarity edges
+        # Find pairs of clusters with similar canonical names.
+        # The 'source' and 'destination' columns in the result are POSITIONAL INDICES.
         name_similarity_edges = find_similar_pairs(
-            cluster_profiles_with_sequential_index['canonical_name_representation'], 
+            profiles_with_sequential_index['canonical_name_representation'], 
             self.vectorizer_config.similarity_tfidf, 
             self.vectorizer_config.similarity_nn,
             self.name_merging_distance_threshold
         )
-
-        # Convert positional indices to actual cluster IDs using GPU operations
-        name_similarity_edges_with_cluster_ids = cudf.DataFrame({
-            'source_cluster_id': positional_index_to_cluster_id_series.iloc[
-                name_similarity_edges['source']
-            ].reset_index(drop=True),
-            'destination_cluster_id': positional_index_to_cluster_id_series.iloc[
-                name_similarity_edges['destination']
-            ].reset_index(drop=True)
+        # Translate the positional indices back to actual cluster IDs using our mapping.
+        name_edges_with_cluster_ids = cudf.DataFrame({
+            'source_cluster_id': positional_index_to_cluster_id.iloc[name_similarity_edges['source']].reset_index(drop=True),
+            'destination_cluster_id': positional_index_to_cluster_id.iloc[name_similarity_edges['destination']].reset_index(drop=True)
         })
-        
-        # Compute address-based similarity edges
+
+        # Do the same for addresses.
         address_similarity_edges = find_similar_pairs(
-            cluster_profiles_with_sequential_index['canonical_address_representation'], 
+            profiles_with_sequential_index['canonical_address_representation'], 
             self.vectorizer_config.similarity_tfidf, 
             self.vectorizer_config.similarity_nn, 
             self.address_merging_distance_threshold
         )
-
-        # Convert positional indices to actual cluster IDs
-        address_similarity_edges_with_cluster_ids = cudf.DataFrame({
-            'source_cluster_id': positional_index_to_cluster_id_series.iloc[
-                address_similarity_edges['source']
-            ].reset_index(drop=True),
-            'destination_cluster_id': positional_index_to_cluster_id_series.iloc[
-                address_similarity_edges['destination']
-            ].reset_index(drop=True)
+        address_edges_with_cluster_ids = cudf.DataFrame({
+            'source_cluster_id': positional_index_to_cluster_id.iloc[address_similarity_edges['source']].reset_index(drop=True),
+            'destination_cluster_id': positional_index_to_cluster_id.iloc[address_similarity_edges['destination']].reset_index(drop=True)
         })
         
-        # Intersect edges: clusters must be similar in BOTH name AND address
-        merged_similarity_edges = address_similarity_edges_with_cluster_ids.merge(
-            name_similarity_edges_with_cluster_ids, 
-            on=['source', 'destination'],
+        # The core merge requirement: an edge exists only if clusters are similar in BOTH name AND address.
+        # We find this by performing an inner merge on the two edge lists.
+        final_similarity_edges = address_edges_with_cluster_ids.merge(
+            name_edges_with_cluster_ids, 
+            on=['source_cluster_id', 'destination_cluster_id'],
             how='inner'
         )
         
-        if len(merged_similarity_edges) == 0:
-            logger.info("No cluster pairs meet similarity thresholds for merging.")
+        if final_similarity_edges.empty:
+            logger.info("No cluster pairs met the dual similarity thresholds for merging.")
             return entity_dataframe
+            
+        # --- Step 3: Find Connected Components in the Similarity Graph ---
+        logger.debug("Identifying connected components in the final similarity graph...")
         
-        # --- Step 3: Find connected components in similarity graph ---
-        logger.debug("Identifying connected components in similarity graph...")
-        
+        # Each connected component represents a group of clusters that should be merged.
         graph_components = find_graph_components(
-            edge_list_df=merged_similarity_edges, 
-            source_column='source', 
-            destination_column='destination', 
+            edge_list_df=final_similarity_edges, 
+            source_column='source_cluster_id', 
+            destination_column='destination_cluster_id', 
             directed=False, 
-            output_vertex_column='cluster_profile_index', 
+            output_vertex_column='cluster_id', 
             output_component_column='merge_component_id'
         )
         
-        # Join component IDs back to cluster profiles
-        cluster_profiles_with_components = cluster_profiles.reset_index().merge(
-            graph_components, 
-            left_on='index', 
-            right_on='cluster_profile_index',
+        # Join the component IDs back to the original cluster profiles.
+        profiles_with_components = cluster_profiles.merge(
+            graph_components,
+            on='cluster_id',
             how='left'
         )
         
-        # --- Step 4: Select winners and create merge mapping ---
-        logger.debug("Determining winner clusters for each merge component...")
+        # --- Step 4 & 5: Create and Apply the Final Merge Mapping ---
+        logger.debug("Determining winner clusters and creating the merge mapping...")
         
-        # Use GPU-native operations to create merge mapping
-        cluster_merge_mapping = self._create_merge_mapping_gpu(cluster_profiles_with_components)
+        # This helper function iterates through each component and selects a "winner"
+        # (e.g., the largest cluster), creating a dictionary mapping losers to the winner.
+        cluster_merge_mapping = self._create_merge_mapping_gpu(profiles_with_components)
         
-        if len(cluster_merge_mapping) == 0:
-            logger.info("No clusters require merging.")
+        if not cluster_merge_mapping:
+            logger.info("No clusters required merging after component analysis.")
             return entity_dataframe
-        
-        # --- Step 5: Apply merge mapping to update cluster assignments ---
+            
         logger.info(f"Applying {len(cluster_merge_mapping)} cluster merges...")
         
-        # Flatten the mapping to handle transitive relationships
-        cluster_merge_mapping = self._flatten_mapping(cluster_merge_mapping)
+        # Flatten the mapping to handle transitive merges (A->B, B->C becomes A->C, B->C).
+        flat_mapping = self._flatten_mapping(cluster_merge_mapping)
         
-        # Use GPU-native replace operation
-        entity_dataframe['cluster'] = entity_dataframe['cluster'].replace(cluster_merge_mapping)
+        # Apply the final mapping to the 'cluster' column in one GPU-accelerated operation.
+        entity_dataframe['cluster'] = entity_dataframe['cluster'].replace(flat_mapping)
         
         logger.info("Cluster similarity merging completed successfully.")
         return entity_dataframe
