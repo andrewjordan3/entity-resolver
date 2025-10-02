@@ -119,28 +119,62 @@ class ClusterMerger:
             logger.info("No valid cluster profiles created.")
             return entity_dataframe
         
+        # Reset index to ensure positional indices are sequential
+        # This ensures find_similar_pairs indices map correctly to cluster profiles
+        cluster_profiles_with_sequential_index = cluster_profiles.reset_index(drop=True)
+        
+        # Create GPU-native bidirectional mapping between positional index and cluster_id
+        # This allows us to convert k-NN results (which use positional indices) back to cluster IDs
+        positional_index_to_cluster_id_series = cluster_profiles_with_sequential_index['cluster_id']
+        
+        # Also create reverse mapping for validation (cluster_id -> positional_index)
+        cluster_id_to_positional_index_map = cudf.DataFrame({
+            'cluster_id': cluster_profiles_with_sequential_index['cluster_id'],
+            'positional_index': cudf.Series(range(len(cluster_profiles_with_sequential_index)), dtype='int32')
+        })
+
         # --- Step 2: Build similarity graph between clusters ---
         logger.info("Constructing cluster similarity graph for merge detection...")
         
         # Compute name-based similarity edges
         name_similarity_edges = find_similar_pairs(
-            cluster_profiles['canonical_name_representation'], 
+            cluster_profiles_with_sequential_index['canonical_name_representation'], 
             self.vectorizer_config.similarity_tfidf, 
             self.vectorizer_config.similarity_nn,
             self.name_merging_distance_threshold
         )
+
+        # Convert positional indices to actual cluster IDs using GPU operations
+        name_similarity_edges_with_cluster_ids = cudf.DataFrame({
+            'source_cluster_id': positional_index_to_cluster_id_series.iloc[
+                name_similarity_edges['source']
+            ].reset_index(drop=True),
+            'destination_cluster_id': positional_index_to_cluster_id_series.iloc[
+                name_similarity_edges['destination']
+            ].reset_index(drop=True)
+        })
         
         # Compute address-based similarity edges
         address_similarity_edges = find_similar_pairs(
-            cluster_profiles['canonical_address_representation'], 
+            cluster_profiles_with_sequential_index['canonical_address_representation'], 
             self.vectorizer_config.similarity_tfidf, 
             self.vectorizer_config.similarity_nn, 
             self.address_merging_distance_threshold
         )
+
+        # Convert positional indices to actual cluster IDs
+        address_similarity_edges_with_cluster_ids = cudf.DataFrame({
+            'source_cluster_id': positional_index_to_cluster_id_series.iloc[
+                address_similarity_edges['source']
+            ].reset_index(drop=True),
+            'destination_cluster_id': positional_index_to_cluster_id_series.iloc[
+                address_similarity_edges['destination']
+            ].reset_index(drop=True)
+        })
         
         # Intersect edges: clusters must be similar in BOTH name AND address
-        merged_similarity_edges = address_similarity_edges.merge(
-            name_similarity_edges, 
+        merged_similarity_edges = address_similarity_edges_with_cluster_ids.merge(
+            name_similarity_edges_with_cluster_ids, 
             on=['source', 'destination'],
             how='inner'
         )
