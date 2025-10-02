@@ -53,6 +53,12 @@ class ClusterMerger:
         self.name_similarity_threshold = validation_config.name_fuzz_ratio / 100.0
         self.address_similarity_threshold = validation_config.address_fuzz_ratio / 100.0
 
+        ##################################################
+        # Need to make the following into parameters
+        ###################################################
+        self.name_merging_distance_threshold: float = 0.08
+        self.address_merging_distance_threshold: float = 0.06
+
     def merge_clusters(self, entity_dataframe: cudf.DataFrame) -> cudf.DataFrame:
         """
         Main orchestration method for the complete cluster merging process.
@@ -121,7 +127,7 @@ class ClusterMerger:
             cluster_profiles['canonical_name_representation'], 
             self.vectorizer_config.similarity_tfidf, 
             self.vectorizer_config.similarity_nn,
-            self.name_similarity_threshold
+            self.name_merging_distance_threshold
         )
         
         # Compute address-based similarity edges
@@ -129,7 +135,7 @@ class ClusterMerger:
             cluster_profiles['canonical_address_representation'], 
             self.vectorizer_config.similarity_tfidf, 
             self.vectorizer_config.similarity_nn, 
-            self.address_similarity_threshold
+            self.address_merging_distance_threshold
         )
         
         # Intersect edges: clusters must be similar in BOTH name AND address
