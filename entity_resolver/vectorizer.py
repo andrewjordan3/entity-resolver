@@ -128,8 +128,11 @@ class MultiStreamVectorizer:
         )
         
         # Step 1: Prepare base text by combining relevant fields
-        tfidf_text, normal_text = self._prepare_base_text(gdf)
-        logger.debug(f"Prepared base text for {len(normal_text):,} records")
+        text_streams = self._prepare_text_streams(gdf)
+        phonetic_text = text_streams['phonetic']
+        semantic_text = text_streams['semantic']
+        tfidf_text = text_streams['tfidf']
+        logger.debug(f"Prepared base text for {len(gdf):,} records")
         
         # Step 2: Process each encoder stream independently
         vector_streams = {}
@@ -148,7 +151,7 @@ class MultiStreamVectorizer:
             logger.debug("Processing phonetic stream...")
             # Phonetic encoding works best on entity names only
             vector_streams['phonetic'] = self._encode_phonetic_stream(
-                normal_text, 
+                phonetic_text, 
                 is_training
             )
             logger.info(f"Phonetic stream shape: {vector_streams['phonetic'].shape}")
@@ -158,7 +161,7 @@ class MultiStreamVectorizer:
             logger.debug("Processing semantic stream...")
             # Semantic encoding also works best on entity names only
             vector_streams['semantic'] = self._encode_semantic_stream(
-                normal_text, 
+                semantic_text, 
                 is_training
             )
             logger.info(f"Semantic stream shape: {vector_streams['semantic'].shape}")
@@ -180,60 +183,96 @@ class MultiStreamVectorizer:
         
         return gdf, combined_vectors
 
-    def _prepare_base_text(self, gdf: cudf.DataFrame) -> List[cudf.Series]:
+    def _prepare_text_streams(
+        self,
+        gdf: cudf.DataFrame, 
+    ) -> Dict[str, cudf.Series]:
         """
-        Prepare base text for different vectorization streams.
+        Prepares distinct, optimized text streams for each vectorization strategy.
 
-        This method creates two text representations:
-        1. TF-IDF Text: A unified text representation that weights the entity
-           name more heavily by repeating it and adds context tags ([N], [A]) to
-           distinguish between name and address features.
-        2. Normal Text: A clean combination of name and address for phonetic
-           and semantic encoders.
+        This function takes a DataFrame with pre-parsed name and address columns and
+        creates three specific text representations, each tailored to the needs of a
+        particular encoder:
+
+        1.  **Phonetic Text**: The entity name (`normalized_text`) only. Phonetic
+            algorithms are designed for names, and applying them to common address
+            terms (e.g., "street", "road") introduces noise.
+
+        2.  **Semantic Text**: A clean, natural-language phrase. It combines the entity
+            name with only the semantically meaningful parts of the address: street
+            name, city, and state. High-variance numerical identifiers like street
+            numbers and zip codes are excluded as they provide little semantic meaning
+            to models like BGE.
+
+        3.  **TF-IDF Text**: A comprehensive string for character n-gram analysis. It
+            includes all name and address components, as character-level patterns in
+            numerical data (like zip codes) can be a strong matching signal for TF-IDF.
+            The entity name is repeated three times to increase its weight in the
+            final vector.
 
         Args:
-            gdf: DataFrame containing normalized_text and optionally address columns
+            gdf: A cuDF DataFrame containing `normalized_text` and the pre-parsed
+                `addr_*` columns.
 
         Returns:
-            A list containing two cudf.Series: [tfidf_text, normal_text]
+            A dictionary mapping each stream name ('phonetic', 'semantic', 'tfidf')
+            to its corresponding, fully prepared cuDF Series of strings.
         """
-        # Ensure the base name text is a string
-        name_text = gdf['normalized_text'].astype(str)
+        logger.debug("Preparing optimized text streams for vectorizers.")
+        
+        name_text = gdf['normalized_text'].fillna('').astype(str)
+        
+        # --- 1. Load Individual Address Components ---
+        if self.config.vectorizer.use_address_in_encoding:
+            logger.debug("Loading pre-parsed address columns.")
+            # Load each address column, filling any missing values with an empty string
+            # to ensure clean concatenation.
+            street_num = gdf['addr_street_number'].fillna('').astype(str)
+            street_name = gdf['addr_street_name'].fillna('').astype(str)
+            city = gdf['addr_city'].fillna('').astype(str)
+            state = gdf['addr_state'].fillna('').astype(str)
+            zip_code = gdf['addr_zip'].fillna('').astype(str)
+            
+            # Log how many records actually have meaningful address data.
+            if 'addr_normalized_key' in gdf.columns:
+                non_empty_addresses = (gdf['addr_normalized_key'].notna() & (gdf['addr_normalized_key'] != '')).sum()
+                logger.debug(f"Found address information for {non_empty_addresses:,}/{len(gdf):,} records.")
 
-        # --- 1. Create Normal Text for Phonetic/Semantic Encoders ---
-        normal_text = name_text
+        else:
+            logger.debug("No address information will be used for encoding.")
+            # If not using addresses, create empty series to ensure concatenation works without errors.
+            empty_series = cudf.Series([''] * len(gdf), dtype='str', index=gdf.index)
+            street_num, street_name, city, state, zip_code = [empty_series] * 5
+
+        # --- 2. Create the Three Optimized Text Streams ---
         
-        # --- 2. Create TF-IDF Text with special formatting ---
-        # Create a tagged block for the name and repeat it to increase its weight
-        name_block = "[N] " + name_text + " [/N]"
-        weighted_name = name_block + " " + name_block + " " + name_block
-        tfidf_text = weighted_name
+        # Stream 1: Phonetic Text (Name only)
+        phonetic_text = name_text
+        logger.info("Created 'phonetic' text stream (name only).")
+
+        # Stream 2: Semantic Text (Name + Street Name + City + State)
+        semantic_address = (street_name + ' ' + city + ' ' + state)
+        semantic_text = (name_text + ' ' + semantic_address)
+        logger.info("Created 'semantic' text stream (name + semantic address parts).")
+
+        # Stream 3: TF-IDF Text (Weighted Name + All Address Parts)
+        weighted_name = (name_text + ' ' + name_text + ' ' + name_text)
+        full_address = (street_num + ' ' + street_name + ' ' + city + ' ' + state + ' ' + zip_code)
+        tfidf_text = (weighted_name + ' ' + full_address)
+        logger.info("Created 'tfidf' text stream (weighted name + full address).")
         
-        # Optionally append address information to both text versions
-        if self.config.use_address_in_encoding and 'addr_normalized_key' in gdf.columns:
-            logger.debug("Appending address information to text streams")
-            
-            # Clean and prepare the address text
-            address_text = gdf['addr_normalized_key'].fillna('').astype(str)
-            
-            # Append clean address to normal_text
-            normal_text = normal_text + " " + address_text
-            
-            # Create a tagged block for the address for tfidf_text
-            address_block = "[A] " + address_text + " [/A]"
-            
-            # Use a non-printable ASCII unit separator for a robust boundary
-            separator = '\x1F' * 8
-            tfidf_text = weighted_name + separator + address_block
-            
-            # Count how many records have non-empty address information
-            non_empty_addresses = (address_text != '').sum()
-            logger.debug(
-                f"Added address information to {non_empty_addresses:,}/{len(gdf):,} records"
-            )
+        # --- 3. Apply Final NFKC Normalization to All Streams ---
+        logger.debug("Applying final NFKC normalization to all text streams.")
+        # Assuming nfkc_normalize_series is a method of the same class
+        phonetic_text_normalized = self.nfkc_normalize_series(phonetic_text)
+        semantic_text_normalized = self.nfkc_normalize_series(semantic_text)
+        tfidf_text_normalized = self.nfkc_normalize_series(tfidf_text)
         
-        logger.debug("Prepared base text for %d records", len(gdf))
-        return [tfidf_text, normal_text]
+        return {
+            'phonetic': phonetic_text_normalized,
+            'semantic': semantic_text_normalized,
+            'tfidf': tfidf_text_normalized,
+        }
     
     def _encode_tfidf_stream(
         self, 

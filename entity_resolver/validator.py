@@ -24,7 +24,12 @@ from cudf.api.types import (
 
 # --- Local Package Imports ---
 from .config import ValidationConfig, VectorizerConfig
-from .utils import gpu_memory_cleanup, get_canonical_name_gpu, get_best_address_gpu, calculate_similarity_gpu
+from .utils import (
+    gpu_memory_cleanup, 
+    get_canonical_name_gpu, 
+    get_best_address_gpu, 
+    calculate_similarity_gpu,
+)
 
 # Set up a logger for this module
 logger = logging.getLogger(__name__)
@@ -325,97 +330,161 @@ class ClusterValidator:
         state_to_clusters: Dict[str, cupy.ndarray]
     ) -> cudf.DataFrame:
         """
-        Memory-efficient method to find the best cluster for each entity.
+        Finds the best cluster for each entity using a state-first batching strategy.
 
-        Uses several strategies to reduce memory usage:
-        1. Pre-filters candidate clusters by state compatibility.
-        2. Processes entities in smaller batches to avoid memory explosions.
-        3. Only computes exact similarity for promising candidates.
+        This method orchestrates the reassignment process by first logically partitioning
+        the entities based on state (if configured) and then processing each partition
+        in smaller, memory-aware batches. This ensures that state boundaries are
+        respected while preventing out-of-memory errors.
+
+        Args:
+            entities_to_reassign: DataFrame of entities needing a new cluster assignment.
+            profiles: DataFrame containing profile information for all candidate clusters.
+            state_to_clusters: A dictionary mapping states to their associated cluster IDs.
+
+        Returns:
+            A DataFrame containing the best new assignments for the entities.
         """
-        # Preserve original index for merging results back later.
+        # Preserve the original index, which is critical for merging results back later.
         entities_to_reassign['original_index'] = entities_to_reassign.index
-
-        batch_size = self.config.validate_cluster_batch_size
         all_best_assignments = []
 
-        # Process entities in batches to manage memory
-        num_batches = (len(entities_to_reassign) + batch_size - 1) // batch_size
-        for i, start_idx in enumerate(range(0, len(entities_to_reassign), batch_size)):
-            end_idx = min(start_idx + batch_size, len(entities_to_reassign))
-            batch = entities_to_reassign.iloc[start_idx:end_idx]
-
-            logger.debug(
-                f"Processing reassignment batch {i + 1}/{num_batches} "
-                f"({len(batch)} entities)"
+        # --- Step 1: Primary Grouping Strategy ---
+        # The primary grouping is based on whether state boundaries should be strictly enforced.
+        if self.config.enforce_state_boundaries:
+            # Group all entities by state first. This creates logical partitions.
+            entity_state_groups = self._group_entities_by_state(entities_to_reassign)
+            logger.info(
+                f"Processing reassignments in {len(entity_state_groups)} state-based groups "
+                f"due to enforce_state_boundaries=True."
             )
 
-            # Find best assignments for this batch
-            batch_assignments = self._process_reassignment_batch_efficient(
-                batch,
-                profiles,
-                state_to_clusters
+            for state, state_entity_group in entity_state_groups:
+                # For each state, find the relevant candidate clusters.
+                candidate_clusters = self._get_candidate_clusters_for_state(
+                    state, profiles, state_to_clusters
+                )
+
+                if candidate_clusters.empty:
+                    logger.debug(
+                        f"No candidate clusters for state '{state}'. "
+                        f"Skipping {len(state_entity_group)} entities."
+                    )
+                    continue
+
+                logger.debug(
+                    f"Processing {len(state_entity_group)} entities for state '{state}' "
+                    f"against {len(candidate_clusters)} candidate clusters."
+                )
+
+                # Process this specific state group in memory-managed batches.
+                group_assignments = self._process_group_in_batches(
+                    state_entity_group, candidate_clusters
+                )
+
+                if not group_assignments.empty:
+                    all_best_assignments.append(group_assignments)
+        else:
+            # If not enforcing state boundaries, treat all entities as a single large group.
+            logger.info(
+                "Processing all reassignments in a single group "
+                "(enforce_state_boundaries=False)."
+            )
+            # All cluster profiles are considered potential candidates.
+            all_candidate_clusters = profiles
+
+            # Process this single large group in memory-managed batches.
+            group_assignments = self._process_group_in_batches(
+                entities_to_reassign, all_candidate_clusters
             )
 
-            if not batch_assignments.empty:
-                all_best_assignments.append(batch_assignments)
+            if not group_assignments.empty:
+                all_best_assignments.append(group_assignments)
 
+        # --- Step 2: Consolidate Results ---
         if all_best_assignments:
+            # Combine the results from all processed groups into a single DataFrame.
             return cudf.concat(all_best_assignments, ignore_index=True)
         else:
+            # If no assignments were found, return an empty DataFrame with the correct schema.
             return cudf.DataFrame(self.EMPTY_ASSIGNMENT_SCHEMA)
 
-    #@gpu_memory_cleanup
-    def _process_reassignment_batch_efficient(
+    @gpu_memory_cleanup
+    def _process_group_in_batches(
         self,
-        batch: cudf.DataFrame,
-        profiles: cudf.DataFrame,
-        state_to_clusters: Dict[str, cupy.ndarray]
+        entity_group: cudf.DataFrame,
+        candidate_clusters: cudf.DataFrame
     ) -> cudf.DataFrame:
         """
-        Process a batch of entities using memory-efficient strategies.
+        Processes a group of entities against candidates in memory-aware batches.
 
-        Instead of creating all possible entity-cluster pairs at once, this method:
-        1. Groups entities by state to reduce the number of comparisons.
-        2. Finds top candidates for each group.
-        3. Only does detailed scoring on these promising matches.
+        This method takes a logical group of entities (e.g., all entities in one state)
+        and processes them in smaller sub-batches defined by `validate_cluster_batch_size`.
+        For each sub-batch, it performs a potentially chunked cross-join to calculate
+        similarity scores, ensuring that memory usage remains under control.
+
+        Args:
+            entity_group: A DataFrame of entities to be processed (e.g., from a single state).
+            candidate_clusters: The cluster profiles that are valid candidates for this group.
+
+        Returns:
+            A DataFrame with the best assignments found for the entities in the group.
         """
-        best_assignments_list = []
+        # The batch size for processing entities within the larger logical group.
+        batch_size = self.config.validate_cluster_batch_size
+        num_batches = (len(entity_group) + batch_size - 1) // batch_size
+        
+        batch_results = []
 
-        # Group batch entities by state for efficient processing
-        state_groups = self._group_entities_by_state(batch)
+        if num_batches > 1:
+            logger.debug(f"Splitting group of {len(entity_group)} entities into {num_batches} sub-batches of size ~{batch_size}.")
 
-        for state, state_batch in state_groups:
-            if len(state_batch) < self.MIN_STATE_BATCH_SIZE:    # Might not need this anymore
-                logger.debug(
-                    f"Skipping state '{state}' with {len(state_batch)} items, "
-                    f"which is below the minimum threshold of {self.MIN_STATE_BATCH_SIZE}."
-                )
+        # Iterate through the entity group in sub-batches.
+        for i, start_idx in enumerate(range(0, len(entity_group), batch_size)):
+            end_idx = min(start_idx + batch_size, len(entity_group))
+            entity_batch = entity_group.iloc[start_idx:end_idx]
+            
+            if num_batches > 1:
+                logger.debug(f"Processing sub-batch {i + 1}/{num_batches} ({len(entity_batch)} entities) for the current group.")
+
+            # --- Cross-Join and Scoring Logic ---
+            # This section handles the actual comparison, further chunking the cross-join
+            # if the number of entity-cluster pairs is too large for memory.
+            n_entities_in_batch = len(entity_batch)
+            n_candidate_clusters = len(candidate_clusters)
+            total_pairs_to_compare = n_entities_in_batch * n_candidate_clusters
+
+            if total_pairs_to_compare == 0:
                 continue
+            
+            # If the total number of pairs is manageable, process the entire batch at once.
+            if total_pairs_to_compare <= self.max_pairs_per_chunk:
+                 matches = self._score_and_select_matches(entity_batch, candidate_clusters)
+                 if not matches.empty:
+                     # Ensure the resulting DataFrame owns its memory to prevent upstream issues.
+                     batch_results.append(self._own_gpu_df(matches))
+            else:
+                 # If the cross-join is too large, chunk the entity batch even further.
+                 # This chunk size is dynamically calculated to respect memory limits.
+                 cross_join_chunk_size = max(1, self.max_pairs_per_chunk // n_candidate_clusters)
+                 logger.debug(
+                     f"Sub-batch of {n_entities_in_batch} entities requires further chunking for "
+                     f"cross-join against {n_candidate_clusters} clusters. "
+                     f"Using chunk size of {cross_join_chunk_size}."
+                 )
 
-            # Get candidate clusters for this state
-            candidate_clusters = self._get_candidate_clusters_for_state(
-                state,
-                profiles,
-                state_to_clusters
-            )
+                 for chunk_start in range(0, n_entities_in_batch, cross_join_chunk_size):
+                     chunk_end = min(chunk_start + cross_join_chunk_size, n_entities_in_batch)
+                     entity_chunk = entity_batch.iloc[chunk_start:chunk_end]
+                     
+                     chunk_matches = self._score_and_select_matches(entity_chunk, candidate_clusters)
+                     
+                     if not chunk_matches.empty:
+                         batch_results.append(self._own_gpu_df(chunk_matches))
 
-            if candidate_clusters.empty:
-                logger.debug(f"No candidate clusters found for state: {state}")
-                continue
-
-            # Process this state group
-            state_assignments = self._find_matches_for_state_group(
-                state_batch,
-                candidate_clusters
-            )
-
-            if not state_assignments.empty:
-                best_assignments_list.append(state_assignments)
-
-        if best_assignments_list:
-            return cudf.concat(best_assignments_list, ignore_index=True)
+        if batch_results:
+            return cudf.concat(batch_results, ignore_index=True)
         else:
-            # Return empty DataFrame with the expected schema
             return cudf.DataFrame(self.EMPTY_ASSIGNMENT_SCHEMA)
 
     def _group_entities_by_state(
