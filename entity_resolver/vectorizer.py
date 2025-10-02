@@ -20,7 +20,11 @@ import phonetics
 # Local package imports
 from .config import VectorizerConfig
 from .components import GPUTruncatedSVD
-from . import utils
+from .utils import (
+    nfkc_normalize_series,
+    normalize_rows,
+    balance_feature_streams,
+)
 
 # Set up module-level logger
 logger = logging.getLogger(__name__)
@@ -264,9 +268,9 @@ class MultiStreamVectorizer:
         # --- 3. Apply Final NFKC Normalization to All Streams ---
         logger.debug("Applying final NFKC normalization to all text streams.")
         # Assuming nfkc_normalize_series is a method of the same class
-        phonetic_text_normalized = self.nfkc_normalize_series(phonetic_text)
-        semantic_text_normalized = self.nfkc_normalize_series(semantic_text)
-        tfidf_text_normalized = self.nfkc_normalize_series(tfidf_text)
+        phonetic_text_normalized = nfkc_normalize_series(phonetic_text)
+        semantic_text_normalized = nfkc_normalize_series(semantic_text)
+        tfidf_text_normalized = nfkc_normalize_series(tfidf_text)
         
         return {
             'phonetic': phonetic_text_normalized,
@@ -564,11 +568,11 @@ class MultiStreamVectorizer:
         
         # First, L2 normalize each stream
         normalized_streams = {
-            name: utils.normalize_rows(vectors) for name, vectors in vector_streams.items()
+            name: normalize_rows(vectors) for name, vectors in vector_streams.items()
         }
         
         # Second, balance the normalized streams by their proportions
-        balanced_vectors_list = utils.balance_feature_streams(
+        balanced_vectors_list = balance_feature_streams(
             vector_streams=normalized_streams,
             proportions=self.config.stream_proportions
         )
@@ -581,7 +585,7 @@ class MultiStreamVectorizer:
         combined_vectors = cupy.concatenate(final_streams, axis=1)
         
         # Final L2 normalization for UMAP cosine distance
-        final_normalized_vectors = utils.normalize_rows(combined_vectors)
+        final_normalized_vectors = normalize_rows(combined_vectors)
 
         logger.debug(
             f"Combined vectors: shape={final_normalized_vectors.shape}, "
