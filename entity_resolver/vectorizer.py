@@ -227,7 +227,7 @@ class MultiStreamVectorizer:
         name_text = gdf['normalized_text'].fillna('').astype(str)
         
         # --- 1. Load Individual Address Components ---
-        if self.config.vectorizer.use_address_in_encoding:
+        if self.config.use_address_in_encoding:
             logger.debug("Loading pre-parsed address columns.")
             # Load each address column, filling any missing values with an empty string
             # to ensure clean concatenation.
