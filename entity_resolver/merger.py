@@ -273,12 +273,8 @@ class ClusterMerger:
             self._create_profile_for_group
         )
 
-        # The result of a groupby-apply operation in cuDF has a multi-level index
-        # (e.g., (cluster_id, original_index)). We must reset this to work with
-        # standard columns. Resetting level 0 brings the 'cluster' group key back
-        # as a regular column.
-        canonical_profiles = canonical_profiles.reset_index(level=0)
-        canonical_profiles = canonical_profiles.rename(columns={'cluster': 'cluster_id'})
+        # Drop the MultiIndex for a clean dataframe
+        canonical_profiles = canonical_profiles.reset_index(drop=True)
 
         # Finally, merge the pre-calculated cluster sizes with the canonical representations.
         # This combines the two parallel computations into a single, comprehensive profiles DataFrame.
@@ -821,10 +817,15 @@ class ClusterMerger:
         
         # Extract the address string, defaulting to an empty string if none is found.
         canonical_address = best_address_row['addr_normalized_key'].iloc[0] if not best_address_row.empty else ""
+
+        # Get the cluster ID from the first row of the group.
+        # It's guaranteed to be the same for all rows in this group.
+        cluster_id = cluster_group['cluster'].iloc[0]
         
         # The result must be a DataFrame, which `groupby().apply()` will then
         # concatenate with the results from all other groups.
         return cudf.DataFrame({
+            'cluster_id': [cluster_id],
             'canonical_name_representation': [canonical_name],
             'canonical_address_representation': [canonical_address]
         })
