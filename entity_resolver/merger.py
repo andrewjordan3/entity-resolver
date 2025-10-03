@@ -15,7 +15,6 @@ from typing import Dict, Optional, Set
 from .config import (
     ValidationConfig, 
     VectorizerConfig, 
-    SimilarityTfidfParams,
     ClustererConfig,
 )
 from .utils import (
@@ -41,7 +40,12 @@ class ClusterMerger:
     and applies similarity thresholds to determine which clusters should be merged.
     """
     
-    def __init__(self, validation_config: ValidationConfig, vectorizer_config: VectorizerConfig, cluster_config: ClustererConfig):
+    def __init__(
+            self, 
+            validation_config: ValidationConfig, 
+            vectorizer_config: VectorizerConfig, 
+            cluster_config: ClustererConfig
+        ):
         """
         Initialize the ClusterMerger with configuration parameters.
 
@@ -265,10 +269,8 @@ class ClusterMerger:
         # This is the key performance optimization: `groupby().apply()` will execute our
         # static method `_create_profile_for_group` on each group of data *in parallel on the GPU*,
         # avoiding the massive overhead of pulling data back to the CPU in a loop.
-        # We pass the necessary TF-IDF configuration as an argument to the apply call.
         canonical_profiles = clustered_entities.groupby('cluster').apply(
-            self._create_profile_for_group,
-            similarity_tfidf_config=self.vectorizer_config.similarity_tfidf
+            self._create_profile_for_group
         )
 
         # The result of a groupby-apply operation in cuDF has a multi-level index
@@ -789,27 +791,20 @@ class ClusterMerger:
         
         return consolidation_map
     
-    @staticmethod
     def _create_profile_for_group(
-        cluster_group: cudf.DataFrame, 
-        similarity_tfidf_config: SimilarityTfidfParams
-    ) -> cudf.DataFrame:
+            self,
+            cluster_group: cudf.DataFrame, 
+        ) -> cudf.DataFrame:
         """
         Creates a canonical profile for a single cluster group.
 
-        This static method is designed to be used within a GPU-accelerated
+        This method is designed to be used within a GPU-accelerated
         `groupby().apply()` operation. It receives a DataFrame containing all
         records for a single cluster and calculates that cluster's canonical
         name and address.
 
-        By being a static method, it operates as a pure function, ensuring that
-        it has no side effects and its output depends only on its inputs. This
-        improves code clarity, testability, and modularity.
-
         Args:
             cluster_group: A cuDF DataFrame containing all rows for one cluster.
-            similarity_tfidf_config: The validated `SimilarityTfidfParams`
-                Pydantic model, which is required by the canonical name function.
 
         Returns:
             A single-row cuDF DataFrame containing the canonical representations
@@ -818,7 +813,7 @@ class ClusterMerger:
         # Calculate the single most representative name for the entire cluster.
         canonical_name = get_canonical_name_gpu(
             cluster_group['normalized_text'],
-            similarity_tfidf_config
+            self.vectorizer_config.similarity_tfidf
         )
         
         # Find the highest-quality address from all records in the cluster.
