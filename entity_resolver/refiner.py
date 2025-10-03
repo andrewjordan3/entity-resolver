@@ -5,10 +5,10 @@ final stages of the entity resolution pipeline: refining cluster assignments,
 building the canonical map, and applying it to the dataset.
 
 The refinement process includes:
-- Address enrichment for incomplete records
-- Cluster splitting based on geographical conflicts
-- Canonical entity profile creation
-- Chain entity identification and numbering
+- Address enrichment for incomplete records.
+- Cluster splitting based on geographical or address range conflicts.
+- Creation of a canonical entity profile for each cluster.
+- Identification and numbering of chain entities (e.g., franchises).
 """
 
 import cudf
@@ -136,101 +136,80 @@ class ClusterRefiner:
 
     def build_canonical_map(self, gdf: cudf.DataFrame) -> cudf.DataFrame:
         """
-        Builds the final canonical map from refined clusters.
-        
-        Creates a definitive mapping of cluster IDs to canonical entity profiles.
-        Each cluster is assigned:
-        - A canonical name (most representative name in the cluster)
-        - A best address (most complete and reliable address)
-        - Average cluster probability score
-        - Chain numbering for multi-location entities
-        
+        Builds the final canonical map from refined clusters using vectorized ops.
+
+        This method creates a definitive mapping of each cluster ID to a
+        single canonical entity profile. It determines:
+        - A canonical name (most representative name).
+        - A best address (most complete and reliable address).
+        - The average cluster probability score.
+        - Chain numbering for multi-location entities.
+
         Args:
-            gdf: cuDF DataFrame with 'final_cluster' assignments and all entity data.
-            
+            gdf: cuDF DataFrame with 'final_cluster' assignments and entity data.
+
         Returns:
-            cudf.DataFrame: Canonical map with one row per unique cluster containing
-                           final_cluster, canonical_name, address fields, and 
-                           avg_cluster_prob. Empty DataFrame if no valid clusters.
+            A cuDF DataFrame serving as the canonical map, with one row per
+            unique cluster. Returns an empty DataFrame if no valid clusters exist.
         """
         logger.info("Building canonical map from refined clusters...")
-        
-        # Filter to only clustered records (exclude noise points with cluster -1)
-        clustered_records_gdf = gdf[gdf['final_cluster'] != -1]
-        
+
+        # Filter to only clustered records, excluding noise points (cluster == -1).
+        clustered_records_gdf = gdf[gdf['final_cluster'] != -1].copy()
+
         if clustered_records_gdf.empty:
             logger.warning(
-                "No valid clusters found to build canonical map. "
-                "All records may be noise points (cluster = -1)."
+                "No valid clusters found (all records may be noise points). "
+                "Cannot build canonical map."
             )
             return cudf.DataFrame()
-        
-        # Get unique cluster IDs - fully GPU-based approach
-        unique_cluster_series = clustered_records_gdf['final_cluster'].unique()
-        unique_cluster_count = len(unique_cluster_series)
-        
-        logger.info(f"Processing {unique_cluster_count:,} unique clusters for canonical profiles...")
-        
-        # Build canonical profiles using groupby operations to stay on GPU
-        # First, get the best address for each cluster using groupby
-        canonical_profiles_list = []
-        
-        # Process each unique cluster while staying on GPU
-        for idx in range(len(unique_cluster_series)):
-            # Get cluster ID directly from GPU series
-            cluster_id = unique_cluster_series.iloc[idx]
-            
-            # Filter to this cluster's records
-            cluster_records_subset = clustered_records_gdf[
-                clustered_records_gdf['final_cluster'] == cluster_id
-            ]
-            
-            # Get canonical name using TF-IDF similarity
-            canonical_entity_name = get_canonical_name_gpu(
-                cluster_records_subset['normalized_text'], 
-                self.vectorizer_config.similarity_tfidf
-            )
-            
-            # Get best address profile for the cluster
-            best_address_dataframe = get_best_address_gpu(cluster_records_subset)
-            
-            # Calculate average cluster probability for quality assessment
-            average_cluster_probability = cluster_records_subset['cluster_probability'].mean()
-            
-            if not best_address_dataframe.empty:
-                # Create a new row with canonical information
-                # Stay on GPU by using cuDF operations
-                canonical_row = best_address_dataframe.iloc[0:1].copy()
-                canonical_row['final_cluster'] = cluster_id
-                canonical_row['canonical_name'] = canonical_entity_name
-                canonical_row['avg_cluster_prob'] = float(average_cluster_probability)
-                
-                canonical_profiles_list.append(canonical_row)
-                
-                # Log progress every 1000 clusters for large datasets
-                if len(canonical_profiles_list) % 1000 == 0:
-                    logger.debug(f"Processed {len(canonical_profiles_list):,} cluster profiles...")
-        
-        if not canonical_profiles_list:
-            logger.warning("No valid canonical profiles could be created from clusters.")
-            return cudf.DataFrame()
-        
-        # Concatenate all canonical profiles into a single DataFrame - stays on GPU
-        canonical_map_dataframe = cudf.concat(canonical_profiles_list, ignore_index=True)
-        
-        logger.info(
-            f"Created initial canonical map with {len(canonical_map_dataframe):,} entries. "
-            f"Average cluster probability: {canonical_map_dataframe['avg_cluster_prob'].mean():.3f}"
+
+        num_unique_clusters = clustered_records_gdf['final_cluster'].nunique()
+        logger.info(f"Processing {num_unique_clusters:,} unique clusters for canonical profiles...")
+
+        # --- Vectorized Canonical Profile Generation ---
+
+        # 1. Get the best address profile for each cluster using groupby().apply().
+        logger.debug("Step 1: Determining best address profile for each cluster via groupby-apply...")
+        best_addresses_df = clustered_records_gdf.groupby('final_cluster').apply(
+            get_best_address_gpu
         )
-        
-        # Handle chain entities (same name at multiple locations)
-        canonical_map_dataframe = self._number_chain_entities(canonical_map_dataframe)
-        
-        logger.info(
-            f"Canonical map complete with {len(canonical_map_dataframe):,} final entries."
+        # The result has a MultiIndex ('final_cluster', original_index). We want
+        # 'final_cluster' as a column and to discard the original index.
+        best_addresses_df = best_addresses_df.reset_index(level=1, drop=True).reset_index()
+        logger.debug(f"Found {len(best_addresses_df):,} best address profiles.")
+
+        # 2. Calculate average cluster probabilities for all clusters at once.
+        logger.debug("Step 2: Calculating average cluster probabilities...")
+        avg_probabilities_df = clustered_records_gdf.groupby('final_cluster').agg(
+            avg_cluster_prob=('cluster_probability', 'mean')
+        ).reset_index()
+        logger.debug("Average probabilities calculated.")
+
+        # 3. Determine the canonical name for each cluster.
+        logger.debug("Step 3: Determining canonical name for each cluster...")
+        canonical_names_df = self._get_canonical_names(clustered_records_gdf)
+        logger.debug("Canonical names determined.")
+
+        # 4. Merge the components into the final canonical map.
+        logger.debug("Step 4: Assembling the final canonical map...")
+        # Start with the addresses, which have the most columns.
+        canonical_map_df = best_addresses_df.merge(
+            avg_probabilities_df, on='final_cluster', how='left'
+        ).merge(
+            canonical_names_df, on='final_cluster', how='left'
         )
-        
-        return canonical_map_dataframe
+
+        logger.info(
+            f"Created initial canonical map with {len(canonical_map_df):,} entries. "
+            f"Average cluster probability: {canonical_map_df['avg_cluster_prob'].mean():.3f}"
+        )
+
+        # 5. Handle chain entities (e.g., "Starbucks - 1", "Starbucks - 2").
+        canonical_map_df = self._number_chain_entities(canonical_map_df)
+
+        logger.info(f"Canonical map build complete with {len(canonical_map_df):,} final entries.")
+        return canonical_map_df
 
     def apply_canonical_map(
         self, 
@@ -323,131 +302,119 @@ class ClusterRefiner:
     # Private Helper Methods
     # ============================================================================
 
+    def _get_canonical_names(self, gdf: cudf.DataFrame) -> cudf.DataFrame:
+        """
+        Vectorized helper to determine the canonical name for each cluster.
+
+        This method uses groupby().apply() to run the name selection logic
+        for each cluster. While .apply() can involve some overhead, it is
+        significantly more performant on the GPU than a Python-level loop as
+        it leverages cuDF's internal dispatch mechanisms.
+
+        Args:
+            gdf: DataFrame containing clustered records.
+
+        Returns:
+            A DataFrame with 'final_cluster' and 'canonical_name' columns.
+        """
+        # This lambda function will be applied to the DataFrame subset for
+        # each unique cluster.
+        def find_canonical_name(df_group):
+            return get_canonical_name_gpu(
+                df_group['normalized_text'], self.vectorizer_config.similarity_tfidf
+            )
+
+        canonical_names_series = gdf.groupby('final_cluster').apply(find_canonical_name)
+        canonical_names_df = canonical_names_series.to_frame('canonical_name').reset_index()
+
+        return canonical_names_df
+
     def _enrich_addresses(self, gdf: cudf.DataFrame) -> cudf.DataFrame:
         """
-        Enriches records with missing street-level information from cluster peers.
-        
-        For records missing street number/name but having matching city/state/zip
-        with other cluster members, this method fills in the missing street data
-        from the cluster's canonical address profile.
-        
+        Enriches records with missing street info from cluster peers.
+
+        This fully vectorized method finds the best address for each cluster and
+        uses it to fill in missing street numbers/names for other records in
+        the same cluster that share the same city, state, and zip.
+
         Args:
             gdf: DataFrame with cluster assignments and address components.
-            
+
         Returns:
-            cudf.DataFrame: DataFrame with enriched addresses and updated 
-                           'address_was_enriched' flags.
+            DataFrame with enriched addresses and updated flags.
         """
-        logger.debug("Starting address enrichment process...")
-        
-        # Get unique clusters excluding noise points
-        clustered_mask = gdf['cluster'] != -1
-        unique_cluster_series = gdf.loc[clustered_mask, 'cluster'].unique()
-        
-        if len(unique_cluster_series) == 0:
+        logger.debug("Starting vectorized address enrichment...")
+
+        clustered_gdf = gdf[gdf['cluster'] != -1]
+        if clustered_gdf.empty:
             logger.debug("No clusters available for address enrichment.")
             return gdf
-        
-        logger.debug(f"Building canonical address profiles for {len(unique_cluster_series):,} clusters...")
-        
-        # Build canonical address profiles for each cluster - fully GPU-based
-        canonical_profile_list = []
-        
-        # Process each cluster while staying on GPU
-        for idx in range(len(unique_cluster_series)):
-            # Get cluster ID directly from GPU series
-            cluster_id = unique_cluster_series.iloc[idx]
-            cluster_subset_df = gdf[gdf['cluster'] == cluster_id]
-            best_address_for_cluster = get_best_address_gpu(cluster_subset_df)
-            
-            if not best_address_for_cluster.empty:
-                # Keep only one row and add cluster ID - stay on GPU
-                single_row_profile = best_address_for_cluster.iloc[0:1].copy()
-                single_row_profile['cluster'] = cluster_id
-                canonical_profile_list.append(single_row_profile)
-        
-        if not canonical_profile_list:
-            logger.debug("No valid canonical profiles found for enrichment.")
-            return gdf
-        
-        # Concatenate all profiles into a single DataFrame
-        canonical_profiles_df = cudf.concat(canonical_profile_list, ignore_index=True)
-        
-        # Rename canonical columns to avoid conflicts during merge
-        canonical_profiles_df = canonical_profiles_df.rename(columns={
+
+        # 1. Get canonical address profiles for each cluster using groupby-apply.
+        canonical_profiles_df = clustered_gdf.groupby('cluster').apply(
+            get_best_address_gpu
+        )
+        # The result has a MultiIndex ('cluster', original_index). We want
+        # 'cluster' as a column and to discard the original index.
+        canonical_profiles_df = canonical_profiles_df.reset_index(level=1, drop=True).reset_index()
+        logger.debug(f"Built {len(canonical_profiles_df):,} canonical address profiles.")
+
+        # 2. Prepare for merge by selecting and renaming columns.
+        canonical_merge_cols = {
+            'cluster': 'cluster',
             'addr_street_number': 'canonical_street_number',
             'addr_street_name': 'canonical_street_name',
             'addr_city': 'canonical_city',
             'addr_state': 'canonical_state',
             'addr_zip': 'canonical_zip'
-        })
-        
-        # Select only needed columns for merge
-        canonical_merge_cols = [
-            'cluster', 'canonical_street_number', 'canonical_street_name',
-            'canonical_city', 'canonical_state', 'canonical_zip'
-        ]
-        
-        # Merge canonical profiles with main DataFrame
-        logger.debug("Merging canonical address profiles with main dataset...")
-        gdf = gdf.merge(
-            canonical_profiles_df[canonical_merge_cols],
-            on='cluster',
-            how='left'
+        }
+        # Filter to only needed columns that exist in the profiles df
+        cols_to_merge = [col for col in canonical_merge_cols.keys() if col in canonical_profiles_df.columns]
+        profiles_for_merge = canonical_profiles_df[cols_to_merge].rename(
+            columns=canonical_merge_cols
         )
         
-        # Define enrichment eligibility criteria
-        # Records are eligible if they:
-        # 1. Are in a cluster (not noise)
-        # 2. Missing street name (primary indicator of incomplete address)
-        # 3. Match the canonical city, state, and zip exactly
+        # 3. Merge canonical profiles back onto the main DataFrame.
+        logger.debug("Merging canonical profiles with main dataset...")
+        gdf = gdf.merge(profiles_for_merge, on='cluster', how='left')
+
+        # 4. Define enrichment criteria using boolean masks.
         missing_street_mask = (gdf['addr_street_name'].isna()) | (gdf['addr_street_name'] == '')
-        canonical_street_name_exists = (gdf['canonical_street_name'].notna()) & (gdf['canonical_street_name'] != '')
-        
-        enrichment_eligible_mask = (
-            (gdf['cluster'] != -1) &
-            missing_street_mask &
-            canonical_street_name_exists &
+        canonical_info_exists = (gdf['canonical_street_name'].notna()) & (gdf['canonical_street_name'] != '')
+        geo_match_mask = (
             (gdf['addr_city'] == gdf['canonical_city']) &
             (gdf['addr_state'] == gdf['canonical_state']) &
             (gdf['addr_zip'] == gdf['canonical_zip'])
         )
-        
-        # Count and enrich eligible records
-        enrichable_record_count = int(enrichment_eligible_mask.sum())
-        
-        if enrichable_record_count > 0:
+
+        eligible_mask = (gdf['cluster'] != -1) & missing_street_mask & canonical_info_exists & geo_match_mask
+        num_enrichable = eligible_mask.sum()
+
+        # 5. Apply enrichment to eligible records.
+        if num_enrichable > 0:
             logger.info(
-                f"Enriching {enrichable_record_count:,} records with missing street information "
-                f"from their cluster's canonical address."
+                f"Enriching {num_enrichable:,} records with missing street "
+                f"information from their cluster's canonical address."
             )
-            
-            # Apply enrichment by copying canonical street data
-            gdf.loc[enrichment_eligible_mask, 'addr_street_number'] = (
-                gdf.loc[enrichment_eligible_mask, 'canonical_street_number']
-            )
-            gdf.loc[enrichment_eligible_mask, 'addr_street_name'] = (
-                gdf.loc[enrichment_eligible_mask, 'canonical_street_name']
-            )
-            gdf.loc[enrichment_eligible_mask, 'address_was_enriched'] = True
-            
-            # Rebuild normalized address keys for enriched records
+            gdf.loc[eligible_mask, 'addr_street_number'] = gdf.loc[eligible_mask, 'canonical_street_number']
+            gdf.loc[eligible_mask, 'addr_street_name'] = gdf.loc[eligible_mask, 'canonical_street_name']
+            gdf.loc[eligible_mask, 'address_was_enriched'] = True
+
+            # Rebuild normalized keys for the records that were just changed.
             logger.debug("Rebuilding address keys for enriched records...")
-            enriched_subset = gdf.loc[enrichment_eligible_mask]
-            gdf.loc[enrichment_eligible_mask, 'addr_normalized_key'] = (
-                create_address_key_gpu(enriched_subset)
-            )
+            enriched_subset = gdf.loc[eligible_mask].copy()
+            # The create_address_key_gpu function should return a Series with an index
+            # that aligns with the enriched_subset.
+            new_keys = create_address_key_gpu(enriched_subset)
+            gdf.loc[eligible_mask, 'addr_normalized_key'] = new_keys
         else:
-            logger.debug("No records eligible for address enrichment.")
-        
-        # Clean up temporary canonical columns
-        canonical_columns_to_drop = [
-            'canonical_street_number', 'canonical_street_name',
-            'canonical_city', 'canonical_state', 'canonical_zip'
-        ]
-        gdf = gdf.drop(columns=canonical_columns_to_drop)
-        
-        logger.debug(f"Address enrichment complete. {enrichable_record_count:,} records updated.")
+            logger.debug("No records were eligible for address enrichment.")
+
+        # 6. Clean up temporary canonical columns.
+        cols_to_drop = [c for c in canonical_merge_cols.values() if c != 'cluster']
+        gdf = gdf.drop(columns=cols_to_drop)
+
+        logger.debug("Address enrichment complete.")
         return gdf
 
     def _split_clusters_by_conflict(self, gdf: cudf.DataFrame) -> cudf.DataFrame:
@@ -539,7 +506,7 @@ class ClusterRefiner:
         valid_clusters_with_address = gdf[
             (gdf['final_cluster'] != -1) & 
             (gdf['street_number_numeric'].notna())
-        ]
+        ].copy()
         
         if len(valid_clusters_with_address) > 0:
             # Calculate street number ranges for each (cluster, street, zip) group

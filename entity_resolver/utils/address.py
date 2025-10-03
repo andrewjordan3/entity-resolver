@@ -41,7 +41,7 @@ ADDRESS_SCORE_WEIGHTS = {
     'street_name': 2,  # Most critical component.
     'street_number': 1,
     'city': 1,
-    'state': 1,       # A valid 2-character state code is required.
+    'state': 1,
     'zip': 1          # A valid 5-digit zip code adds confidence.
 }
 
@@ -95,13 +95,14 @@ def _expand_and_parse_address(address_string: str) -> Dict[str, str]:
         logger.debug("Input to _expand_and_parse_address was empty or not a string.")
         return {}
 
+    # *****Expansion was causing issues (st -> saint, ky -> key) *****
     # expand_address returns a list of possible expansions. We use the first,
     # most likely expansion for parsing to ensure consistency.
-    expanded_address_list = expand_address(address_string)
-    most_likely_expansion = expanded_address_list[0] if expanded_address_list else address_string
+    # expanded_address_list = expand_address(address_string)
+    # most_likely_expansion = expanded_address_list[0] if expanded_address_list else address_string
 
     # parse_address returns a list of (value, label) tuples.
-    parsed_tuples = parse_address(most_likely_expansion)
+    parsed_tuples = parse_address(address_string)
 
     # Convert the list of tuples into a dictionary for easier access by label.
     return {label: value for value, label in parsed_tuples}
@@ -310,7 +311,7 @@ def calculate_address_score_gpu(gdf: cudf.DataFrame) -> cudf.Series:
     score += _is_series_present(gdf['addr_city']).astype('int32') * ADDRESS_SCORE_WEIGHTS['city']
 
     # For state, we check for a valid 2-character abbreviation.
-    is_valid_state = gdf['addr_state'].notna() & (gdf['addr_state'].str.len() == 2)
+    is_valid_state = gdf['addr_state'].notna()
     score += is_valid_state.astype('int32') * ADDRESS_SCORE_WEIGHTS['state']
 
     # For ZIP code, we validate a 5-digit format.

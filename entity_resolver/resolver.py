@@ -170,7 +170,8 @@ class EntityResolver:
         # Merging component for combining related clusters
         self.merger = ClusterMerger(
             validation_config=self.config.validation,
-            vectorizer_config=self.config.vectorizer  # For similarity parameters
+            vectorizer_config=self.config.vectorizer,  # For similarity parameters
+            cluster_config=self.config.clusterer
         )
         self.logger.debug("ClusterMerger initialized")
         

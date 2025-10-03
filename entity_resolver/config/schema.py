@@ -1170,6 +1170,14 @@ class SnnClusteringParams(BaseModel):
         gt=0.0, 
         description="Resolution parameter for the Louvain community detection algorithm. Higher values lead to more, smaller communities."
     )
+    merge_name_distance_threshold: float = Field(
+        default=0.02, gt=0.0, lt=1.0,
+        description="Maximum k-NN distance for two cluster NAMES to be considered for merging."
+    )
+    merge_address_distance_threshold: float = Field(
+        default=0.01, gt=0.0, lt=1.0,
+        description="Maximum k-NN distance for two cluster ADDRESSES to be considered for merging."
+    )
 
 class NoiseAttachmentParams(BaseModel):
     """

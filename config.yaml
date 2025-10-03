@@ -210,6 +210,8 @@ clusterer:
   snn_clustering_params:
     k_neighbors: 40
     louvain_resolution: 0.65
+    merge_name_distance_threshold: 0.02
+    merge_address_distance_threshold: 0.01
   noise_attachment_params:
     k_neighbors: 15
     similarity_threshold: 0.82

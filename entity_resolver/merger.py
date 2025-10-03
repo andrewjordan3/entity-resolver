@@ -12,7 +12,12 @@ import logging
 from typing import Dict, Optional, Set
 
 # --- Local Package Imports ---
-from .config import ValidationConfig, VectorizerConfig
+from .config import (
+    ValidationConfig, 
+    VectorizerConfig, 
+    SimilarityTfidfParams,
+    ClustererConfig,
+)
 from .utils import (
     get_canonical_name_gpu, 
     get_best_address_gpu, 
@@ -36,7 +41,7 @@ class ClusterMerger:
     and applies similarity thresholds to determine which clusters should be merged.
     """
     
-    def __init__(self, validation_config: ValidationConfig, vectorizer_config: VectorizerConfig):
+    def __init__(self, validation_config: ValidationConfig, vectorizer_config: VectorizerConfig, cluster_config: ClustererConfig):
         """
         Initialize the ClusterMerger with configuration parameters.
 
@@ -48,16 +53,11 @@ class ClusterMerger:
         """
         self.validation_config = validation_config
         self.vectorizer_config = vectorizer_config
+        self.cluster_config = cluster_config
         
         # Pre-compute similarity thresholds to avoid repeated division operations
         self.name_similarity_threshold = validation_config.name_fuzz_ratio / 100.0
         self.address_similarity_threshold = validation_config.address_fuzz_ratio / 100.0
-
-        ##################################################
-        # Need to make the following into parameters
-        ###################################################
-        self.name_merging_distance_threshold: float = 0.02
-        self.address_merging_distance_threshold: float = 0.01
 
     def merge_clusters(self, entity_dataframe: cudf.DataFrame) -> cudf.DataFrame:
         """
@@ -154,7 +154,7 @@ class ClusterMerger:
             profiles_with_sequential_index['canonical_name_representation'], 
             self.vectorizer_config.similarity_tfidf, 
             self.vectorizer_config.similarity_nn,
-            self.name_merging_distance_threshold
+            self.cluster_config.snn_clustering_params.merge_name_distance_threshold
         )
         # Translate the positional indices back to actual cluster IDs using our mapping.
         name_edges_with_cluster_ids = cudf.DataFrame({
@@ -167,7 +167,7 @@ class ClusterMerger:
             profiles_with_sequential_index['canonical_address_representation'], 
             self.vectorizer_config.similarity_tfidf, 
             self.vectorizer_config.similarity_nn, 
-            self.address_merging_distance_threshold
+            self.cluster_config.snn_clustering_params.merge_address_distance_threshold
         )
         address_edges_with_cluster_ids = cudf.DataFrame({
             'source_cluster_id': positional_index_to_cluster_id.iloc[address_similarity_edges['source']].reset_index(drop=True),
@@ -230,71 +230,65 @@ class ClusterMerger:
     
     def _build_cluster_profiles_gpu(self, clustered_entities: cudf.DataFrame) -> Optional[cudf.DataFrame]:
         """
-        Build cluster profiles entirely on GPU without loops or pandas conversions.
-        
-        This method creates a canonical representation for each cluster including:
-        - Canonical name (most representative entity name)
-        - Canonical address (best quality address)
-        - Cluster size (number of entities)
-        
+        Builds canonical profiles for each cluster using a fully GPU-accelerated approach.
+
+        This method leverages cuDF's `groupby().apply()` functionality, which
+        executes a user-defined function (`_create_profile_for_group`) on each cluster's
+        data in parallel on the GPU.
+
+        The process is as follows:
+        1.  Calculates the size of each cluster using a parallel `groupby().agg()`.
+        2.  Executes the `_create_profile_for_group` static method for each cluster group
+            on the GPU, generating the canonical name and address representations.
+        3.  Cleans up the resulting DataFrame's multi-level index, which is an artifact
+            of the `apply` operation.
+        4.  Merges the cluster sizes and canonical representations into a final,
+            comprehensive profiles DataFrame.
+
         Args:
-            clustered_entities: DataFrame containing only entities with valid cluster assignments
-            
+            clustered_entities: A cuDF DataFrame containing only the entities that
+                                have been assigned to a valid cluster (i.e., not noise).
+
         Returns:
-            cudf.DataFrame: Cluster profiles with canonical representations, or None if empty
+            A cuDF DataFrame where each row represents a single cluster's canonical profile,
+            or None if no profiles could be generated.
         """
-        # Use groupby aggregation to get cluster sizes in parallel
-        cluster_sizes = clustered_entities.groupby('cluster').size().reset_index()
-        cluster_sizes.columns = ['cluster_id', 'cluster_entity_count']
-        
-        # For canonical names, we'll need to call the utility function per cluster
-        # But we can optimize by doing batch operations where possible
-        
-        # Create a function to get canonical representations for all clusters at once
-        canonical_names_list = []
-        canonical_addresses_list = []
-        cluster_ids_list = []
-        
-        # Group the dataframe once and iterate through groups
-        grouped_entities = clustered_entities.groupby('cluster')
-        
-        for cluster_id, cluster_group in grouped_entities:
-            # Get canonical name for this cluster
-            canonical_name = get_canonical_name_gpu(
-                cluster_group['normalized_text'], 
-                self.vectorizer_config.similarity_tfidf
-            )
-            
-            # Get best address for this cluster
-            best_address_row = get_best_address_gpu(cluster_group)
-            
-            if not best_address_row.empty:
-                canonical_address = best_address_row['addr_normalized_key'].iloc[0]
-            else:
-                canonical_address = ""
-            
-            canonical_names_list.append(canonical_name)
-            canonical_addresses_list.append(canonical_address)
-            cluster_ids_list.append(cluster_id)
-        
-        if not cluster_ids_list:
-            return None
-        
-        # Create the profiles dataframe entirely on GPU
-        cluster_profiles = cudf.DataFrame({
-            'cluster_id': cluster_ids_list,
-            'canonical_name_representation': canonical_names_list,
-            'canonical_address_representation': canonical_addresses_list
-        })
-        
-        # Merge with cluster sizes
-        cluster_profiles = cluster_profiles.merge(
-            cluster_sizes, 
-            on='cluster_id',
-            how='left'
+        logger.debug("Building cluster profiles with GPU-native groupby-apply...")
+
+        # First, calculate the size of each cluster in a single, parallel GPU operation.
+        # We use 'raw_name' to count, but any non-null column would work.
+        cluster_stats = clustered_entities.groupby('cluster').agg(
+            cluster_entity_count=('raw_name', 'count')
+        ).reset_index()
+
+        # Now, generate the canonical name and address for each cluster.
+        # This is the key performance optimization: `groupby().apply()` will execute our
+        # static method `_create_profile_for_group` on each group of data *in parallel on the GPU*,
+        # avoiding the massive overhead of pulling data back to the CPU in a loop.
+        # We pass the necessary TF-IDF configuration as an argument to the apply call.
+        canonical_profiles = clustered_entities.groupby('cluster').apply(
+            self._create_profile_for_group,
+            similarity_tfidf_config=self.vectorizer_config.similarity_tfidf
         )
-        
-        return cluster_profiles
+
+        # The result of a groupby-apply operation in cuDF has a multi-level index
+        # (e.g., (cluster_id, original_index)). We must reset this to work with
+        # standard columns. Resetting level 0 brings the 'cluster' group key back
+        # as a regular column.
+        canonical_profiles = canonical_profiles.reset_index(level=0)
+        canonical_profiles = canonical_profiles.rename(columns={'cluster': 'cluster_id'})
+
+        # Finally, merge the pre-calculated cluster sizes with the canonical representations.
+        # This combines the two parallel computations into a single, comprehensive profiles DataFrame.
+        # We join on the cluster identifiers and drop the redundant 'cluster' column from the merge.
+        final_profiles = canonical_profiles.merge(
+            cluster_stats,
+            left_on='cluster_id',
+            right_on='cluster',
+            how='left'
+        ).drop(columns=['cluster'])
+
+        return final_profiles
     
     def _create_merge_mapping_gpu(self, profiles_with_components: cudf.DataFrame) -> Dict:
         """
@@ -794,3 +788,48 @@ class ClusterMerger:
             logger.debug("No cluster consolidations needed")
         
         return consolidation_map
+    
+    @staticmethod
+    def _create_profile_for_group(
+        cluster_group: cudf.DataFrame, 
+        similarity_tfidf_config: SimilarityTfidfParams
+    ) -> cudf.DataFrame:
+        """
+        Creates a canonical profile for a single cluster group.
+
+        This static method is designed to be used within a GPU-accelerated
+        `groupby().apply()` operation. It receives a DataFrame containing all
+        records for a single cluster and calculates that cluster's canonical
+        name and address.
+
+        By being a static method, it operates as a pure function, ensuring that
+        it has no side effects and its output depends only on its inputs. This
+        improves code clarity, testability, and modularity.
+
+        Args:
+            cluster_group: A cuDF DataFrame containing all rows for one cluster.
+            similarity_tfidf_config: The validated `SimilarityTfidfParams`
+                Pydantic model, which is required by the canonical name function.
+
+        Returns:
+            A single-row cuDF DataFrame containing the canonical representations
+            for the cluster. This format is required by the `apply` function.
+        """
+        # Calculate the single most representative name for the entire cluster.
+        canonical_name = get_canonical_name_gpu(
+            cluster_group['normalized_text'],
+            similarity_tfidf_config
+        )
+        
+        # Find the highest-quality address from all records in the cluster.
+        best_address_row = get_best_address_gpu(cluster_group)
+        
+        # Extract the address string, defaulting to an empty string if none is found.
+        canonical_address = best_address_row['addr_normalized_key'].iloc[0] if not best_address_row.empty else ""
+        
+        # The result must be a DataFrame, which `groupby().apply()` will then
+        # concatenate with the results from all other groups.
+        return cudf.DataFrame({
+            'canonical_name_representation': [canonical_name],
+            'canonical_address_representation': [canonical_address]
+        })
