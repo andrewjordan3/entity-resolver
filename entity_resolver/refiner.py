@@ -356,7 +356,7 @@ class ClusterRefiner:
         )
         # The result has a MultiIndex ('cluster', original_index). We want
         # 'cluster' as a column and to discard the original index.
-        canonical_profiles_df = canonical_profiles_df.reset_index(level=1, drop=True).reset_index()
+        canonical_profiles_df = canonical_profiles_df.reset_index()
         logger.debug(f"Built {len(canonical_profiles_df):,} canonical address profiles.")
 
         # 2. Prepare for merge by selecting and renaming columns.
