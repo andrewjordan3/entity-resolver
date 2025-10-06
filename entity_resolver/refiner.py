@@ -174,9 +174,8 @@ class ClusterRefiner:
         best_addresses_df = clustered_records_gdf.groupby('final_cluster').apply(
             get_best_address_gpu
         )
-        # The result has a MultiIndex ('final_cluster', original_index). We want
-        # 'final_cluster' as a column and to discard the original index.
-        best_addresses_df = best_addresses_df.reset_index(level=1, drop=True).reset_index()
+        # The result has'final_cluster' as index. We want 'final_cluster' as a column.
+        best_addresses_df = best_addresses_df.reset_index()
         logger.debug(f"Found {len(best_addresses_df):,} best address profiles.")
 
         # 2. Calculate average cluster probabilities for all clusters at once.
@@ -354,8 +353,7 @@ class ClusterRefiner:
         canonical_profiles_df = clustered_gdf.groupby('cluster').apply(
             get_best_address_gpu
         )
-        # The result has a MultiIndex ('cluster', original_index). We want
-        # 'cluster' as a column and to discard the original index.
+        # The result has 'cluster'as index. We want 'cluster' as a column.
         canonical_profiles_df = canonical_profiles_df.reset_index()
         logger.debug(f"Built {len(canonical_profiles_df):,} canonical address profiles.")
 
