@@ -537,13 +537,15 @@ class ClusterValidator:
             return cudf.Series(dtype=bool)
 
         logger.debug(f"Building null distribution with {n_shuffles} shuffles for {num_entities} entities.")
-        # Extract GPU arrays for efficient computation.
-        entity_text_arr = entities_with_profiles_df['normalized_text'].values
-        entity_addr_arr = entities_with_profiles_df['addr_normalized_key'].values
+        # Keep string columns as cuDF Series. Calling .values on a string column
+        # is not supported as CuPy does not have a native string dtype. Numeric columns
+        # can still be converted to CuPy arrays for performance.
+        entity_text_series = entities_with_profiles_df['normalized_text']
+        entity_addr_series = entities_with_profiles_df['addr_normalized_key']
         actual_match_scores = entities_with_profiles_df['current_match_score'].values
         
-        profile_name_arr = entities_with_profiles_df['profile_canonical_name'].values
-        profile_addr_arr = entities_with_profiles_df['profile_canonical_addr_key'].values
+        profile_name_series = entities_with_profiles_df['profile_canonical_name']
+        profile_addr_series = entities_with_profiles_df['profile_canonical_addr_key']
         
         # --- Build Empirical Null Distribution ---
         # We concatenate scores from multiple shuffles to create a more stable and
@@ -553,19 +555,20 @@ class ClusterValidator:
             logger.debug(f"Running shuffle {i+1}/{n_shuffles}...")
             # Shuffle the profiles by creating a random permutation of indices.
             shuffled_indices = cp.random.permutation(num_entities)
-            shuffled_profile_name_arr = profile_name_arr[shuffled_indices]
-            shuffled_profile_addr_arr = profile_addr_arr[shuffled_indices]
+            # Use .take() to reorder the cuDF Series according to the shuffled indices.
+            shuffled_profile_name_series = profile_name_series.take(shuffled_indices)
+            shuffled_profile_addr_series = profile_addr_series.take(shuffled_indices)
 
             # Calculate similarity scores against these incorrect, random profiles.
             shuffled_name_sim = calculate_similarity_gpu(
-                cudf.Series(entity_text_arr),
-                cudf.Series(shuffled_profile_name_arr),
+                entity_text_series,
+                shuffled_profile_name_series,
                 self.vectorizer_config.similarity_tfidf
             ).fillna(0.0)
 
             shuffled_addr_sim = calculate_similarity_gpu(
-                cudf.Series(entity_addr_arr),
-                cudf.Series(shuffled_profile_addr_arr),
+                entity_addr_series,
+                shuffled_profile_addr_series,
                 self.vectorizer_config.similarity_tfidf
             ).fillna(0.0)
             
