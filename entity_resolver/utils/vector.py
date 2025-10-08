@@ -328,7 +328,7 @@ def center_kernel_matrix(
         kernel_matrix
         - row_means.astype(working_dtype)
         - col_means.astype(working_dtype)
-        + working_dtype(grand_mean)
+        + grand_mean
     )
 
     # Step 7: Enforce perfect symmetry if requested
