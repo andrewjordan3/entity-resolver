@@ -877,8 +877,11 @@ class EntityClusterer:
         # for filtering out small SNN clusters that are not large enough to
         # become new, independent clusters.
         snn_cluster_sizes_df = (
-            cudf.Series(snn_labels).astype("int32").value_counts().reset_index()
-            .rename(columns={"index": "snn", 0: "size"})
+            cudf.Series(snn_labels)
+            .astype("int32")
+            .value_counts()
+            .reset_index(name="size")
+            .rename(columns={"index": "snn"})
         )
 
         # 2. De-duplicate the SNN-to-HDBSCAN Mapping
