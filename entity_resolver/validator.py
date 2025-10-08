@@ -12,7 +12,7 @@ This class uses memory-efficient, GPU-native strategies including:
 """
 
 import cudf
-import cupy
+import cupy as cp
 import logging
 from typing import Dict, Optional, List, Tuple
 from cudf.api.types import (
@@ -201,7 +201,7 @@ class ClusterValidator:
 
         return profiles_gdf
 
-    def _build_state_index(self, profiles: cudf.DataFrame) -> Dict[str, cupy.ndarray]:
+    def _build_state_index(self, profiles: cudf.DataFrame) -> Dict[str, cp.ndarray]:
         """
         Builds an index mapping states to cluster IDs for efficient filtering.
 
@@ -216,7 +216,7 @@ class ClusterValidator:
             # Group by state and collect cluster IDs, then convert the small result
             grouped = valid_profiles.groupby('profile_canonical_state')['cluster'].agg('collect').to_pandas()
             for state, clusters in grouped.items():
-                state_index[state] = cupy.asarray(clusters)
+                state_index[state] = cp.asarray(clusters)
 
         # Handle null states separately
         null_state_clusters = profiles[profiles['profile_canonical_state'].isna()]['cluster']
@@ -229,105 +229,490 @@ class ClusterValidator:
 
     def _identify_entities_for_reassignment(
         self,
-        gdf: cudf.DataFrame,
-        profiles: cudf.DataFrame
+        entity_data_gdf: cudf.DataFrame,
+        cluster_profiles_df: cudf.DataFrame
     ) -> cudf.DataFrame:
         """
-        Identifies entities that need reassignment.
-        
-        An entity needs reassignment if:
-        1. It's currently marked as noise (cluster == -1), or
-        2. It's significantly mismatched with its current cluster's profile.
-        
-        Uses tolerance zones and considers overall match quality
-        rather than hard cutoffs.
+        Identifies entities for reassignment using a robust statistical voting system.
+
+        This method replaces a fixed-threshold approach with three complementary,
+        data-driven detection techniques:
+        1. Per-cluster robust outlier detection (Mahalanobis distance).
+        2. Global empirical null with FDR control (Benjamini-Hochberg via shuffling).
+        3. Margin test for confidence in the current assignment.
+
+        An entity is flagged if it receives at least two "votes" from these methods,
+        if its match score is exceptionally poor, or if it violates a hard business
+        rule like state boundaries.
+
+        Args:
+            entity_data_gdf: DataFrame containing entity data with a 'cluster' column.
+            cluster_profiles_df: DataFrame containing the canonical profiles for each cluster.
+
+        Returns:
+            A DataFrame containing all entities identified for reassignment, with
+            their original schema plus a 'current_match_score' column.
         """
-        # First, handle noise entities - they always need reassignment.
-        noise_entities = gdf[gdf['cluster'] == -1].copy()
+        # --- 1. Initial Data Partitioning ---
+        # Noise entities are always candidates for reassignment. We separate them now
+        # and will concatenate them back at the end.
+        noise_entities_df = entity_data_gdf[entity_data_gdf['cluster'] == -1].copy()
+        clustered_entities_df = entity_data_gdf[entity_data_gdf['cluster'] != -1].copy()
+
+        # If there are no clustered entities to analyze, we only need to handle the noise.
+        if clustered_entities_df.empty:
+            if not noise_entities_df.empty:
+                noise_entities_df['current_match_score'] = 0.0
+            return noise_entities_df
+
+        # --- 2. Calculate Current Match Scores ---
+        # Merge entities with their assigned cluster's profile to compute how well they
+        # currently fit. This score is the baseline for all subsequent statistical tests.
+        entities_with_profiles_df = clustered_entities_df.merge(
+            cluster_profiles_df, on='cluster', how='left'
+        )
+
+        # Calculate name and address similarity scores against the assigned profile.
+        name_similarity_scores = calculate_similarity_gpu(
+            entities_with_profiles_df['normalized_text'],
+            entities_with_profiles_df['profile_canonical_name'],
+            self.vectorizer_config.similarity_tfidf
+        ).fillna(0.0)
+
+        addr_similarity_scores = calculate_similarity_gpu(
+            entities_with_profiles_df['addr_normalized_key'],
+            entities_with_profiles_df['profile_canonical_addr_key'],
+            self.vectorizer_config.similarity_tfidf
+        ).fillna(0.0)
+
+        # Compute a weighted average to get the final match score.
+        current_match_scores = (name_similarity_scores * 0.6 + addr_similarity_scores * 0.4)
+        entities_with_profiles_df['name_similarity'] = name_similarity_scores
+        entities_with_profiles_df['addr_similarity'] = addr_similarity_scores
+        entities_with_profiles_df['current_match_score'] = current_match_scores
+
+        # --- 3. Statistical Anomaly Detection (Voting) ---
+        # Each method provides a "vote" indicating if an entity is a poor fit.
         
-        # For clustered entities, check if they're valid in their current cluster.
-        clustered_entities = gdf[gdf['cluster'] != -1].copy()
+        # Vote 1: Mahalanobis Distance - Is this entity an outlier within its own cluster's distribution?
+        mahalanobis_outlier_vote = self._detect_mahalanobis_outliers_per_cluster(
+            entities_with_profiles_df
+        )
+
+        # Vote 2: FDR Control - Is this entity's match score statistically indistinguishable from a random match?
+        fdr_outlier_vote = self._detect_fdr_outliers_by_shuffling(
+            entities_with_profiles_df
+        )
+
+        # Vote 3: Margin Test - Is there another cluster that is almost as good a fit (or better)?
+        low_margin_vote = self._detect_low_margin_assignments_vectorized(
+            entities_with_profiles_df, cluster_profiles_df
+        )
+
+        # --- 4. Tally Votes and Apply Overrides ---
+        # Tally the votes from the three statistical methods.
+        outlier_vote_counts = (
+            mahalanobis_outlier_vote.astype('int32') +
+            fdr_outlier_vote.astype('int32') +
+            low_margin_vote.astype('int32')
+        )
+        # An entity needs at least two votes to be flagged for reassignment.
+        reassignment_mask = (outlier_vote_counts >= 2)
+
+        # Override 1: Extremely poor matches are always reassigned, regardless of votes.
+        # This acts as a safety net for clear mismatches.
+        very_poor_match_mask = (current_match_scores < 0.3)
+        reassignment_mask |= very_poor_match_mask
         
-        invalid_entities_list = []
-        if not clustered_entities.empty:
-            # Merge current cluster profile info onto each entity
-            entities_with_profiles = clustered_entities.merge(
-                profiles,
-                on='cluster',
-                how='left'
+        # Override 2: Enforce hard business rule (e.g., entity state must match profile state).
+        if self.config.enforce_state_boundaries:
+            state_is_compatible = self._check_state_compatibility(
+                entities_with_profiles_df['addr_state'],
+                entities_with_profiles_df['profile_canonical_state']
+            )
+            # If compatibility is False, it's a mismatch. `~state_is_compatible` flags it.
+            # We fill NaNs with True, assuming compatibility if data is missing.
+            reassignment_mask |= ~state_is_compatible.fillna(True)
+
+        # --- 5. Final Assembly ---
+        # Select the entities flagged for reassignment using the final mask.
+        mismatched_entities_df = entities_with_profiles_df[reassignment_mask]
+
+        # Trim the DataFrame to match the original schema, plus the new score column.
+        final_columns = list(entity_data_gdf.columns) + ['current_match_score']
+        reassignment_candidates_df = mismatched_entities_df[final_columns].copy()
+
+        # Combine the statistically-identified candidates with the original noise entities.
+        all_entities_to_reassign_list = []
+        if not noise_entities_df.empty:
+            noise_entities_df['current_match_score'] = 0.0
+            all_entities_to_reassign_list.append(noise_entities_df)
+        if not reassignment_candidates_df.empty:
+            all_entities_to_reassign_list.append(reassignment_candidates_df)
+
+        if not all_entities_to_reassign_list:
+            return cudf.DataFrame() # Return empty DF if no one needs reassignment.
+
+        return cudf.concat(all_entities_to_reassign_list)
+
+    # --- Statistical and Validation Helper Methods ---
+
+    def _logit_transform_gpu(self, scores: cp.ndarray, epsilon: float = 1e-6) -> cp.ndarray:
+        """
+        Applies a stabilized logit transformation to similarity scores.
+
+        This transformation stretches the score distribution from [0, 1] to [-inf, inf],
+        making it more symmetric and Gaussian-like, which is a key assumption for
+        methods like Mahalanobis distance.
+
+        Args:
+            scores: A cupy.ndarray of similarity scores, expected to be in the [0, 1] range.
+            epsilon: A small constant to prevent log(0) or division by zero.
+
+        Returns:
+            A cupy.ndarray with the logit-transformed scores.
+        """
+        # Clip scores to be slightly away from 0 and 1 to ensure numerical stability.
+        clipped_scores = cp.clip(scores, epsilon, 1 - epsilon)
+        return cp.log(clipped_scores / (1 - clipped_scores))
+
+    def _detect_mahalanobis_outliers_per_cluster(
+        self,
+        entities_with_profiles_df: cudf.DataFrame,
+        min_contamination: float = 0.01,
+        max_contamination: float = 0.2
+    ) -> cudf.Series:
+        """
+        Detects outliers within each cluster using a robust Mahalanobis distance.
+
+        For each cluster, it calculates a robust center and covariance matrix by
+        trimming the most extreme points. It then computes the Mahalanobis distance
+        for all points in the cluster from this robust center. Points with a distance
+        exceeding an adaptive threshold are flagged as outliers.
+
+        Args:
+            entities_with_profiles_df: DataFrame of entities with their similarity scores.
+            min_contamination: The minimum assumed proportion of outliers in a cluster.
+            max_contamination: The maximum assumed proportion of outliers in a cluster.
+
+        Returns:
+            A boolean cudf.Series, indexed like the input, where True marks an outlier.
+        """
+        outlier_mask = cudf.Series(
+            cp.zeros(len(entities_with_profiles_df), dtype=bool),
+            index=entities_with_profiles_df.index
+        )
+        
+        # Iterate over each cluster to perform localized outlier detection.
+        for cluster_id in entities_with_profiles_df['cluster'].unique().to_pandas():
+            cluster_mask = entities_with_profiles_df['cluster'] == cluster_id
+            cluster_data_df = entities_with_profiles_df[cluster_mask]
+            cluster_size = len(cluster_data_df)
+            
+            # We need a minimum number of points to reliably compute covariance.
+            if cluster_size < 5:
+                continue
+
+            # Adaptively set the contamination rate based on cluster size.
+            # Larger clusters are assumed to have a smaller proportion of outliers.
+            contamination_rate = min(
+                max_contamination, 
+                max(min_contamination, 1.0 / cp.sqrt(cluster_size))
             )
             
-            # Calculate similarity of each entity to its own cluster's profile
-            name_sim = calculate_similarity_gpu(
-                entities_with_profiles['normalized_text'],
-                entities_with_profiles['profile_canonical_name'],
+            # Prepare the feature matrix (name and address similarity) and transform it.
+            similarity_features_raw = cp.column_stack([
+                cluster_data_df['name_similarity'].values,
+                cluster_data_df['addr_similarity'].values
+            ])
+            logit_features = self._logit_transform_gpu(similarity_features_raw)
+            
+            # --- Robust Covariance Estimation (MCD-like approach) ---
+            # 1. Find a preliminary center using the median (robust to outliers).
+            initial_center = cp.median(logit_features, axis=0)
+            
+            # 2. Calculate Euclidean distances to this center to identify a core subset.
+            distances_from_center = cp.sqrt(cp.sum((logit_features - initial_center)**2, axis=1))
+            
+            # 3. Trim the data, keeping a high percentage of the points closest to the center.
+            # This ensures the covariance matrix is not skewed by outliers.
+            order = cp.argsort(distances_from_center)
+            # Ensure we keep at least 3 points to avoid a singular matrix.
+            num_points_to_keep = max(3, int(cluster_size * (1 - min(0.10, contamination_rate * 0.5))))
+            trimmed_indices = order[:num_points_to_keep]
+            logit_features_trimmed = logit_features[trimmed_indices]
+            
+            # 4. Calculate the robust center (mean) and covariance from this trimmed subset.
+            robust_center = cp.mean(logit_features_trimmed, axis=0)
+            # Add a small identity matrix (regularization) to guarantee invertibility.
+            robust_covariance = cp.cov(logit_features_trimmed.T) + cp.eye(2) * 1e-6
+            
+            # --- Mahalanobis Distance Calculation ---
+            try:
+                inv_covariance = cp.linalg.inv(robust_covariance)
+                centered_features = logit_features - robust_center
+                # This is the squared Mahalanobis distance calculation.
+                mahalanobis_distances = cp.sqrt(cp.sum((centered_features @ inv_covariance) * centered_features, axis=1))
+                
+                # Set a dynamic threshold based on the contamination rate.
+                distance_threshold = cp.percentile(mahalanobis_distances, (1 - contamination_rate) * 100)
+                
+                # Use a statistical floor for the threshold. For a chi-squared distribution
+                # with 2 degrees of freedom (our features), the 99th percentile is ~9.21.
+                # The distance (sqrt) is ~3.04. This prevents an overly lenient threshold.
+                final_threshold = max(distance_threshold, 3.05)
+                cluster_outlier_flags = mahalanobis_distances > final_threshold
+                
+                # Update the main outlier mask without transferring data to the CPU.
+                cluster_outlier_series = cudf.Series(cluster_outlier_flags, index=cluster_data_df.index)
+                outlier_mask.loc[cluster_outlier_series.index] = cluster_outlier_series
+
+            except cp.linalg.LinAlgError:
+                # This can happen if the covariance matrix is singular (e.g., all points are collinear).
+                # We simply skip outlier detection for this cluster.
+                continue
+                
+        return outlier_mask
+
+    def _detect_fdr_outliers_by_shuffling(
+        self,
+        entities_with_profiles_df: cudf.DataFrame,
+        fdr_level: float = 0.05,
+        n_shuffles: int = 10
+    ) -> cudf.Series:
+        """
+        Detects outliers using a non-parametric empirical null generated by
+        shuffling cluster profiles, followed by False Discovery Rate (FDR) control.
+
+        This method tests whether an entity's `current_match_score` is significantly
+        better than scores obtained by matching it against randomly chosen cluster
+        profiles. By shuffling many times, we create a strong "null distribution" of
+        scores that occur by chance. We then use the Benjamini-Hochberg procedure
+        to find a p-value threshold that controls the FDR at the specified level.
+
+        Args:
+            entities_with_profiles_df: DataFrame of entities with their scores.
+            fdr_level: The desired False Discovery Rate (e.g., 0.05 means we accept
+                    that up to 5% of flagged outliers may be false positives).
+            n_shuffles: The number of times to shuffle profiles to build the null distribution.
+
+        Returns:
+            A boolean cudf.Series, where True indicates a statistically insignificant match (an outlier).
+        """
+        num_entities = len(entities_with_profiles_df)
+        if num_entities == 0:
+            return cudf.Series(dtype=bool)
+
+        # Extract GPU arrays for efficient computation.
+        entity_text_arr = entities_with_profiles_df['normalized_text'].values
+        entity_addr_arr = entities_with_profiles_df['addr_normalized_key'].values
+        actual_match_scores = entities_with_profiles_df['current_match_score'].values
+        
+        profile_name_arr = entities_with_profiles_df['profile_canonical_name'].values
+        profile_addr_arr = entities_with_profiles_df['profile_canonical_addr_key'].values
+        
+        # --- Build Empirical Null Distribution ---
+        # We concatenate scores from multiple shuffles to create a more stable and
+        # robust null distribution than a single shuffle would provide.
+        null_score_accumulator = []
+        for _ in range(n_shuffles):
+            # Shuffle the profiles by creating a random permutation of indices.
+            shuffled_indices = cp.random.permutation(num_entities)
+            shuffled_profile_name_arr = profile_name_arr[shuffled_indices]
+            shuffled_profile_addr_arr = profile_addr_arr[shuffled_indices]
+
+            # Calculate similarity scores against these incorrect, random profiles.
+            shuffled_name_sim = calculate_similarity_gpu(
+                cudf.Series(entity_text_arr),
+                cudf.Series(shuffled_profile_name_arr),
                 self.vectorizer_config.similarity_tfidf
-            )
-            
-            addr_sim = calculate_similarity_gpu(
-                entities_with_profiles['addr_normalized_key'],
-                entities_with_profiles['profile_canonical_addr_key'],
+            ).fillna(0.0)
+
+            shuffled_addr_sim = calculate_similarity_gpu(
+                cudf.Series(entity_addr_arr),
+                cudf.Series(shuffled_profile_addr_arr),
                 self.vectorizer_config.similarity_tfidf
-            )
+            ).fillna(0.0)
             
-            # Apply tolerance to thresholds - be more forgiving
-            # Instead of strict thresholds, use a softer validation with tolerance
-            name_threshold_with_tolerance = max(
-                0.0, 
-                (self.config.name_fuzz_ratio / 100.0) - self.validation_tolerance
-            )
-            addr_threshold_with_tolerance = max(
-                0.0,
-                (self.config.address_fuzz_ratio / 100.0) - self.validation_tolerance
-            )
-            
-            # Calculate a composite match score for the current assignment
-            current_match_score = (name_sim * 0.6 + addr_sim * 0.4)
-            
-            # An entity is considered for reassignment only if:
-            # 1. Both similarities are below tolerant thresholds, OR
-            # 2. The composite score is very low (below 50% of expected)
-            is_potentially_invalid = (
-                ((name_sim < name_threshold_with_tolerance) & 
-                (addr_sim < addr_threshold_with_tolerance)) |
-                (current_match_score < 0.3)  # Very poor overall match
-            )
-            
-            # Additional state compatibility check if enforced
-            if self.config.enforce_state_boundaries:
-                state_compatible = self._check_state_compatibility(
-                    entities_with_profiles['addr_state'],
-                    entities_with_profiles['profile_canonical_state']
-                )
-                # Only mark as invalid if BOTH similarity is poor AND state is incompatible
-                is_potentially_invalid &= ~state_compatible
-            
-            # Store the current match score for later comparison
-            invalid_clustered = clustered_entities[is_potentially_invalid].copy()
-            if not invalid_clustered.empty:
-                # Store current match scores to compare against potential new assignments
-                invalid_clustered['current_match_score'] = current_match_score[is_potentially_invalid]
-                invalid_entities_list.append(invalid_clustered)
+            # These scores represent what we'd expect from random pairings.
+            null_scores_for_shuffle = shuffled_name_sim.values * 0.6 + shuffled_addr_sim.values * 0.4
+            null_score_accumulator.append(null_scores_for_shuffle)
+
+        # Combine all shuffles into one large array and sort it for fast searching.
+        null_scores_distribution = cp.concatenate(null_score_accumulator)
+        null_scores_distribution_sorted = cp.sort(null_scores_distribution)
+
+        # --- P-Value Calculation and FDR Control ---
+        # For each actual score, find its rank within the null distribution.
+        # A low rank means the score is unusually low, even compared to random matches.
+        rank_in_null = cp.searchsorted(null_scores_distribution_sorted, actual_match_scores, side='right')
         
-        # Combine noise and invalid entities into a single DataFrame
-        all_to_reassign = []
-        if not noise_entities.empty:
-            # Noise entities get a current_match_score of 0
-            noise_entities['current_match_score'] = 0.0
-            all_to_reassign.append(noise_entities)
-        if invalid_entities_list:
-            all_to_reassign.extend(invalid_entities_list)
+        # Calculate p-values using Laplace smoothing (+1) to avoid p=0 or p=1.
+        # p-value = "probability of observing a score this low or lower by chance".
+        p_values = (rank_in_null + 1) / (len(null_scores_distribution_sorted) + 1)
         
-        if not all_to_reassign:
-            return cudf.DataFrame()
+        # Apply Benjamini-Hochberg procedure to find which p-values are significant
+        # while controlling for the false discovery rate.
+        is_outlier = self._benjamini_hochberg_gpu(p_values, fdr_level)
         
-        return cudf.concat(all_to_reassign)
+        return cudf.Series(is_outlier, index=entities_with_profiles_df.index)
+
+    def _detect_low_margin_assignments_vectorized(
+        self,
+        entities_with_profiles_df: cudf.DataFrame,
+        all_profiles_df: cudf.DataFrame,
+        margin_threshold: float = 0.1,
+        max_sample_size: int = 1000
+    ) -> cudf.Series:
+        """
+        Identifies entities with a low assignment margin by comparing their current
+        match score to the best possible score from any *other* cluster profile.
+
+        The "margin" is `(current_score - best_alternative_score)`. A small or
+        negative margin indicates low confidence in the current assignment. To make
+        this computationally feasible, it operates on a random sample of the entities
+        that have below-median match scores.
+
+        Args:
+            entities_with_profiles_df: DataFrame of entities with their current scores.
+            all_profiles_df: DataFrame containing all available cluster profiles.
+            margin_threshold: If the margin is below this value, it's a "vote" for reassignment.
+            max_sample_size: The maximum number of entities to check to keep memory usage down.
+
+        Returns:
+            A boolean cudf.Series, where True indicates a low-margin assignment.
+        """
+        # Initialize a mask of all Falses; we will set specific indices to True.
+        low_margin_mask = cudf.Series(cp.zeros(len(entities_with_profiles_df), dtype=bool), index=entities_with_profiles_df.index)
+        
+        # --- Candidate Selection for Efficiency ---
+        # Pre-filter to entities with below-median scores. High-scoring entities are
+        # unlikely to have a low margin, so this is a safe and effective optimization.
+        median_score = entities_with_profiles_df['current_match_score'].median()
+        low_score_entity_subset_df = entities_with_profiles_df[
+            entities_with_profiles_df['current_match_score'] <= median_score
+        ].reset_index().rename(columns={'index': 'original_index'})
+        
+        if low_score_entity_subset_df.empty:
+            return low_margin_mask
+            
+        # If there are too many candidates, take a random sample to avoid memory explosion.
+        if len(low_score_entity_subset_df) > max_sample_size:
+            low_score_entity_subset_df = low_score_entity_subset_df.sample(n=max_sample_size, random_state=42)
+
+        # --- Vectorized Cross-Comparison ---
+        # Prepare for a cross-join by adding a dummy key to both DataFrames.
+        # This will create all possible pairs of (candidate_entity, alternative_profile).
+        low_score_entity_subset_df['dummy_key'] = 1
+        profiles_alt_df = all_profiles_df.copy()
+        profiles_alt_df['dummy_key'] = 1
+        
+        entity_to_all_profiles_cross_df = low_score_entity_subset_df.merge(
+            profiles_alt_df, on='dummy_key', suffixes=('', '_alt')
+        ).drop(columns=['dummy_key'])
+        
+        # We only care about alternative profiles, so remove pairs where the entity's
+        # own cluster profile is being compared against itself.
+        entity_to_all_profiles_cross_df = entity_to_all_profiles_cross_df[
+            entity_to_all_profiles_cross_df['cluster'] != entity_to_all_profiles_cross_df['cluster_alt']
+        ]
+        
+        # Calculate match scores for every entity against every *other* profile.
+        alt_name_sim = calculate_similarity_gpu(
+            entity_to_all_profiles_cross_df['normalized_text'], 
+            entity_to_all_profiles_cross_df['profile_canonical_name_alt'], 
+            self.vectorizer_config.similarity_tfidf
+        ).fillna(0.0)
+        
+        alt_addr_sim = calculate_similarity_gpu(
+            entity_to_all_profiles_cross_df['addr_normalized_key'], 
+            entity_to_all_profiles_cross_df['profile_canonical_addr_key_alt'], 
+            self.vectorizer_config.similarity_tfidf
+        ).fillna(0.0)
+        
+        entity_to_all_profiles_cross_df['alt_score'] = (alt_name_sim * 0.6 + alt_addr_sim * 0.4)
+        
+        # --- Margin Calculation ---
+        # For each candidate entity, find the single best score among all alternatives.
+        best_alternative_scores_s = entity_to_all_profiles_cross_df.groupby('original_index')['alt_score'].max()
+        
+        # Merge this best alternative score back to our candidate subset.
+        candidates_with_alt_scores_df = low_score_entity_subset_df.merge(
+            best_alternative_scores_s.reset_index(), on='original_index', how='left'
+        ).fillna({'alt_score': 0.0}) # Fill missing alt scores with 0.
+        
+        # The margin is the difference between how good the current assignment is
+        # and how good the best other option is.
+        candidates_with_alt_scores_df['margin'] = (
+            candidates_with_alt_scores_df['current_match_score'] - candidates_with_alt_scores_df['alt_score']
+        )
+        
+        # Identify the original indices of entities whose margin is below the threshold.
+        low_margin_original_indices = candidates_with_alt_scores_df[
+            candidates_with_alt_scores_df['margin'] < margin_threshold
+        ]['original_index']
+        
+        # Update the final mask at these specific locations.
+        if len(low_margin_original_indices) > 0:
+            low_margin_mask.loc[low_margin_original_indices] = True
+                
+        return low_margin_mask
+
+    # --- Low-Level GPU Helpers ---
+
+    def _benjamini_hochberg_gpu(
+        self,
+        p_values: cp.ndarray,
+        alpha: float = 0.05
+    ) -> cp.ndarray:
+        """
+        Performs the Benjamini-Hochberg FDR correction procedure entirely on the GPU.
+
+        Args:
+            p_values: A cupy.ndarray of p-values to be corrected.
+            alpha: The desired False Discovery Rate level.
+
+        Returns:
+            A boolean cupy.ndarray of the same size as p_values, where True
+            indicates that the null hypothesis can be rejected (i.e., it is a
+            significant result/outlier).
+        """
+        num_tests = len(p_values)
+        if num_tests == 0:
+            return cp.array([], dtype=bool)
+        
+        # 1. Sort the p-values in ascending order while keeping track of their original indices.
+        sorted_indices = cp.argsort(p_values)
+        sorted_p_values = p_values[sorted_indices]
+        
+        # 2. Find the largest k such that p-value_k <= (k / num_tests) * alpha.
+        # First, create the BH critical value line to compare against.
+        bh_thresholds = (cp.arange(1, num_tests + 1) / num_tests) * alpha
+        
+        # Find all p-values that fall below their corresponding threshold.
+        is_below_threshold = sorted_p_values <= bh_thresholds
+        
+        # 3. If any such p-values exist, find the one with the highest rank (k).
+        if cp.any(is_below_threshold):
+            # `cp.where` returns indices where the condition is True. We take the last one.
+            max_index_below_threshold = cp.where(is_below_threshold)[0][-1]
+            
+            # The critical value is the p-value at this highest rank.
+            critical_value = sorted_p_values[max_index_below_threshold]
+            
+            # 4. Reject all null hypotheses for which the original p-value is less than or equal to this critical value.
+            rejections = p_values <= critical_value
+        else:
+            # If no p-values were below the line, we reject none.
+            rejections = cp.zeros(num_tests, dtype=bool)
+            
+        return rejections
 
     def _find_best_assignments(
         self,
         entities_to_reassign: cudf.DataFrame,
         profiles: cudf.DataFrame,
-        state_to_clusters: Dict[str, cupy.ndarray]
+        state_to_clusters: Dict[str, cp.ndarray]
     ) -> cudf.DataFrame:
         """
         Finds the best cluster for each entity using a state-first batching strategy.
@@ -523,7 +908,7 @@ class ClusterValidator:
         self,
         state: Optional[str],
         profiles: cudf.DataFrame,
-        state_to_clusters: Dict[str, cupy.ndarray]
+        state_to_clusters: Dict[str, cp.ndarray]
     ) -> cudf.DataFrame:
         """
         Gets candidate clusters that are compatible with the given state.
@@ -554,7 +939,7 @@ class ClusterValidator:
 
         if candidate_cluster_ids:
             # Combine all candidate cluster IDs and get unique values
-            all_candidates = cupy.unique(cupy.concatenate(candidate_cluster_ids))
+            all_candidates = cp.unique(cp.concatenate(candidate_cluster_ids))
 
             # Filter profiles to only these clusters
             # Note: .isin is highly optimized for this operation.
@@ -587,7 +972,7 @@ class ClusterValidator:
             # Test sync illegal memory issue
             if logger.isEnabledFor(logging.DEBUG):
                 try:
-                    cupy.cuda.Stream.null.synchronize()
+                    cp.cuda.Stream.null.synchronize()
                 except:
                     logger.debug(f"*** CUDA sync failed inside _find_matches_for_state_group single chunk branch ***")
             # Can process all at once if below memory threshold
@@ -603,7 +988,7 @@ class ClusterValidator:
             for chunk_start in range(0, n_entities, chunk_size):
                 if logger.isEnabledFor(logging.DEBUG):
                     try:
-                        cupy.cuda.Stream.null.synchronize()
+                        cp.cuda.Stream.null.synchronize()
                     except:
                         logger.debug(f"*** CUDA sync failed inside _find_matches_for_state_group multi chunk branch ***")
                         logger.debug(f"*** Failed on chunk starting at {chunk_start} ***")
@@ -684,7 +1069,7 @@ class ClusterValidator:
         # Apply soft penalties for being below threshold (but don't eliminate)
         # If below threshold, reduce score but don't zero it out
         name_penalty = cudf.Series(
-            cupy.where(
+            cp.where(
                 pairs['name_sim'].values < self.name_threshold,
                 self.soft_threshold_penalty,  # Apply penalty
                 0.0  # No penalty if above threshold
@@ -693,7 +1078,7 @@ class ClusterValidator:
         )
         
         addr_penalty = cudf.Series(
-            cupy.where(
+            cp.where(
                 pairs['addr_sim'].values < self.addr_threshold,
                 self.soft_threshold_penalty,  # Apply penalty
                 0.0  # No penalty if above threshold
@@ -707,7 +1092,7 @@ class ClusterValidator:
         
         # State incompatibility is a stronger penalty but not elimination
         state_penalty = cudf.Series(
-            cupy.where(
+            cp.where(
                 pairs['state_compatible'].values,
                 0.0,  # No penalty if compatible
                 0.3   # Significant penalty if incompatible
@@ -720,7 +1105,7 @@ class ClusterValidator:
         
         # Normalize cluster size with log scale
         size_values = pairs['size'].values
-        size_factor = (cupy.log1p(size_values) / cupy.log1p(10.0)).clip(0.0, 1.0)
+        size_factor = (cp.log1p(size_values) / cp.log1p(10.0)).clip(0.0, 1.0)
         
         # Compute raw match score
         raw_match_score = (
