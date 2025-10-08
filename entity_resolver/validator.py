@@ -138,6 +138,7 @@ class ClusterValidator:
         # Clear the similarity cache after validation to free memory.
         self._similarity_cache.clear()
 
+        logger.info("Reassignment complete. Returning validated DataFrame.")
         return final_gdf
 
     def _build_cluster_profiles(self, clustered_gdf: cudf.DataFrame) -> cudf.DataFrame:
@@ -555,9 +556,16 @@ class ClusterValidator:
             logger.debug(f"Running shuffle {i+1}/{n_shuffles}...")
             # Shuffle the profiles by creating a random permutation of indices.
             shuffled_indices = cp.random.permutation(num_entities)
+            
             # Use .take() to reorder the cuDF Series according to the shuffled indices.
             shuffled_profile_name_series = profile_name_series.take(shuffled_indices)
             shuffled_profile_addr_series = profile_addr_series.take(shuffled_indices)
+
+            # The .take() operation resets the index. We must reassign the original
+            # index to the new shuffled series to ensure they align for the row-wise
+            # similarity calculation. This resolves the ValueError.
+            shuffled_profile_name_series.index = entity_text_series.index
+            shuffled_profile_addr_series.index = entity_addr_series.index
 
             # Calculate similarity scores against these incorrect, random profiles.
             shuffled_name_sim = calculate_similarity_gpu(
