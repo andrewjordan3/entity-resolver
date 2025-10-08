@@ -253,19 +253,25 @@ class ClusterValidator:
             A DataFrame containing all entities identified for reassignment, with
             their original schema plus a 'current_match_score' column.
         """
+        logger.info("Starting entity reassignment identification process.")
+        logger.debug(f"Input entity_data_gdf shape: {entity_data_gdf.shape}, cluster_profiles_df shape: {cluster_profiles_df.shape}")
+
         # --- 1. Initial Data Partitioning ---
         # Noise entities are always candidates for reassignment. We separate them now
         # and will concatenate them back at the end.
         noise_entities_df = entity_data_gdf[entity_data_gdf['cluster'] == -1].copy()
         clustered_entities_df = entity_data_gdf[entity_data_gdf['cluster'] != -1].copy()
+        logger.debug(f"Partitioned data into {len(noise_entities_df)} noise entities and {len(clustered_entities_df)} clustered entities.")
 
         # If there are no clustered entities to analyze, we only need to handle the noise.
         if clustered_entities_df.empty:
+            logger.info("No clustered entities to process. Returning only noise entities.")
             if not noise_entities_df.empty:
                 noise_entities_df['current_match_score'] = 0.0
             return noise_entities_df
 
         # --- 2. Calculate Current Match Scores ---
+        logger.debug("Calculating current match scores for clustered entities.")
         # Merge entities with their assigned cluster's profile to compute how well they
         # currently fit. This score is the baseline for all subsequent statistical tests.
         entities_with_profiles_df = clustered_entities_df.merge(
@@ -290,26 +296,34 @@ class ClusterValidator:
         entities_with_profiles_df['name_similarity'] = name_similarity_scores
         entities_with_profiles_df['addr_similarity'] = addr_similarity_scores
         entities_with_profiles_df['current_match_score'] = current_match_scores
+        logger.debug("Finished calculating match scores.")
 
         # --- 3. Statistical Anomaly Detection (Voting) ---
         # Each method provides a "vote" indicating if an entity is a poor fit.
         
         # Vote 1: Mahalanobis Distance - Is this entity an outlier within its own cluster's distribution?
+        logger.info("Initiating Vote 1: Mahalanobis outlier detection.")
         mahalanobis_outlier_vote = self._detect_mahalanobis_outliers_per_cluster(
             entities_with_profiles_df
         )
+        logger.debug(f"Mahalanobis vote identified {mahalanobis_outlier_vote.sum()} potential outliers.")
 
         # Vote 2: FDR Control - Is this entity's match score statistically indistinguishable from a random match?
+        logger.info("Initiating Vote 2: FDR outlier detection via shuffling.")
         fdr_outlier_vote = self._detect_fdr_outliers_by_shuffling(
             entities_with_profiles_df
         )
+        logger.debug(f"FDR vote identified {fdr_outlier_vote.sum()} potential outliers.")
 
         # Vote 3: Margin Test - Is there another cluster that is almost as good a fit (or better)?
+        logger.info("Initiating Vote 3: Low-margin assignment detection.")
         low_margin_vote = self._detect_low_margin_assignments_vectorized(
             entities_with_profiles_df, cluster_profiles_df
         )
+        logger.debug(f"Low-margin vote identified {low_margin_vote.sum()} potential outliers.")
 
         # --- 4. Tally Votes and Apply Overrides ---
+        logger.info("Tallying votes and applying overrides.")
         # Tally the votes from the three statistical methods.
         outlier_vote_counts = (
             mahalanobis_outlier_vote.astype('int32') +
@@ -318,14 +332,17 @@ class ClusterValidator:
         )
         # An entity needs at least two votes to be flagged for reassignment.
         reassignment_mask = (outlier_vote_counts >= 2)
+        logger.debug(f"Found {reassignment_mask.sum()} entities with 2 or more votes.")
 
         # Override 1: Extremely poor matches are always reassigned, regardless of votes.
         # This acts as a safety net for clear mismatches.
         very_poor_match_mask = (current_match_scores < 0.3)
         reassignment_mask |= very_poor_match_mask
+        logger.debug(f"Total entities flagged after 'very_poor_match' override: {reassignment_mask.sum()}")
         
         # Override 2: Enforce hard business rule (e.g., entity state must match profile state).
         if self.config.enforce_state_boundaries:
+            logger.debug("Applying state boundary enforcement override.")
             state_is_compatible = self._check_state_compatibility(
                 entities_with_profiles_df['addr_state'],
                 entities_with_profiles_df['profile_canonical_state']
@@ -333,8 +350,10 @@ class ClusterValidator:
             # If compatibility is False, it's a mismatch. `~state_is_compatible` flags it.
             # We fill NaNs with True, assuming compatibility if data is missing.
             reassignment_mask |= ~state_is_compatible.fillna(True)
+            logger.debug(f"Total entities flagged after state compatibility override: {reassignment_mask.sum()}")
 
         # --- 5. Final Assembly ---
+        logger.info("Assembling final list of entities for reassignment.")
         # Select the entities flagged for reassignment using the final mask.
         mismatched_entities_df = entities_with_profiles_df[reassignment_mask]
 
@@ -351,9 +370,12 @@ class ClusterValidator:
             all_entities_to_reassign_list.append(reassignment_candidates_df)
 
         if not all_entities_to_reassign_list:
-            return cudf.DataFrame() # Return empty DF if no one needs reassignment.
+            logger.info("Reassignment process complete. No entities were identified for reassignment.")
+            return cudf.DataFrame()
 
-        return cudf.concat(all_entities_to_reassign_list)
+        final_reassignment_df = cudf.concat(all_entities_to_reassign_list)
+        logger.info(f"Reassignment process complete. Identified {len(final_reassignment_df)} total entities for reassignment.")
+        return final_reassignment_df
 
     # --- Statistical and Validation Helper Methods ---
 
@@ -398,19 +420,23 @@ class ClusterValidator:
         Returns:
             A boolean cudf.Series, indexed like the input, where True marks an outlier.
         """
+        logger.info("Starting Mahalanobis outlier detection for all clusters.")
         outlier_mask = cudf.Series(
             cp.zeros(len(entities_with_profiles_df), dtype=bool),
             index=entities_with_profiles_df.index
         )
         
+        unique_clusters = entities_with_profiles_df['cluster'].unique().to_pandas()
+        logger.debug(f"Processing {len(unique_clusters)} unique clusters.")
         # Iterate over each cluster to perform localized outlier detection.
-        for cluster_id in entities_with_profiles_df['cluster'].unique().to_pandas():
+        for cluster_id in unique_clusters:
             cluster_mask = entities_with_profiles_df['cluster'] == cluster_id
             cluster_data_df = entities_with_profiles_df[cluster_mask]
             cluster_size = len(cluster_data_df)
             
             # We need a minimum number of points to reliably compute covariance.
             if cluster_size < 5:
+                logger.debug(f"Skipping cluster {cluster_id}: size ({cluster_size}) is less than 5.")
                 continue
 
             # Adaptively set the contamination rate based on cluster size.
@@ -419,6 +445,7 @@ class ClusterValidator:
                 max_contamination, 
                 max(min_contamination, 1.0 / cp.sqrt(cluster_size))
             )
+            logger.debug(f"Processing cluster {cluster_id} (size={cluster_size}), contamination_rate={contamination_rate:.4f}")
             
             # Prepare the feature matrix (name and address similarity) and transform it.
             similarity_features_raw = cp.column_stack([
@@ -462,16 +489,20 @@ class ClusterValidator:
                 # The distance (sqrt) is ~3.04. This prevents an overly lenient threshold.
                 final_threshold = max(distance_threshold, 3.05)
                 cluster_outlier_flags = mahalanobis_distances > final_threshold
+                logger.debug(f"Cluster {cluster_id}: found {cluster_outlier_flags.sum()} outliers.")
                 
-                # Update the main outlier mask without transferring data to the CPU.
-                cluster_outlier_series = cudf.Series(cluster_outlier_flags, index=cluster_data_df.index)
-                outlier_mask.loc[cluster_outlier_series.index] = cluster_outlier_series
+                # Update the main outlier mask using the boolean mask for the current cluster.
+                # This is a more robust way to assign the results back, as it doesn't
+                # rely on index lookups (.loc) which can be problematic with non-unique indices.
+                outlier_mask[cluster_mask] = cluster_outlier_flags
 
             except cp.linalg.LinAlgError:
                 # This can happen if the covariance matrix is singular (e.g., all points are collinear).
                 # We simply skip outlier detection for this cluster.
+                logger.warning(f"Skipping Mahalanobis for cluster {cluster_id} due to LinAlgError (likely singular matrix).")
                 continue
-                
+        
+        logger.info(f"Mahalanobis detection complete. Total outliers found: {outlier_mask.sum()}.")
         return outlier_mask
 
     def _detect_fdr_outliers_by_shuffling(
@@ -499,10 +530,13 @@ class ClusterValidator:
         Returns:
             A boolean cudf.Series, where True indicates a statistically insignificant match (an outlier).
         """
+        logger.info("Starting FDR outlier detection via shuffling.")
         num_entities = len(entities_with_profiles_df)
         if num_entities == 0:
+            logger.warning("FDR detection called with an empty DataFrame.")
             return cudf.Series(dtype=bool)
 
+        logger.debug(f"Building null distribution with {n_shuffles} shuffles for {num_entities} entities.")
         # Extract GPU arrays for efficient computation.
         entity_text_arr = entities_with_profiles_df['normalized_text'].values
         entity_addr_arr = entities_with_profiles_df['addr_normalized_key'].values
@@ -515,7 +549,8 @@ class ClusterValidator:
         # We concatenate scores from multiple shuffles to create a more stable and
         # robust null distribution than a single shuffle would provide.
         null_score_accumulator = []
-        for _ in range(n_shuffles):
+        for i in range(n_shuffles):
+            logger.debug(f"Running shuffle {i+1}/{n_shuffles}...")
             # Shuffle the profiles by creating a random permutation of indices.
             shuffled_indices = cp.random.permutation(num_entities)
             shuffled_profile_name_arr = profile_name_arr[shuffled_indices]
@@ -541,8 +576,10 @@ class ClusterValidator:
         # Combine all shuffles into one large array and sort it for fast searching.
         null_scores_distribution = cp.concatenate(null_score_accumulator)
         null_scores_distribution_sorted = cp.sort(null_scores_distribution)
+        logger.debug(f"Null distribution created with {len(null_scores_distribution)} total scores.")
 
         # --- P-Value Calculation and FDR Control ---
+        logger.debug(f"Calculating p-values and applying Benjamini-Hochberg correction at alpha={fdr_level}.")
         # For each actual score, find its rank within the null distribution.
         # A low rank means the score is unusually low, even compared to random matches.
         rank_in_null = cp.searchsorted(null_scores_distribution_sorted, actual_match_scores, side='right')
@@ -555,6 +592,7 @@ class ClusterValidator:
         # while controlling for the false discovery rate.
         is_outlier = self._benjamini_hochberg_gpu(p_values, fdr_level)
         
+        logger.info(f"FDR detection complete. Total outliers found: {is_outlier.sum()}.")
         return cudf.Series(is_outlier, index=entities_with_profiles_df.index)
 
     def _detect_low_margin_assignments_vectorized(
@@ -582,6 +620,7 @@ class ClusterValidator:
         Returns:
             A boolean cudf.Series, where True indicates a low-margin assignment.
         """
+        logger.info("Starting low-margin assignment detection.")
         # Initialize a mask of all Falses; we will set specific indices to True.
         low_margin_mask = cudf.Series(cp.zeros(len(entities_with_profiles_df), dtype=bool), index=entities_with_profiles_df.index)
         
@@ -594,13 +633,18 @@ class ClusterValidator:
         ].reset_index().rename(columns={'index': 'original_index'})
         
         if low_score_entity_subset_df.empty:
+            logger.info("No entities with below-median scores; skipping margin analysis.")
             return low_margin_mask
+        
+        logger.debug(f"Selected {len(low_score_entity_subset_df)} candidates for margin analysis (median score <= {median_score:.4f}).")
             
         # If there are too many candidates, take a random sample to avoid memory explosion.
         if len(low_score_entity_subset_df) > max_sample_size:
+            logger.debug(f"Sampling down to {max_sample_size} candidates from {len(low_score_entity_subset_df)}.")
             low_score_entity_subset_df = low_score_entity_subset_df.sample(n=max_sample_size, random_state=42)
 
         # --- Vectorized Cross-Comparison ---
+        logger.debug("Performing cross-join to compare candidates against all other profiles.")
         # Prepare for a cross-join by adding a dummy key to both DataFrames.
         # This will create all possible pairs of (candidate_entity, alternative_profile).
         low_score_entity_subset_df['dummy_key'] = 1
@@ -616,6 +660,7 @@ class ClusterValidator:
         entity_to_all_profiles_cross_df = entity_to_all_profiles_cross_df[
             entity_to_all_profiles_cross_df['cluster'] != entity_to_all_profiles_cross_df['cluster_alt']
         ]
+        logger.debug(f"Cross-join created {len(entity_to_all_profiles_cross_df)} pairs for comparison.")
         
         # Calculate match scores for every entity against every *other* profile.
         alt_name_sim = calculate_similarity_gpu(
@@ -633,6 +678,7 @@ class ClusterValidator:
         entity_to_all_profiles_cross_df['alt_score'] = (alt_name_sim * 0.6 + alt_addr_sim * 0.4)
         
         # --- Margin Calculation ---
+        logger.debug("Calculating best alternative scores and margins.")
         # For each candidate entity, find the single best score among all alternatives.
         best_alternative_scores_s = entity_to_all_profiles_cross_df.groupby('original_index')['alt_score'].max()
         
@@ -655,7 +701,8 @@ class ClusterValidator:
         # Update the final mask at these specific locations.
         if len(low_margin_original_indices) > 0:
             low_margin_mask.loc[low_margin_original_indices] = True
-                
+        
+        logger.info(f"Low-margin detection complete. Found {low_margin_mask.sum()} entities with low margin.")
         return low_margin_mask
 
     # --- Low-Level GPU Helpers ---
