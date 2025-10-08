@@ -8,6 +8,7 @@ All operations are optimized for GPU execution using cuDF's native operations.
 """
 
 import cudf
+import cupy
 import logging
 from typing import Dict, Optional, Set
 
@@ -125,6 +126,7 @@ class ClusterMerger:
         logger.info("Starting GPU-accelerated cluster similarity merging process...")
         
         # Isolate only the records that were successfully clustered, excluding noise.
+        entity_dataframe['cluster'] = entity_dataframe['cluster'].fillna(-1).astype('int32')
         clustered_entities = entity_dataframe[entity_dataframe['cluster'] != -1].copy()
         
         if clustered_entities.empty:
@@ -215,21 +217,35 @@ class ClusterMerger:
         
         # This helper function iterates through each component and selects a "winner"
         # (e.g., the largest cluster), creating a dictionary mapping losers to the winner.
-        cluster_merge_mapping = self._create_merge_mapping_gpu(profiles_with_components)
+        merge_map_df = self._create_merge_mapping_gpu(profiles_with_components)
         
-        if not cluster_merge_mapping:
+        if merge_map_df.empty:
             logger.info("No clusters required merging after component analysis.")
             return entity_dataframe
-            
-        logger.info(f"Applying {len(cluster_merge_mapping)} cluster merges...")
-        
-        # Flatten the mapping to handle transitive merges (A->B, B->C becomes A->C, B->C).
-        flat_mapping = self._flatten_mapping(cluster_merge_mapping)
-        
-        # Apply the final mapping to the 'cluster' column in one GPU-accelerated operation.
-        entity_dataframe['cluster'] = entity_dataframe['cluster'].replace(flat_mapping)
-        
-        logger.info("Cluster similarity merging completed successfully.")
+
+        logger.info(f"Applying {len(merge_map_df)} cluster merges using GPU-native merge...")
+
+        # Rename columns for a clean merge. 'cluster' is the key to join on.
+        merge_map_df = merge_map_df.rename(columns={
+            'loser_cluster_id': 'cluster',
+            'winner_cluster_id': 'new_cluster_id'
+        })
+
+        # Perform a left merge. For rows in entity_dataframe that are losers,
+        # 'new_cluster_id' will be populated. For all others, it will be null.
+        entity_dataframe = entity_dataframe.merge(merge_map_df, on='cluster', how='left')
+
+        # Coalesce the columns. If 'new_cluster_id' is null (i.e., the cluster
+        # was not a loser), we keep the original 'cluster' value using fillna.
+        entity_dataframe['cluster'] = (
+            entity_dataframe['new_cluster_id']
+            .fillna(entity_dataframe['cluster'])
+            .astype('int32')
+        )
+
+        # Drop the temporary 'new_cluster_id' column.
+        entity_dataframe = entity_dataframe.drop(columns=['new_cluster_id'])
+
         return entity_dataframe
     
     def _build_cluster_profiles_gpu(self, clustered_entities: cudf.DataFrame) -> Optional[cudf.DataFrame]:
@@ -273,7 +289,7 @@ class ClusterMerger:
             self._create_profile_for_group
         )
 
-        # Drop the MultiIndex for a clean dataframe
+        # Drop the index for a clean dataframe
         canonical_profiles = canonical_profiles.reset_index(drop=True)
 
         # Finally, merge the pre-calculated cluster sizes with the canonical representations.
@@ -288,509 +304,421 @@ class ClusterMerger:
 
         return final_profiles
     
-    def _create_merge_mapping_gpu(self, profiles_with_components: cudf.DataFrame) -> Dict:
+    def _create_merge_mapping_gpu(self, profiles_with_components: cudf.DataFrame) -> cudf.DataFrame:
         """
-        Create cluster merge mapping using GPU-native operations.
+        Creates a flat cluster merge-mapping DataFrame using GPU-native operations.
         
         For each connected component in the similarity graph, this method:
-        1. Identifies the winner cluster (largest by entity count)
-        2. Maps all other clusters in the component to the winner
+        1. Identifies the winner cluster (largest by entity count) using a
+        performant sort and drop_duplicates operation.
+        2. Creates a DataFrame mapping all other clusters ('losers') in that
+        component directly to the winner.
         
+        The mapping produced is inherently flat, meaning every loser maps directly
+        to its final destination.
+
         Args:
-            profiles_with_components: Cluster profiles with component assignments
-            
+            profiles_with_components: A cuDF DataFrame of cluster profiles that
+                includes their assigned 'merge_component_id'.
+
         Returns:
-            Dict: Mapping from source cluster IDs to target (winner) cluster IDs
+            A cuDF DataFrame with two columns: ['loser_cluster_id', 'winner_cluster_id'],
+            ready to be used in a merge operation.
         """
-        # Filter to only clusters that are part of a component
+        # Filter to only clusters that are part of a multi-cluster component.
         clusters_in_components = profiles_with_components[
             profiles_with_components['merge_component_id'].notna()
         ]
         
-        if len(clusters_in_components) == 0:
-            return {}
+        if clusters_in_components.empty:
+            return cudf.DataFrame({'loser_cluster_id': [], 'winner_cluster_id': []})
         
-        # Sort by component and size (descending) to identify winners
+        # Sort by component ID, then by cluster size in descending order.
+        # This places the largest cluster (the winner) at the top of each group.
         sorted_clusters = clusters_in_components.sort_values(
             ['merge_component_id', 'cluster_entity_count'], 
             ascending=[True, False]
         )
         
-        # The first cluster in each component is the winner (largest)
+        # Use drop_duplicates to efficiently select the winner for each component.
         component_winners = sorted_clusters.drop_duplicates(
             subset=['merge_component_id'], 
             keep='first'
         )[['merge_component_id', 'cluster_id']].copy()
-        component_winners.columns = ['merge_component_id', 'winner_cluster_id']
+        component_winners = component_winners.rename(columns={'cluster_id': 'winner_cluster_id'})
         
-        # Join back to get losers (non-winners) and their target winners
+        # Join the winner ID back to all clusters in each component.
         clusters_with_winners = sorted_clusters.merge(
             component_winners, 
             on='merge_component_id',
             how='left'
         )
         
-        # Filter to only losers (clusters that need to be remapped)
+        # A 'loser' is any cluster whose ID does not match the winner ID.
         loser_clusters = clusters_with_winners[
             clusters_with_winners['cluster_id'] != clusters_with_winners['winner_cluster_id']
         ]
         
-        # Create the merge mapping dictionary
-        # Convert to pandas only for the final dictionary creation
-        merge_mapping = loser_clusters[['cluster_id', 'winner_cluster_id']].to_pandas()
-        merge_mapping_dict = dict(zip(
-            merge_mapping['cluster_id'], 
-            merge_mapping['winner_cluster_id']
-        ))
+        if loser_clusters.empty:
+            return cudf.DataFrame({'loser_cluster_id': [], 'winner_cluster_id': []})
+            
+        # Create and return the final mapping DataFrame.
+        merge_map_df = loser_clusters[['cluster_id', 'winner_cluster_id']].copy()
+        merge_map_df.columns = ['loser_cluster_id', 'winner_cluster_id']
         
-        # Flatten transitive mappings
-        merge_mapping_dict = self._flatten_mapping(merge_mapping_dict)
-        
-        return merge_mapping_dict
+        return merge_map_df
     
     def _consolidate_identical_entities(self, entity_dataframe: cudf.DataFrame) -> cudf.DataFrame:
         """
-        Consolidate entities with identical normalized names and addresses into 
-        the same cluster using GPU-optimized operations.
-        
-        This cleanup step ensures consistency by detecting and fixing cases where
-        identical entities ended up in different clusters due to edge cases in
-        the clustering algorithm.
-        
+        Consolidate entities with identical names and addresses using an
+        end-to-end GPU-optimized pipeline.
+
+        This method identifies cases where identical entities (based on a composite
+        key of their normalized name and address) have been assigned to different
+        clusters. It then merges these inconsistent assignments into a single,
+        deterministically chosen "winner" cluster. The entire process, from key
+        creation to final application, is designed to run on the GPU.
+
         Args:
-            entity_dataframe: DataFrame with entities and their cluster assignments
-            
+            entity_dataframe: The main DataFrame with entities and their current
+                              cluster assignments.
+
         Returns:
-            cudf.DataFrame: DataFrame with consolidated cluster assignments
+            A new cuDF DataFrame with the 'cluster' column updated to reflect
+            the consolidated assignments.
         """
-        logger.info("Starting entity consolidation for identical name-address pairs...")
+        logger.info("Starting GPU-accelerated entity consolidation...")
+
+        # =============================================================================
+        # Step 1: Data Preparation and Pre-computation
+        # =============================================================================
+        # Ensure the 'cluster' column is a consistent integer type and has no NaNs.
+        entity_dataframe['cluster'] = entity_dataframe['cluster'].fillna(-1).astype('int32')
         
-        # Filter to clustered entities only
+        # We only need to work with entities that have already been assigned a cluster.
         clustered_entities = entity_dataframe[entity_dataframe['cluster'] != -1].copy()
         
-        if len(clustered_entities) == 0:
+        if clustered_entities.empty:
+            logger.info("No clustered entities found for consolidation.")
             return entity_dataframe
-        
-        # Create composite entity key for exact matching
-        # Using fillna directly on GPU to handle missing addresses
+
+        # Create a single, unique key for each entity based on its name and address.
+        # This key will be used to find identical entities.
         clustered_entities['composite_entity_key'] = (
             clustered_entities['normalized_text'] + '|||' + 
             clustered_entities['addr_normalized_key'].fillna('')
         )
-        
-        # Group by entity key and find keys with multiple clusters
+
+        # =============================================================================
+        # Step 2: Identify Inconsistent Entity Groups
+        # =============================================================================
+        # Group by the composite key to find all clusters associated with each unique entity.
         entity_cluster_groups = clustered_entities.groupby('composite_entity_key').agg(
-            unique_clusters=('cluster', 'unique'),
-            cluster_count=('cluster', 'nunique')
+            unique_clusters=('cluster', 'unique'), # Get the list of unique cluster IDs
+            cluster_count=('cluster', 'nunique')   # Get the count of unique cluster IDs
         ).reset_index()
-        
-        # Filter to only entity keys that appear in multiple clusters
+
+        # An entity is "inconsistent" if its identical representations appear in more than one cluster.
         inconsistent_entities = entity_cluster_groups[entity_cluster_groups['cluster_count'] > 1]
         
-        if len(inconsistent_entities) == 0:
-            logger.info("No identical entities found across different clusters.")
+        if inconsistent_entities.empty:
+            logger.info("No identical entities found across different clusters. Consolidation not needed.")
             return entity_dataframe
-        
+
         logger.warning(f"Found {len(inconsistent_entities)} identical entities in multiple clusters. Consolidating...")
+
+        # =============================================================================
+        # Step 3: Generate the Consolidation Mapping
+        # =============================================================================
+        # This is the core logic step. We pass the full entity set and the identified
+        # inconsistent groups to the mapping creation function. It will determine
+        # the final source -> target mappings (e.g., cluster 101 -> cluster 50).
+        consolidation_map_df = self._create_consolidation_mapping(
+            entity_dataframe, inconsistent_entities
+        )
+
+        # =============================================================================
+        # Step 4: Apply the Consolidation Map to the DataFrame
+        # =============================================================================
+        if consolidation_map_df.empty:
+            logger.info("No cluster consolidations were necessary after analysis.")
+            return entity_dataframe
+            
+        logger.info(f"Applying {len(consolidation_map_df)} cluster consolidations using GPU-native merge...")
         
-        # Try the GPU-optimized batch method first
-        try:
-            consolidation_mapping = self._create_consolidation_mapping_gpu_optimized(
-                entity_dataframe,
-                inconsistent_entities
-            )
-        except Exception as e:
-            logger.debug(f"Batch consolidation failed, using fallback method: {e}")
-            # Fallback to iterative method if batch method fails
-            consolidation_mapping = self._create_consolidation_mapping_gpu(
-                clustered_entities, 
-                inconsistent_entities,
-                entity_dataframe
-            )
+        # Prepare the mapping DataFrame for the merge operation.
+        consolidation_map_df = consolidation_map_df.rename(columns={
+            'source_cluster': 'cluster',
+            'target_cluster': 'new_cluster_id'
+        })
+
+        # Use a left merge to bring the new, consolidated cluster IDs into the main DataFrame.
+        # Rows that need consolidation will get a 'new_cluster_id'; others will have NaN.
+        updated_df = entity_dataframe.merge(
+            consolidation_map_df, on='cluster', how='left'
+        )
+
+        # Coalesce the old and new cluster columns. If 'new_cluster_id' is not NaN,
+        # use it; otherwise, keep the original 'cluster' value. This efficiently
+        # updates only the rows that need changing.
+        updated_df['cluster'] = updated_df['new_cluster_id'].fillna(updated_df['cluster'])
+        updated_df['cluster'] = updated_df['cluster'].astype('int32')
         
-        # Apply consolidation mapping if any merges are needed
-        if consolidation_mapping:
-            logger.info(f"Consolidating {len(consolidation_mapping)} clusters...")
-            # Flatten is already applied in the creation methods
-            entity_dataframe['cluster'] = entity_dataframe['cluster'].replace(consolidation_mapping)
+        # Clean up the temporary column.
+        final_df = updated_df.drop(columns=['new_cluster_id'])
         
         logger.info("Entity consolidation completed successfully.")
-        return entity_dataframe
-    
-    def _create_consolidation_mapping_gpu(
-        self, 
-        clustered_entities: cudf.DataFrame,
-        inconsistent_entities: cudf.DataFrame,
-        full_dataframe: cudf.DataFrame
-    ) -> Dict:
-        """
-        Create consolidation mapping for identical entities using GPU operations.
-        
-        This method is the fallback when batch operations fail. It processes
-        each inconsistent entity iteratively but still uses GPU operations
-        for statistics calculation.
-        
-        Args:
-            clustered_entities: DataFrame of entities with valid clusters
-            inconsistent_entities: DataFrame of entity keys appearing in multiple clusters
-            full_dataframe: Complete DataFrame for calculating cluster statistics
-            
-        Returns:
-            Dict: Mapping from source cluster IDs to consolidation target cluster IDs
-        """
-        consolidation_map = {}
-        
-        # GUARDRAIL: Filter to valid clusters only
-        valid_full_dataframe = full_dataframe[full_dataframe['cluster'] != -1]
-        
-        # Check and disambiguate cluster_probability column
-        probability_columns = [col for col in valid_full_dataframe.columns 
-                              if 'cluster_probability' in col.lower()]
-        
-        has_probability_column = len(probability_columns) > 0
-        probability_col_name = None
-        
-        if has_probability_column:
-            # Use the first matching column, or the exact match if it exists
-            probability_col_name = ('cluster_probability' 
-                                   if 'cluster_probability' in probability_columns 
-                                   else probability_columns[0])
-            
-            # Ensure the column is numeric
-            try:
-                valid_full_dataframe[probability_col_name] = (
-                    valid_full_dataframe[probability_col_name].astype('float32')
-                )
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Could not convert {probability_col_name} to numeric: {e}")
-                has_probability_column = False
-        
-        # Process each inconsistent entity key
-        for idx, row in inconsistent_entities.iterrows():
-            entity_key = row['composite_entity_key']
-            affected_clusters = row['unique_clusters']
-            
-            # Skip if affected_clusters is null or empty
-            if affected_clusters is None or len(affected_clusters) == 0:
-                continue
-            
-            # Filter out noise clusters (-1) from affected clusters
-            valid_affected_clusters = [c for c in affected_clusters if c != -1]
-            
-            if len(valid_affected_clusters) == 0:
-                continue
-            
-            # Get statistics for each affected cluster
-            cluster_statistics = []
-            
-            for cluster_id in valid_affected_clusters:
-                # Ensure dtype consistency for comparison
-                cluster_mask = (valid_full_dataframe['cluster'] == cluster_id)
-                
-                # Calculate cluster size using GPU operations
-                cluster_size_series = cluster_mask.sum()
-                # Properly extract scalar value
-                if hasattr(cluster_size_series, 'item'):
-                    cluster_size = int(cluster_size_series.item())
-                elif hasattr(cluster_size_series, 'values'):
-                    cluster_size = int(cluster_size_series.values[0])
-                else:
-                    cluster_size = int(cluster_size_series)
-                
-                # Skip empty clusters
-                if cluster_size == 0:
-                    continue
-                
-                # Calculate average probability if column exists
-                average_probability = 0.0  # Default value
-                if has_probability_column and probability_col_name:
-                    cluster_probabilities = valid_full_dataframe.loc[cluster_mask, probability_col_name]
-                    if len(cluster_probabilities) > 0:
-                        # Properly extract scalar from cuDF Series mean
-                        mean_value = cluster_probabilities.mean()
-                        # Handle both cuDF Series and scalar returns
-                        if hasattr(mean_value, 'item'):
-                            average_probability = float(mean_value.item())
-                        elif hasattr(mean_value, 'values'):
-                            # For cuDF Series with single value
-                            average_probability = float(mean_value.values[0])
-                        else:
-                            # Fallback for direct scalar
-                            try:
-                                average_probability = float(mean_value)
-                            except (TypeError, ValueError):
-                                average_probability = 0.0
-                
-                cluster_statistics.append({
-                    'cluster_id': cluster_id,
-                    'size': cluster_size,
-                    'avg_probability': average_probability
-                })
-            
-            # Skip if no valid clusters found
-            if len(cluster_statistics) == 0:
-                continue
-            
-            # Select winner based on size first, then average probability, then cluster_id for determinism
-            winner_cluster = sorted(
-                cluster_statistics, 
-                key=lambda x: (x['size'], x['avg_probability'], -x['cluster_id']), 
-                reverse=True
-            )[0]
-            
-            winner_cluster_id = winner_cluster['cluster_id']
-            
-            # Map all non-winner clusters to the winner
-            for cluster_id in valid_affected_clusters:
-                if cluster_id != winner_cluster_id:
-                    consolidation_map[cluster_id] = winner_cluster_id
-        
-        return consolidation_map
-    
-    def _flatten_mapping(self, mapping: Dict[int, int]) -> Dict[int, int]:
-        """
-        Flatten transitive mappings to ensure single-pass replacement works correctly.
-        
-        Collapses chains like A->B, B->C into A->C so a single replace() is sufficient.
-        Also guards against accidental cycles by stopping when a loop is detected.
-        
-        Args:
-            mapping: Original mapping dictionary that may contain chains
-            
-        Returns:
-            Dict: Flattened mapping where each key maps directly to its final destination
-        """
-        flattened_mapping: Dict[int, int] = {}
-        
-        for start_cluster in mapping.keys():
-            visited_clusters: Set[int] = {start_cluster}
-            destination_cluster = mapping[start_cluster]
-            
-            # Follow the chain until we reach the end or detect a cycle
-            while destination_cluster in mapping and destination_cluster not in visited_clusters:
-                visited_clusters.add(destination_cluster)
-                destination_cluster = mapping[destination_cluster]
-            
-            # If we hit a cycle (destination in visited), stop at current destination
-            flattened_mapping[start_cluster] = destination_cluster
-        
-        return flattened_mapping
-    
-    def _resolve_cluster_conflicts(self, loser_mappings: cudf.DataFrame) -> cudf.DataFrame:
-        """
-        Resolve conflicts where a single cluster_id appears under multiple entity keys
-        with different winners.
-        
-        When a cluster appears in multiple entity groups, we need to pick ONE winner
-        deterministically. We choose the winner from the largest entity group.
-        
-        Args:
-            loser_mappings: DataFrame with cluster_id and winner_cluster_id columns,
-                          potentially containing conflicts
-                          
-        Returns:
-            cudf.DataFrame: Deduplicated mappings with conflicts resolved
-        """
-        # Count how many times each loser->winner mapping appears
-        mapping_counts = loser_mappings.groupby(
-            ['cluster_id', 'winner_cluster_id']
-        ).size().reset_index()
-        mapping_counts.columns = ['cluster_id', 'winner_cluster_id', 'mapping_count']
-        
-        # For each cluster_id, pick the winner with the highest count
-        # If tied, use winner_cluster_id as tiebreaker (smallest ID wins)
-        mapping_counts_sorted = mapping_counts.sort_values(
-            ['cluster_id', 'mapping_count', 'winner_cluster_id'],
-            ascending=[True, False, True]
-        )
-        
-        # Keep only the first (best) mapping for each cluster_id
-        resolved_mappings = mapping_counts_sorted.drop_duplicates(
-            subset=['cluster_id'],
-            keep='first'
-        )[['cluster_id', 'winner_cluster_id']]
-        
-        return resolved_mappings
-    
-    def _create_consolidation_mapping_gpu_optimized(
+        return final_df
+
+    def _create_consolidation_mapping(
         self,
         entity_dataframe: cudf.DataFrame,
         inconsistent_entities: cudf.DataFrame
-    ) -> Dict:
+    ) -> cudf.DataFrame:
         """
-        Create consolidation mapping using fully GPU-optimized batch operations.
+        Create a consolidation mapping using fully GPU-optimized vectorized operations.
         
-        This method minimizes loops by using vectorized operations to process
-        all inconsistent entities in parallel where possible.
+        This method is a complete end-to-end GPU pipeline that:
+        1. Explodes inconsistent entity groups into individual cluster-entity pairs.
+        2. Calculates statistics for all affected clusters in parallel.
+        3. Determines winner clusters using GPU sorting and grouping.
+        4. Creates a flat mapping from source ('loser') to target ('winner') clusters.
+        5. Resolves conflicts where a cluster appears in multiple groups.
+        6. Flattens transitive mappings (e.g., A->B, B->C becomes A->C).
         
         Args:
-            entity_dataframe: Complete DataFrame for calculating cluster statistics
-            inconsistent_entities: DataFrame of entity keys appearing in multiple clusters
+            entity_dataframe: The complete DataFrame with all entities.
+            inconsistent_entities: A DataFrame detailing which entities are in multiple clusters.
             
         Returns:
-            Dict: Mapping from source cluster IDs to consolidation target cluster IDs
+            A cuDF DataFrame with 'source_cluster' and 'target_cluster' columns
+            representing the final, flattened consolidation mapping.
         """
-        # GUARDRAIL 1: Work only on valid clusters (exclude noise points)
-        valid_entity_dataframe = entity_dataframe[entity_dataframe['cluster'] != -1].copy()
+        # =============================================================================
+        # Initial Setup and Validation
+        # =============================================================================
+        # Filter out any entities that have not been assigned to a cluster (cluster == -1).
+        # We only work with valid, clustered entities.
+        valid_entities = entity_dataframe[entity_dataframe['cluster'] != -1].copy()
         
-        if len(valid_entity_dataframe) == 0:
-            logger.debug("No valid clusters found for consolidation statistics.")
-            return {}
+        # If there are no valid entities, no consolidation is possible.
+        if valid_entities.empty:
+            logger.debug("No valid entities with cluster assignments found. Returning empty mapping.")
+            return cudf.DataFrame({'source_cluster': [], 'target_cluster': []})
+
+        # Store the data type of the cluster column for consistent casting later.
+        cluster_dtype = valid_entities['cluster'].dtype
         
-        # GUARDRAIL 2: Ensure cluster column dtype alignment
-        # Cast cluster to the same dtype for consistent joining
-        cluster_dtype = valid_entity_dataframe['cluster'].dtype
-        
-        # Explode the unique_clusters column to get individual cluster-entity pairs
+        # =============================================================================
+        # Step 1: Identify and Prepare All Clusters Involved in Inconsistencies
+        # =============================================================================
+        # The 'unique_clusters' column contains lists of clusters associated with an entity.
+        # 'explode' transforms each item in the list into its own row, creating a long-format
+        # DataFrame where each row is a (composite_entity_key, cluster_id) pair.
         exploded_entities = inconsistent_entities.explode('unique_clusters')
-        
-        # GUARDRAIL 3: Handle potential nulls from explode operation
         exploded_entities = exploded_entities.dropna(subset=['unique_clusters'])
         
-        if len(exploded_entities) == 0:
-            logger.debug("No valid clusters after exploding inconsistent entities.")
-            return {}
+        # If exploding results in an empty DataFrame, there are no inconsistencies to resolve.
+        if exploded_entities.empty: 
+            logger.debug("No inconsistent clusters to process. Returning empty mapping.")
+            return cudf.DataFrame({'source_cluster': [], 'target_cluster': []})
         
-        # Rename and ensure dtype consistency
+        # Rename for clarity and ensure consistent data types.
         exploded_entities = exploded_entities.rename(columns={'unique_clusters': 'cluster_id'})
         exploded_entities['cluster_id'] = exploded_entities['cluster_id'].astype(cluster_dtype)
         
-        # Calculate cluster statistics for all affected clusters at once
+        # Get a unique series of all cluster IDs that are part of any inconsistency.
+        # These are the only clusters we need to analyze further.
         affected_clusters = exploded_entities['cluster_id'].unique()
-        
-        # Filter to only valid affected clusters (double-check no -1 values)
         affected_clusters = affected_clusters[affected_clusters != -1]
         
-        if len(affected_clusters) == 0:
-            logger.debug("No valid affected clusters found.")
-            return {}
+        if len(affected_clusters) == 0: 
+            logger.debug("No affected clusters found after filtering. Returning empty mapping.")
+            return cudf.DataFrame({'source_cluster': [], 'target_cluster': []})
+
+        # =============================================================================
+        # Step 2: Calculate Statistics for Affected Clusters
+        # =============================================================================
+        # To decide a "winner" cluster, we need metrics. We calculate size and avg probability.
         
-        # Get cluster sizes using groupby (only valid clusters)
-        cluster_sizes = valid_entity_dataframe[
-            valid_entity_dataframe['cluster'].isin(affected_clusters)
-        ].groupby('cluster').size().reset_index()
-        cluster_sizes.columns = ['cluster_id', 'cluster_size']
+        # First, filter the main entity dataframe to only include rows with affected clusters.
+        entities_in_affected_clusters = valid_entities[valid_entities['cluster'].isin(affected_clusters)]
+
+        # Calculate the size (number of entities) for each affected cluster.
+        cluster_sizes_grouped = entities_in_affected_clusters.groupby('cluster').size()
+        cluster_sizes = cluster_sizes_grouped.reset_index(name='cluster_size')
+        cluster_sizes = cluster_sizes.rename(columns={'cluster': 'cluster_id'}) 
         
-        # GUARDRAIL 4: Check and disambiguate cluster_probability column
-        probability_columns = [col for col in valid_entity_dataframe.columns 
-                              if 'cluster_probability' in col.lower()]
+        # Initialize the cluster_stats DataFrame with the size information.
+        cluster_stats = cluster_sizes
         
-        has_probability_column = len(probability_columns) > 0
-        
-        if has_probability_column:
-            # Use the first matching column, or the exact match if it exists
-            probability_col_name = ('cluster_probability' 
-                                   if 'cluster_probability' in probability_columns 
-                                   else probability_columns[0])
-            
-            logger.debug(f"Using probability column: {probability_col_name}")
-            
-            # Ensure the probability column is numeric with float64 for stable means
+        # Dynamically find the probability column, if it exists.
+        prob_cols = [c for c in valid_entities.columns if 'cluster_probability' in c.lower()]
+        if prob_cols:
+            prob_col_name = prob_cols[0]
             try:
-                valid_entity_dataframe[probability_col_name] = (
-                    valid_entity_dataframe[probability_col_name].astype('float64')
-                )
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Could not convert {probability_col_name} to numeric: {e}")
-                has_probability_column = False
+                # Calculate the average cluster probability for each affected cluster.
+                valid_entities[prob_col_name] = valid_entities[prob_col_name].astype('float32')
+                cluster_probs_grouped = entities_in_affected_clusters.groupby('cluster')[prob_col_name].mean()
+                cluster_probs = cluster_probs_grouped.reset_index(name='avg_probability')
+                cluster_probs = cluster_probs.rename(columns={'cluster': 'cluster_id'}) 
+                
+                # Merge the probability stats with the size stats.
+                cluster_stats = cluster_stats.merge(cluster_probs, on='cluster_id', how='left')
+            except Exception as e:
+                logger.warning(f"Could not process probability column {prob_col_name}: {e}")
         
-        # Get average probabilities if the column exists and is valid
-        if has_probability_column:
-            cluster_probabilities = valid_entity_dataframe[
-                valid_entity_dataframe['cluster'].isin(affected_clusters)
-            ].groupby('cluster')[probability_col_name].mean().reset_index()
-            cluster_probabilities.columns = ['cluster_id', 'avg_probability']
-            
-            # Merge statistics with explicit dtype alignment
-            cluster_stats = cluster_sizes.merge(
-                cluster_probabilities, 
-                on='cluster_id', 
-                how='left'
-            )
-            # Fill NaN probabilities with 0
-            cluster_stats['avg_probability'] = cluster_stats['avg_probability'].fillna(0.0)
-        else:
-            cluster_stats = cluster_sizes.copy()
+        # Ensure 'avg_probability' column exists for consistent sorting, even if it could not be calculated.
+        if 'avg_probability' not in cluster_stats.columns:
             cluster_stats['avg_probability'] = 0.0
         
-        # Ensure cluster_size is not null (shouldn't happen, but being defensive)
-        cluster_stats['cluster_size'] = cluster_stats['cluster_size'].fillna(0)
+        # Fill any missing values with 0.
+        cluster_stats = cluster_stats.fillna(0)
         
-        # Join cluster statistics back to exploded entities
-        entities_with_stats = exploded_entities.merge(
-            cluster_stats,
-            on='cluster_id',
-            how='left'
-        )
-        
-        # Drop any rows where we couldn't find cluster statistics
+        # =============================================================================
+        # Step 3: Determine the "Winner" Cluster for Each Inconsistent Entity Group
+        # =============================================================================
+        # Join the calculated stats back to the exploded entity-cluster pairs.
+        entities_with_stats = exploded_entities.merge(cluster_stats, on='cluster_id', how='left')
         entities_with_stats = entities_with_stats.dropna(subset=['cluster_size'])
         
-        if len(entities_with_stats) == 0:
-            logger.debug("No entities with valid cluster statistics found.")
-            return {}
+        if entities_with_stats.empty: 
+            logger.debug("No entities with stats remained after merge. Returning empty mapping.")
+            return cudf.DataFrame({'source_cluster': [], 'target_cluster': []})
         
-        # GUARDRAIL 5: Add deterministic tie-breaking
-        # Add cluster_id as a third sort key for fully deterministic results
-        # Sort by entity key, then by size (desc), probability (desc), and cluster_id (asc) for ties
-        entities_sorted = entities_with_stats.sort_values(
-            ['composite_entity_key', 'cluster_size', 'avg_probability', 'cluster_id'],
-            ascending=[True, False, False, True]
+        # Sort to determine the winner. The logic is:
+        # 1. Group by each inconsistent entity (`composite_entity_key`).
+        # 2. Within each group, the winner is the cluster with the largest `cluster_size`.
+        # 3. If sizes are tied, the winner has the highest `avg_probability`.
+        # 4. If still tied, the winner is the one with the lowest `cluster_id` for deterministic results.
+        sort_order = ['composite_entity_key', 'cluster_size', 'avg_probability', 'cluster_id']
+        ascending_order = [True, False, False, True]
+        entities_sorted = entities_with_stats.sort_values(sort_order, ascending=ascending_order)
+        
+        # The first row for each `composite_entity_key` is now the winner.
+        # We drop duplicates to isolate these winner rows.
+        winner_rows = entities_sorted.drop_duplicates(subset=['composite_entity_key'], keep='first')
+        winners = winner_rows[['composite_entity_key', 'cluster_id']]
+        winners = winners.rename(columns={'cluster_id': 'winner_cluster_id'})
+        
+        # =============================================================================
+        # Step 4: Generate Initial Source-to-Target ("Loser-to-Winner") Mappings
+        # =============================================================================
+        # Join the winner information back to the full list of sorted inconsistent clusters.
+        clusters_with_winners = entities_sorted.merge(winners, on='composite_entity_key', how='left')
+        
+        # Any cluster that is not the designated winner for its group is a "loser"
+        # and needs to be mapped to the winner.
+        loser_rows = clusters_with_winners[clusters_with_winners['cluster_id'] != clusters_with_winners['winner_cluster_id']]
+        loser_mappings = loser_rows[['cluster_id', 'winner_cluster_id']]
+        
+        if loser_mappings.empty:
+            logger.debug("No loser-to-winner mappings were generated. Returning empty mapping.")
+            return cudf.DataFrame({'source_cluster': [], 'target_cluster': []})
+
+        # =============================================================================
+        # Step 5: Resolve Mapping Conflicts
+        # =============================================================================
+        # A single cluster might be a "loser" in multiple different inconsistent groups,
+        # potentially mapping it to different winners. This step resolves such conflicts.
+        # For example, if we have A->B and A->C, we must choose one.
+        resolved_mappings = self._resolve_cluster_conflicts(loser_mappings)
+        
+        # =============================================================================
+        # Step 6: Flatten Transitive Mappings
+        # =============================================================================
+        # Resolve mapping chains. For example, if the mappings are A->B and B->C, this
+        # step flattens them into a direct mapping: A->C. This is repeated until no
+        # more chains exist.
+        flattened_mappings = self._flatten_transitive_mappings_gpu(resolved_mappings)
+        
+        # =============================================================================
+        # Step 7: Finalize the Consolidation Mapping
+        # =============================================================================
+        # Rename columns to the final desired schema: 'source_cluster' and 'target_cluster'.
+        final_mapping = flattened_mappings.rename(
+            columns={'cluster_id': 'source_cluster', 'winner_cluster_id': 'target_cluster'}
         )
         
-        # Get the first (winner) cluster for each entity key
-        winners = entities_sorted.drop_duplicates(
-            subset=['composite_entity_key'],
+        # As a final sanity check, remove any mappings where a cluster maps to itself.
+        final_mapping = final_mapping[final_mapping['source_cluster'] != final_mapping['target_cluster']]
+        
+        logger.debug(f"Created final consolidation mapping for {len(final_mapping)} clusters.")
+        return final_mapping
+    
+    def _resolve_cluster_conflicts(self, loser_mappings: cudf.DataFrame) -> cudf.DataFrame:
+        """
+        Resolve conflicts where a single source cluster maps to multiple target clusters.
+
+        A conflict arises when a single cluster_id (a "loser") is part of multiple
+        inconsistent entity groups and, as a result, is mapped to different "winner"
+        clusters. This function ensures that every source cluster maps to only one
+        target cluster.
+
+        The resolution strategy is deterministic:
+        1. Count how many times each unique (source -> target) mapping occurs. This
+           count serves as a proxy for the strength of the mapping.
+        2. For each source cluster, select the target cluster that has the highest
+           mapping count.
+        3. If there's a tie in counts, the target cluster with the lowest numerical
+           ID is chosen to ensure a consistent outcome.
+
+        Args:
+            loser_mappings: DataFrame with 'cluster_id' (source) and 'winner_cluster_id'
+                            (target) columns, potentially containing conflicts.
+
+        Returns:
+            A DataFrame with conflicts resolved, containing a unique source-to-target
+            mapping for each cluster.
+        """
+        # =============================================================================
+        # Step 1: Count Occurrences of Each Unique Mapping
+        # =============================================================================
+        # Group by both the source ('cluster_id') and target ('winner_cluster_id') to
+        # get a count for every unique mapping pair that exists.
+        mapping_counts_grouped = loser_mappings.groupby(
+            ['cluster_id', 'winner_cluster_id']
+        ).size()
+        mapping_counts = mapping_counts_grouped.reset_index(name='mapping_count')
+
+        # =============================================================================
+        # Step 2: Sort to Identify the Best Mapping for Each Source Cluster
+        # =============================================================================
+        # Sort the mappings to prepare for deduplication. The desired mapping will be
+        # at the top for each 'cluster_id' group after sorting.
+        #  - Primary sort by 'cluster_id' to group all mappings for the same source.
+        #  - Secondary sort by 'mapping_count' descending, to prioritize the most
+        #    frequent (strongest) mapping.
+        #  - Tertiary sort by 'winner_cluster_id' ascending as a tie-breaker for
+        #    deterministic results.
+        sort_order = ['cluster_id', 'mapping_count', 'winner_cluster_id']
+        ascending_order = [True, False, True]
+        mappings_sorted = mapping_counts.sort_values(
+            by=sort_order,
+            ascending=ascending_order
+        )
+
+        # =============================================================================
+        # Step 3: Deduplicate to Keep Only the Single Best Mapping
+        # =============================================================================
+        # After sorting, the first entry for each 'cluster_id' is the one we want to keep.
+        # `drop_duplicates` with `keep='first'` achieves this.
+        resolved_mappings_with_counts = mappings_sorted.drop_duplicates(
+            subset=['cluster_id'],
             keep='first'
-        )[['composite_entity_key', 'cluster_id']].rename(
-            columns={'cluster_id': 'winner_cluster_id'}
         )
-        
-        # Join back to get all clusters and their winners
-        clusters_with_winners = entities_sorted.merge(
-            winners,
-            on='composite_entity_key',
-            how='left'
-        )
-        
-        # Filter to get only the losers (non-winner clusters)
-        loser_mappings = clusters_with_winners[
-            clusters_with_winners['cluster_id'] != clusters_with_winners['winner_cluster_id']
-        ][['cluster_id', 'winner_cluster_id']]
-        
-        # CRITICAL: Resolve conflicts where a cluster_id maps to different winners
-        # This can happen when a cluster appears in multiple entity groups
-        loser_mappings = self._resolve_cluster_conflicts(loser_mappings)
-        
-        # Final validation: ensure we're not mapping any cluster to -1
-        loser_mappings = loser_mappings[
-            (loser_mappings['winner_cluster_id'] != -1) & 
-            (loser_mappings['cluster_id'] != -1)
-        ]
-        
-        # Convert to dictionary
-        if len(loser_mappings) > 0:
-            # Use to_pandas only for final dictionary creation
-            mapping_df = loser_mappings.to_pandas()
-            consolidation_map = dict(zip(
-                mapping_df['cluster_id'],
-                mapping_df['winner_cluster_id']
-            ))
-            
-            # Flatten transitive mappings for single-pass replacement
-            consolidation_map = self._flatten_mapping(consolidation_map)
-            
-            logger.debug(f"Created consolidation mapping for {len(consolidation_map)} clusters")
-        else:
-            consolidation_map = {}
-            logger.debug("No cluster consolidations needed")
-        
-        return consolidation_map
+
+        # The 'mapping_count' column is no longer needed. Select and return only the
+        # final cluster_id -> winner_cluster_id pairs.
+        final_resolved_mappings = resolved_mappings_with_counts[['cluster_id', 'winner_cluster_id']]
+
+        logger.debug(f"Resolved conflicts for {len(loser_mappings) - len(final_resolved_mappings)} mappings.")
+        return final_resolved_mappings
     
     def _create_profile_for_group(
             self,
             cluster_group: cudf.DataFrame, 
-        ) -> cudf.DataFrame:
+    ) -> cudf.DataFrame:
         """
         Creates a canonical profile for a single cluster group.
 
@@ -806,26 +734,167 @@ class ClusterMerger:
             A single-row cuDF DataFrame containing the canonical representations
             for the cluster. This format is required by the `apply` function.
         """
-        # Calculate the single most representative name for the entire cluster.
+        # =============================================================================
+        # Step 1: Determine the Canonical Name Representation
+        # =============================================================================
+        # This step processes all 'normalized_text' entries for the cluster group
+        # and calculates the single most representative name for the entire cluster.
+        # The underlying `get_canonical_name_gpu` function handles the complex
+        # similarity and scoring logic on the GPU.
         canonical_name = get_canonical_name_gpu(
             cluster_group['normalized_text'],
             self.vectorizer_config.similarity_tfidf
         )
         
-        # Find the highest-quality address from all records in the cluster.
+        # =============================================================================
+        # Step 2: Determine the Canonical Address Representation
+        # =============================================================================
+        # This step evaluates all address-related columns within the group to find the
+        # single highest-quality, most complete address.
         best_address_row = get_best_address_gpu(cluster_group)
         
-        # Extract the address string, defaulting to an empty string if none is found.
-        canonical_address = best_address_row['addr_normalized_key'].iloc[0] if not best_address_row.empty else ""
+        # Extract the normalized address string from the best row found. If the
+        # `get_best_address_gpu` function returned an empty DataFrame (i.e., no
+        # valid addresses were found), we default to an empty string.
+        if not best_address_row.empty:
+            canonical_address = best_address_row['addr_normalized_key'].iloc[0]
+        else:
+            canonical_address = ""
 
-        # Get the cluster ID from the first row of the group.
-        # It's guaranteed to be the same for all rows in this group.
-        cluster_id = cluster_group['cluster'].iloc[0]
+        # =============================================================================
+        # Step 3: Assemble the Final Profile DataFrame
+        # =============================================================================
+        # The `groupby().apply()` construct requires that the function returns a
+        # DataFrame. We create a single-row DataFrame containing the cluster's ID
+        # and its newly calculated canonical representations. These individual
+        # DataFrames (one from each group) will be concatenated by cuDF into the
+        # final result.
         
-        # The result must be a DataFrame, which `groupby().apply()` will then
-        # concatenate with the results from all other groups.
-        return cudf.DataFrame({
+        # The cluster ID is guaranteed to be the same for all rows in this group,
+        # so we can safely take it from the first row.
+        cluster_id = int(cluster_group['cluster'].iloc[0])
+        
+        profile_df = cudf.DataFrame({
             'cluster_id': [cluster_id],
             'canonical_name_representation': [canonical_name],
             'canonical_address_representation': [canonical_address]
         })
+        
+        return profile_df
+    
+    def _flatten_transitive_mappings_gpu(self, mapping_df: cudf.DataFrame) -> cudf.DataFrame:
+        """
+        Flattens transitive mappings (e.g., A->B, B->C becomes A->C) on the GPU.
+
+        This function uses a "pointer jumping" or "path doubling" algorithm, which is a
+        highly efficient, parallel approach for finding the root nodes in a forest (a
+        collection of directed trees). It is robust to cycles and converges in a
+        logarithmic number of steps relative to the number of nodes.
+
+        Args:
+            mapping_df: A DataFrame with ['cluster_id', 'winner_cluster_id'] columns.
+                        It is assumed that each 'cluster_id' maps to at most one winner.
+
+        Returns:
+            A DataFrame with the same columns, where each 'cluster_id' now maps
+            directly to its ultimate final winner.
+        """
+        if mapping_df.empty:
+            return mapping_df
+
+        # =============================================================================
+        # Step 1: Create a Dense, 0-Indexed ID Space for All Graph Nodes
+        # =============================================================================
+        # GPU array operations require dense, 0-based integer indices for direct memory
+        # access. Our original 'cluster_id' values can be large and sparse. This step
+        # maps every unique cluster ID to a new, dense ID from 0 to N-1.
+
+        # Gather all unique cluster IDs from both source and target columns.
+        source_ids = mapping_df['cluster_id']
+        target_ids = mapping_df['winner_cluster_id']
+        all_unique_ids = cudf.concat([source_ids, target_ids]).unique().dropna()
+        all_unique_ids = all_unique_ids.astype('int32')
+        n_nodes = len(all_unique_ids)
+
+        # Create a lookup table (like a dictionary) to map from the original sparse
+        # ID to the new dense ID (0, 1, 2, ...).
+        id_to_dense_map = cudf.DataFrame({
+            'original_id': all_unique_ids,
+            'dense_id': cupy.arange(n_nodes, dtype='int32')
+        })
+
+        # =============================================================================
+        # Step 2: Map Original Mappings to the New Dense ID Space
+        # =============================================================================
+        # Now, translate the input mappings from original IDs to dense IDs.
+        
+        # Create a temporary DataFrame for merging.
+        dense_mappings = mapping_df.copy()
+
+        # Merge to find the dense ID for each source ('cluster_id').
+        dense_mappings = dense_mappings.merge(
+            id_to_dense_map, left_on='cluster_id', right_on='original_id', how='left'
+        ).rename(columns={'dense_id': 'dense_source_id'})
+
+        # Merge again to find the dense ID for each target ('winner_cluster_id').
+        dense_mappings = dense_mappings.merge(
+            id_to_dense_map, left_on='winner_cluster_id', right_on='original_id', how='left'
+        ).rename(columns={'dense_id': 'dense_target_id'})
+
+        # Extract the dense source and target IDs as cupy arrays for the algorithm.
+        dense_sources = dense_mappings['dense_source_id'].dropna().astype('int32')
+        dense_targets = dense_mappings['dense_target_id'].dropna().astype('int32')
+        
+        # =============================================================================
+        # Step 3: Initialize and Run the Pointer Jumping Algorithm
+        # =============================================================================
+        # The 'parent' array stores the graph. parent[i] = j means node i -> node j.
+        # Initially, every node is its own parent.
+        parent = cupy.arange(n_nodes, dtype='int32')
+        
+        # Apply the initial mappings: each source node points to its target node.
+        parent[dense_sources.values] = dense_targets.values
+
+        # Iteratively "jump" pointers. In each step, every node updates its parent to
+        # its current grandparent (parent[parent]). This is the core of the "path doubling"
+        # algorithm, which doubles the path length to the root in each iteration,
+        # leading to O(log N) convergence.
+        max_steps = int(cupy.ceil(cupy.log2(cupy.asarray(max(n_nodes, 1), dtype='float32')))) + 2
+        for _ in range(max_steps):
+            new_parent = parent[parent]
+            # If no pointers changed in an iteration, the graph has stabilized and we can exit early.
+            if cupy.all(new_parent == parent):
+                break
+            parent = new_parent
+        
+        # =============================================================================
+        # Step 4: Determine the Final Root/Winner for Each Original Source
+        # =============================================================================
+        # After the loop, `parent[i]` holds the ultimate root of the tree that node `i` belongs to.
+        # We only need the final destination for the initial set of source nodes.
+        final_dense_targets = parent[dense_sources.values]
+
+        # =============================================================================
+        # Step 5: Map Dense IDs Back to Original Cluster IDs
+        # =============================================================================
+        # We now have the final mappings in the dense space. Translate them back to
+        # the original, sparse cluster IDs. The `id_to_dense_map` is now used in reverse.
+        dense_to_id_map = id_to_dense_map.set_index('dense_id')
+        
+        final_sources_series = dense_to_id_map.loc[dense_sources]['original_id']
+        final_targets_series = dense_to_id_map.loc[cudf.Series(final_dense_targets)]['original_id']
+
+        # =============================================================================
+        # Step 6: Assemble and Return the Final Flattened Mapping
+        # =============================================================================
+        flat_mapping = cudf.DataFrame({
+            'cluster_id': final_sources_series,
+            'winner_cluster_id': final_targets_series.values
+        })
+
+        # Ensure the output dtypes match the original input dtypes.
+        flat_mapping['cluster_id'] = flat_mapping['cluster_id'].astype('int32')
+        flat_mapping['winner_cluster_id'] = flat_mapping['winner_cluster_id'].astype('int32')
+
+        # Final cleanup to remove any duplicates that might arise and reset the index.
+        return flat_mapping.drop_duplicates().reset_index(drop=True)

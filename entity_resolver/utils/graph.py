@@ -185,7 +185,7 @@ def find_graph_components(
         edge_list_df,
         source=source_column,
         destination=destination_column,
-        renumber=True  # Allow cuGraph to optimize vertex numbering internally
+        renumber=False
     )
     
     num_vertices = graph.number_of_vertices()
@@ -312,56 +312,63 @@ def _compute_directed_knn_edges(
 
 def _identify_mutual_edges(directed_edges_df: cudf.DataFrame) -> cudf.DataFrame:
     """
-    Identifies bidirectional (mutual) edges from a directed edge list.
+    Identifies bidirectional (mutual) edges and returns a de-duplicated list.
 
-    A mutual edge exists when both (i→j) and (j→i) are present in the directed
-    graph. This function finds such pairs and combines their information,
-    preserving ranks and similarities from both directions.
+    A mutual edge exists when both (i->j) and (j->i) are present in the directed
+    graph. This function finds such pairs by merging the edge list with itself,
+    enforces a canonical direction (source < destination) to prevent duplicates,
+    and returns a clean DataFrame with data from both edge perspectives.
 
     Args:
         directed_edges_df: DataFrame with directed edges containing columns:
             'source', 'destination', 'rank', 'similarity'
 
     Returns:
-        DataFrame with mutual edges containing:
-            - 'source', 'destination': Node pair (source < destination)
+        DataFrame with de-duplicated mutual edges containing:
+            - 'source', 'destination': Node pair (enforced source < destination)
             - 'source_to_dest_rank': Rank of destination in source's k-NN
             - 'dest_to_source_rank': Rank of source in destination's k-NN
             - 'source_to_dest_similarity': Similarity from source perspective
             - 'dest_to_source_similarity': Similarity from destination perspective
     """
-    # Create a reversed version of edges for matching
-    reversed_edges_df = directed_edges_df.rename(columns={
-        'source': 'destination',
-        'destination': 'source',
-        'rank': 'reverse_rank',
-        'similarity': 'reverse_similarity'
-    })
-    
-    # Inner join to find mutual connections
-    # This keeps only edges where both directions exist
-    mutual_edges_df = directed_edges_df.merge(
-        reversed_edges_df,
-        on=['source', 'destination'],
-        how='inner'
+    # Perform an inner self-merge to find mutual pairs.
+    # This correctly matches a forward edge (A->B) from the left side with a
+    # reverse edge (B->A) from the right side.
+    mutual_edges_with_duplicates = directed_edges_df.merge(
+        directed_edges_df,
+        left_on=['source', 'destination'],
+        right_on=['destination', 'source'],
+        how='inner',
+        suffixes=('_fwd', '_rev')  # Suffixes for forward and reverse edge columns
     )
-    
-    # Rename columns for clarity
-    mutual_edges_df = mutual_edges_df.rename(columns={
-        'rank': 'source_to_dest_rank',
-        'reverse_rank': 'dest_to_source_rank',
-        'similarity': 'source_to_dest_similarity',
-        'reverse_similarity': 'dest_to_source_similarity'
+
+    # CRITICAL: De-duplicate the mutual edges.
+    # The merge creates two rows for each mutual pair (one for A->B, one for B->A).
+    # We enforce a canonical direction (source < destination) to keep only one
+    # edge per pair, which is correct for an undirected graph.
+    deduplicated_mutual_edges = mutual_edges_with_duplicates[
+        mutual_edges_with_duplicates['source_fwd'] < mutual_edges_with_duplicates['destination_fwd']
+    ]
+
+    # Select and rename columns to the final desired format for clarity.
+    final_df = cudf.DataFrame({
+        'source': deduplicated_mutual_edges['source_fwd'],
+        'destination': deduplicated_mutual_edges['destination_fwd'],
+        'source_to_dest_rank': deduplicated_mutual_edges['rank_fwd'],
+        'source_to_dest_similarity': deduplicated_mutual_edges['similarity_fwd'],
+        'dest_to_source_rank': deduplicated_mutual_edges['rank_rev'],
+        'dest_to_source_similarity': deduplicated_mutual_edges['similarity_rev']
     })
-    
-    num_mutual_edges = len(mutual_edges_df)
+
+    num_mutual_pairs = len(final_df)
     num_directed_edges = len(directed_edges_df)
-    mutual_percentage = (num_mutual_edges / num_directed_edges * 100) if num_directed_edges > 0 else 0
+    # The number of directed edges involved in mutual pairs is 2 * num_mutual_pairs
+    mutual_percentage = (2 * num_mutual_pairs / num_directed_edges * 100) if num_directed_edges > 0 else 0
     
-    logger.info(f"Found {num_mutual_edges:,} mutual edges from {num_directed_edges:,} "
-                f"directed edges ({mutual_percentage:.1f}% mutual)")
+    logger.info(f"Identified {num_mutual_pairs:,} unique mutual pairs from {num_directed_edges:,} "
+                f"directed edges ({mutual_percentage:.1f}% of directed edges are part of a mutual pair)")
     
-    return mutual_edges_df
+    return final_df
 
 
 def _compute_hybrid_edge_weight(

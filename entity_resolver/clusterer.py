@@ -282,7 +282,8 @@ class EntityClusterer:
         
         # Assign default confidence for predictions
         # (HDBSCAN predict doesn't provide probabilities)
-        gdf["cluster"] = self.cluster_model.predict(reduced_vectors)
+        predicted_clusters = cudf.Series(self.cluster_model.predict(reduced_vectors), index=gdf.index)
+        gdf["cluster"] = predicted_clusters.fillna(-1).astype('int32')
         
         # Assign default confidence for predictions
         default_conf = float(self.config.ensemble_params.default_rescue_conf)
@@ -339,8 +340,9 @@ class EntityClusterer:
         # Store fitted model for later use
         self.cluster_model = clusterer
         
-        # Add cluster assignments to DataFrame
-        gdf["cluster"] = clusterer.labels_
+        # Add cluster assignments to DataFram
+        cluster_labels = cudf.Series(clusterer.labels_, index=gdf.index)
+        gdf["cluster"] = cluster_labels.fillna(-1).astype('int32')
         gdf["cluster_probability"] = clusterer.probabilities_
         
         # Calculate and log statistics
@@ -418,7 +420,7 @@ class EntityClusterer:
         
         # Convert to label array
         initial_labels = cp.full(reduced_vectors.shape[0], -1, dtype=cp.int32)
-        initial_labels[partitions_df["vertex"].values] = partitions_df["partition"].values
+        initial_labels[partitions_df["vertex"].values] = partitions_df["partition"].astype(cp.int32).values
         
         n_communities = int(initial_labels[initial_labels != -1].max() + 1)
         logger.info(f"Found {n_communities} initial communities (modularity={modularity:.3f})")
@@ -689,51 +691,74 @@ class EntityClusterer:
         return gdf_hdbscan
     
     def _find_snn_to_hdbscan_mapping(
-        self, 
-        hdb_labels: cp.ndarray, 
+        self,
+        hdb_labels: cp.ndarray,
         snn_labels: cp.ndarray,
         params: EnsembleParams
     ) -> cudf.DataFrame:
         """
-        Find best mapping from SNN clusters to HDBSCAN clusters.
-        
+        Find the best mapping from SNN clusters to HDBSCAN clusters.
+
+        This version corrects the purity calculation to account for SNN members
+        that were labeled as noise by HDBSCAN, preventing inflated purity scores.
+
         Args:
-            hdb_labels: HDBSCAN cluster labels
-            snn_labels: SNN cluster labels
-            params: Ensemble parameters
-            
+            hdb_labels: HDBSCAN cluster labels.
+            snn_labels: SNN cluster labels.
+            params: Ensemble parameters containing purity_min and min_overlap.
+
         Returns:
-            DataFrame with 'snn' and 'hdb' columns for valid mappings
+            A DataFrame with 'snn' and 'hdb' columns for valid mappings.
         """
         logger.debug("Finding SNN to HDBSCAN cluster mappings")
-        
-        # Create overlap DataFrame
+
+        # Create a DataFrame to represent the overlap between the two clusterings.
         overlap_df = cudf.DataFrame({"hdb": hdb_labels, "snn": snn_labels})
-        clustered_both = overlap_df[(overlap_df["hdb"] != -1) & (overlap_df["snn"] != -1)]
+
+        # 1. Calculate the TRUE total size of each SNN cluster first.
+        # This includes all members of an SNN cluster, even those that HDBSCAN
+        # labeled as noise (-1). This is the correct denominator for the purity calculation.
+        snn_all_members = overlap_df[overlap_df["snn"] != -1]
         
-        if clustered_both.empty:
-            logger.warning("No overlap between HDBSCAN and SNN clusters")
+        if snn_all_members.empty:
+            logger.warning("No valid SNN clusters to analyze for mapping.")
             return cudf.DataFrame({"snn": [], "hdb": []})
-        
-        # Calculate overlap statistics
+            
+        snn_total_sizes = snn_all_members.groupby("snn").size().reset_index(name="snn_total")
+
+        # 2. Now, find the intersection of points that were clustered by BOTH algorithms.
+        # This will be used to calculate the overlap (the numerator).
+        clustered_both = overlap_df[(overlap_df["hdb"] != -1) & (overlap_df["snn"] != -1)]
+
+        if clustered_both.empty:
+            logger.warning("No overlap between any valid HDBSCAN and SNN clusters.")
+            return cudf.DataFrame({"snn": [], "hdb": []})
+
+        # 3. Calculate overlap counts (the size of the intersection between each pair of clusters).
         overlap_counts = clustered_both.groupby(["snn", "hdb"]).size().reset_index(name="overlap")
-        snn_total_sizes = overlap_counts.groupby("snn")["overlap"].sum().reset_index(name="snn_total")
-        overlap_counts = overlap_counts.merge(snn_total_sizes, on="snn")
+
+        # 4. Merge the overlap counts with the true SNN cluster sizes calculated in step 1.
+        overlap_counts = overlap_counts.merge(snn_total_sizes, on="snn", how="left")
+
+        # 5. Calculate purity correctly.
+        # Purity is the proportion of an SNN cluster's members that fall into a specific
+        # HDBSCAN cluster, relative to the SNN cluster's TOTAL size.
         overlap_counts["purity"] = overlap_counts["overlap"] / overlap_counts["snn_total"]
-        
-        # Find best match for each SNN cluster
+        # --- END REFINED LOGIC ---
+
+        # Find the best HDBSCAN match for each SNN cluster based on the largest overlap.
         best_matches = (
             overlap_counts
             .sort_values(["snn", "overlap"], ascending=[True, False])
             .drop_duplicates(subset=["snn"])
         )
-        
-        # Filter by purity and overlap thresholds
+
+        # Filter these best matches based on the minimum purity and overlap thresholds.
         valid_mappings = best_matches[
             (best_matches["purity"] >= params.purity_min) &
             (best_matches["overlap"] >= params.min_overlap)
         ][["snn", "hdb"]]
-        
+
         logger.debug(f"Found {len(valid_mappings)} valid SNN->HDBSCAN mappings")
         return valid_mappings
     
@@ -747,25 +772,82 @@ class EntityClusterer:
         params: EnsembleParams
     ) -> int:
         """
-        Rescue HDBSCAN noise points using SNN clusters.
-        
+        Rescue HDBSCAN noise points using valid SNN-to-HDBSCAN cluster mappings.
+
+        This version uses a dense Look-Up Table (LUT) for high performance and
+        to completely eliminate the risk of index misalignment that can occur
+        with DataFrame joins.
+
         Returns:
-            Number of rescued points
+            The total number of noise points that were successfully rescued.
         """
-        # Map SNN labels to HDBSCAN clusters
-        snn_labels_df = cudf.DataFrame({"snn": snn_labels})
-        snn_labels_df = snn_labels_df.merge(snn_to_hdb_map, on="snn", how="left")
-        mapped_hdb_labels = snn_labels_df["hdb"].fillna(-1).astype("int32").values
+        # 0. Input Validation
+        # Ensure all core arrays have the same length before proceeding.
+        num_points = len(snn_labels)
+        if not (len(final_labels) == len(final_probs) == len(noise_mask) == num_points):
+            raise ValueError("Array length mismatch in _rescue_noise_points")
+
+        # 1. Prepare the SNN-to-HDBSCAN Mapping
+        # To build a valid LUT, the mapping keys ('snn') must be unique.
+        # We de-duplicate the DataFrame to ensure each SNN cluster ID maps to
+        # exactly one HDBSCAN cluster ID.
+        if snn_to_hdb_map.empty:
+            logger.debug("SNN to HDBSCAN map is empty. No points to rescue.")
+            return 0
+            
+        unique_snn_to_hdb_map = snn_to_hdb_map.astype(
+            {"snn": "int32", "hdb": "int32"}
+        ).drop_duplicates(subset=["snn"], keep="first")
+
+        snn_ids_from_map = unique_snn_to_hdb_map["snn"].values
+        hdb_ids_from_map = unique_snn_to_hdb_map["hdb"].values
+
+        if len(snn_ids_from_map) == 0:
+            return 0
+
+        # 2. Build a High-Performance Look-Up Table (LUT)
+        # The LUT maps an SNN cluster ID to its corresponding HDBSCAN cluster ID.
+        # This is much faster than merging DataFrames. The LUT must be large
+        # enough to hold the max SNN label value to prevent out-of-bounds errors.
+        max_snn_label_in_data = int(cp.max(snn_labels)) if num_points > 0 else -1
+        max_snn_in_map = int(cp.max(snn_ids_from_map))
+        lut_size = max(max_snn_label_in_data, max_snn_in_map) + 1
         
-        # Rescue noise points that SNN assigns to mapped clusters
-        rescue_mask = noise_mask & (mapped_hdb_labels != -1)
-        final_labels[rescue_mask] = mapped_hdb_labels[rescue_mask]
+        snn_to_hdb_id_lut = cp.full(lut_size, -1, dtype=cp.int32)
+        snn_to_hdb_id_lut[snn_ids_from_map] = hdb_ids_from_map
+
+        # 3. Apply the LUT to Propose Rescued Labels for All Points
+        # Use the LUT to find the potential new HDBSCAN label for every point
+        # based on its SNN cluster membership. Points whose SNN cluster is not
+        # in the map will be assigned a -1.
+        proposed_hdb_labels_for_all_points = cp.full(num_points, -1, dtype=cp.int32)
+        points_with_valid_snn_labels_mask = (snn_labels >= 0) & (snn_labels < lut_size)
         
-        # Set confidence for rescued points
-        default_conf = float(params.default_rescue_conf)
-        final_probs[rescue_mask] = default_conf
+        proposed_hdb_labels_for_all_points[points_with_valid_snn_labels_mask] = snn_to_hdb_id_lut[
+            snn_labels[points_with_valid_snn_labels_mask]
+        ]
+
+        # 4. Assign Rescued Labels Only to Points Previously Marked as Noise
+        # The final assignment happens only if a point meets two conditions:
+        #   a) It was originally considered noise by HDBSCAN (noise_mask is True).
+        #   b) Its SNN cluster was successfully mapped to an HDBSCAN cluster
+        #      (proposed_hdb_labels != -1).
+        rescue_mask = noise_mask & (proposed_hdb_labels_for_all_points != -1)
         
-        return int(rescue_mask.sum())
+        num_rescued = int(rescue_mask.sum())
+
+        if num_rescued > 0:
+            final_labels[rescue_mask] = proposed_hdb_labels_for_all_points[rescue_mask]
+            
+            # Set a default confidence for all rescued points.
+            default_rescue_confidence = float(params.default_rescue_conf)
+            final_probs[rescue_mask] = cp.asarray(
+                default_rescue_confidence, dtype=cp.float32
+            )
+            
+        logger.debug(f"Rescued {num_rescued:,} noise points.")
+
+        return num_rescued
     
     def _mint_new_clusters(
         self,
@@ -774,50 +856,117 @@ class EntityClusterer:
         noise_mask: cp.ndarray,
         snn_labels: cp.ndarray,
         snn_to_hdb_map: cudf.DataFrame,
-        params: EnsembleParams
+        params: EnsembleParams,
     ) -> int:
         """
         Create new clusters from large unmapped SNN groups.
         
-        Returns:
-            Number of new clusters created
+        This version uses a dense Look-Up Table (LUT) instead of joins, which
+        is faster and prevents any possibility of index misalignment. It also 
+        returns the number of clusters that were actually assigned to at least
+        one data point.
         """
-        # Find SNN clusters that aren't mapped to HDBSCAN
-        snn_sizes = cudf.Series(snn_labels).value_counts().reset_index()
-        snn_sizes.columns = ["snn", "size"]
+        # 0. Input Validation
+        # Ensure all core arrays have the same length before proceeding.
+        num_points = len(snn_labels)
+        if not (len(final_labels) == len(final_probs) == len(noise_mask) == num_points):
+            raise ValueError("Array length mismatch in _mint_new_clusters")
+
+        # 1. Compute SNN Cluster Sizes
+        # Calculate the number of points in each SNN cluster. This is crucial
+        # for filtering out small SNN clusters that are not large enough to
+        # become new, independent clusters.
+        snn_cluster_sizes_df = (
+            cudf.Series(snn_labels).astype("int32").value_counts().reset_index()
+            .rename(columns={"index": "snn", 0: "size"})
+        )
+
+        # 2. De-duplicate the SNN-to-HDBSCAN Mapping
+        # To perform a clean anti-join, we only need a unique set of SNN cluster
+        # IDs that have already been mapped. This prevents potential issues with
+        # the merge logic that follows.
+        unique_snn_to_hdb_map = snn_to_hdb_map.astype(
+            {"snn": "int32", "hdb": "int32"}
+        ).drop_duplicates(subset=["snn"], keep="first")
+
+        # 3. Identify Candidate SNN Clusters for Minting
+        # A candidate is an SNN cluster that meets three criteria:
+        #   a) It is not the SNN noise cluster (snn != -1).
+        #   b) It does not appear in the snn_to_hdb_map ('left_only').
+        #   c) Its size meets the minimum threshold defined in parameters.
+        snn_sizes_with_map_indicator = snn_cluster_sizes_df.merge(
+            unique_snn_to_hdb_map[["snn"]], on="snn", how="left", indicator=True
+        )
         
-        unmapped_snn = snn_sizes.merge(snn_to_hdb_map, on="snn", how="left")
-        new_cluster_candidates = unmapped_snn[
-            (unmapped_snn["snn"] != -1) & 
-            unmapped_snn["hdb"].isnull() &
-            (unmapped_snn["size"] >= params.min_newcluster_size)
+        candidate_snn_clusters_df = snn_sizes_with_map_indicator[
+            (snn_sizes_with_map_indicator["snn"] != -1) &
+            (snn_sizes_with_map_indicator["_merge"] == "left_only") & 
+            (snn_sizes_with_map_indicator["size"] >= int(params.min_newcluster_size))
         ]
         
-        if new_cluster_candidates.empty:
+        if candidate_snn_clusters_df.empty:
+            logger.debug("No SNN clusters met the criteria for minting.")
             return 0
+
+        # 4. Allocate a New, Unique Block of Cluster IDs
+        # To avoid collisions, we find the maximum existing cluster ID and start
+        # numbering our new clusters sequentially from that point.
+        max_existing_cluster_id = int(cp.max(final_labels)) if final_labels.size > 0 else -1
+        next_available_cluster_id = 0 if max_existing_cluster_id < 0 else max_existing_cluster_id + 1
         
-        # Assign new cluster IDs
-        next_id = int(final_labels.max()) + 1 if int(final_labels.max()) >= 0 else 0
-        candidate_ids = new_cluster_candidates["snn"].values
+        snn_cluster_ids_to_mint = candidate_snn_clusters_df["snn"].astype("int32").values
+        newly_minted_cluster_ids = cp.arange(
+            next_available_cluster_id,
+            next_available_cluster_id + len(snn_cluster_ids_to_mint),
+            dtype=cp.int32
+        )
+
+        # 5. Build a High-Performance Look-Up Table (LUT)
+        # The LUT maps an SNN cluster ID to its newly minted final cluster ID.
+        # This array-based mapping is significantly faster than a DataFrame join.
+        # The LUT must be large enough to hold the maximum SNN label value found
+        # in the entire dataset to prevent out-of-bounds errors during lookup.
+        max_snn_label_in_data = int(cp.max(snn_labels))
+        max_snn_in_candidates = int(cp.max(snn_cluster_ids_to_mint)) if len(snn_cluster_ids_to_mint) > 0 else -1
+        lut_size = max(max_snn_label_in_data, max_snn_in_candidates) + 1
         
-        new_id_map = cudf.DataFrame({
-            "snn": candidate_ids,
-            "new_id": cp.arange(next_id, next_id + len(candidate_ids), dtype=cp.int32),
-        })
+        snn_to_new_id_lut = cp.full(lut_size, -1, dtype=cp.int32)
+        snn_to_new_id_lut[snn_cluster_ids_to_mint] = newly_minted_cluster_ids
+
+        # 6. Apply the LUT to Propose New Labels for All Points
+        # Use the LUT to find the potential new cluster ID for every point based
+        # on its SNN label. Points whose SNN cluster is not a candidate will
+        # receive a -1.
+        proposed_new_labels_for_all_points = cp.full(num_points, -1, dtype=cp.int32)
+        points_with_valid_snn_labels_mask = (snn_labels >= 0) & (snn_labels < lut_size)
+        proposed_new_labels_for_all_points[points_with_valid_snn_labels_mask] = snn_to_new_id_lut[
+            snn_labels[points_with_valid_snn_labels_mask]
+        ]
+
+        # 7. Assign New Labels Only to Points Previously Marked as Noise
+        # The final assignment happens only if a point meets two conditions:
+        #   a) It was originally considered noise by HDBSCAN (noise_mask is True).
+        #   b) Its SNN cluster was selected for minting (proposed_new_labels != -1).
+        assignment_mask = noise_mask & (proposed_new_labels_for_all_points != -1)
         
-        # Apply new cluster assignments
-        snn_labels_df = cudf.DataFrame({"snn": snn_labels})
-        snn_labels_df = snn_labels_df.merge(new_id_map, on="snn", how="left")
-        new_ids = snn_labels_df["new_id"].fillna(-1).astype("int32").values
-        
-        assign_new_mask = noise_mask & (new_ids != -1)
-        final_labels[assign_new_mask] = new_ids[assign_new_mask]
-        
-        # Set confidence for new clusters
-        default_conf = float(params.default_rescue_conf)
-        final_probs[assign_new_mask] = default_conf
-        
-        return len(candidate_ids)
+        if assignment_mask.any():
+            final_labels[assignment_mask] = proposed_new_labels_for_all_points[assignment_mask]
+            final_probs[assignment_mask] = cp.asarray(
+                float(params.default_rescue_conf), dtype=cp.float32
+            )
+
+        # 8. Count the Number of New Clusters Actually Used
+        # It's possible a candidate SNN cluster consisted entirely of non-noise
+        # points, so its new ID would never be assigned. This final count
+        # reflects the true number of new clusters that were successfully minted.
+        if assignment_mask.any():
+            num_clusters_actually_minted = int(cp.unique(final_labels[assignment_mask]).size)
+        else:
+            num_clusters_actually_minted = 0
+            
+        logger.debug(f"Minted {num_clusters_actually_minted:,} new clusters from unmapped SNN groups.")
+
+        return num_clusters_actually_minted
 
     # ========================================================================
     # PARAMETER GENERATION

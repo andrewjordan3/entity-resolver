@@ -101,7 +101,7 @@ class ClusterRefiner:
                 "No address information found (missing 'addr_normalized_key'). "
                 "Skipping cluster refinement - using initial clusters as final."
             )
-            gdf['final_cluster'] = gdf['cluster']
+            gdf['final_cluster'] = gdf['cluster'].fillna(-1).astype('int32')
             gdf['address_was_enriched'] = False
             return gdf
 
@@ -111,7 +111,7 @@ class ClusterRefiner:
         )
         
         # Initialize refinement tracking columns
-        gdf['final_cluster'] = gdf['cluster']
+        gdf['final_cluster'] = gdf['cluster'].fillna(-1).astype('int32')
         gdf['address_was_enriched'] = False
         
         # Perform sequential refinement steps
@@ -155,6 +155,7 @@ class ClusterRefiner:
         logger.info("Building canonical map from refined clusters...")
 
         # Filter to only clustered records, excluding noise points (cluster == -1).
+        gdf['final_cluster'] = gdf['final_cluster'].fillna(-1).astype('int32')
         clustered_records_gdf = gdf[gdf['final_cluster'] != -1].copy()
 
         if clustered_records_gdf.empty:
@@ -433,6 +434,7 @@ class ClusterRefiner:
         logger.debug("Starting cluster conflict detection and splitting...")
         
         # Track the maximum cluster ID to ensure new splits get unique IDs
+        gdf['final_cluster'] = gdf['final_cluster'].fillna(-1).astype('int32')
         current_max_cluster_id = int(gdf['final_cluster'].max())
         clusters_split_count = 0
         

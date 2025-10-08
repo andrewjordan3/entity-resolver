@@ -7,8 +7,9 @@ embeddings.
 
 import cupy
 import cupyx.scipy.sparse as cpx_sparse
+import numpy as np
 import logging
-from typing import Dict, List, Tuple, Union, Optional, Literal
+from typing import Dict, List, Tuple, Union, Optional, Literal, Any
 
 # Set up a logger for this module
 logger = logging.getLogger(__name__)
@@ -197,181 +198,166 @@ def center_kernel_matrix(
     kernel_matrix: cupy.ndarray,
     verify_symmetry: bool = True,
     symmetry_tolerance: float = 1e-6,
-    enforce_symmetry: bool = True
-) -> cupy.ndarray:
+    enforce_symmetry: bool = True,
+    return_centering_params: bool = False
+) -> Union[cupy.ndarray, Tuple[cupy.ndarray, Dict[str, Any]]]:
     """
     Applies double-centering transformation to a kernel (Gram) matrix.
-    
+
     Double-centering is essential for Kernel PCA and other kernel methods that require
     centered data in the implicit feature space. This transformation ensures that the
     feature vectors (which we never explicitly compute) have zero mean in the
     high-dimensional feature space induced by the kernel.
-    
+
     Mathematical Foundation:
     Given kernel matrix K where K[i,j] = φ(x_i)·φ(x_j) for some feature map φ,
     the centered kernel K_c corresponds to centered features φ_c(x) = φ(x) - μ_φ,
     where μ_φ is the mean of all φ(x_i).
-    
+
     The centering formula is:
-    K_c[i,j] = K[i,j] - (1/n)Σ_k K[i,k] - (1/n)Σ_k K[k,j] + (1/n²)Σ_k,l K[k,l]
-    
-    Or in matrix form:
     K_c = K - 1_n @ K - K @ 1_n + 1_n @ K @ 1_n
-    where 1_n is the (1/n) * ones(n,n) matrix
-    
+    where 1_n is the (1/n) * ones(n,n) matrix.
+
     Simplified implementation:
     K_c = K - row_means - col_means + grand_mean
-    
-    Applications:
-    - Kernel PCA: Required preprocessing step
-    - Kernel CCA (Canonical Correlation Analysis)
-    - Kernel Fisher Discriminant Analysis
-    - Any kernel method assuming centered features
-    
+
     Args:
         kernel_matrix: Square symmetric matrix of shape (n, n) containing kernel values.
-                      K[i,j] = kernel_function(x_i, x_j) for samples x_i, x_j.
-                      Common kernels: RBF, polynomial, linear, sigmoid.
         verify_symmetry: If True, checks that input matrix is symmetric.
-                        Set to False only if you're certain about symmetry.
         symmetry_tolerance: Maximum allowed deviation from symmetry when verifying.
-                           Accounts for floating-point errors.
         enforce_symmetry: If True, forces output to be exactly symmetric by averaging
                          with its transpose. Recommended to avoid numerical drift.
-    
+        return_centering_params: If True, returns a tuple of (centered_kernel, centering_params)
+                                where centering_params contains the means needed to center
+                                new test data.
+
     Returns:
-        centered_kernel: Double-centered kernel matrix of shape (n, n).
-                        Properties:
-                        - Symmetric (if enforce_symmetry=True)
-                        - Row sums ≈ 0
-                        - Column sums ≈ 0
-                        - Grand mean ≈ 0
-                        - Eigenvalues may be negative (normal for centered kernels)
-    
+        If return_centering_params is False:
+            centered_kernel: Double-centered kernel matrix of shape (n, n).
+        If return_centering_params is True:
+            Tuple of (centered_kernel, centering_params) where centering_params is a dict.
+
     Raises:
-        ValueError: If matrix is not square, not symmetric (when verify_symmetry=True),
-                   or has invalid dimensions.
+        ValueError: If matrix is not square, not symmetric, or contains invalid values.
         TypeError: If input is not a CuPy ndarray.
-    
-    Example:
-        >>> # Create an RBF kernel matrix
-        >>> X = cupy.random.randn(100, 10)  # 100 samples, 10 features
-        >>> pairwise_dists = cupy.sum((X[:, None] - X[None, :]) ** 2, axis=2)
-        >>> rbf_kernel = cupy.exp(-0.5 * pairwise_dists)  # RBF with gamma=0.5
-        >>> 
-        >>> # Center the kernel
-        >>> centered_kernel = center_kernel_matrix(rbf_kernel)
-        >>> 
-        >>> # Verify centering (should be near zero)
-        >>> print(f"Row mean: {cupy.abs(centered_kernel.mean(axis=1)).max():.2e}")
-        >>> print(f"Col mean: {cupy.abs(centered_kernel.mean(axis=0)).max():.2e}")
-        >>> print(f"Grand mean: {abs(centered_kernel.mean()):.2e}")
-    
-    Performance Notes:
-        - Time complexity: O(n²) for the centering operation
-        - Memory: Requires temporary arrays for means (negligible compared to kernel matrix)
-        - For very large matrices (n > 10,000), consider using float32 precision
-    
-    Numerical Stability:
-        - Enforcing symmetry prevents accumulation of rounding errors
-        - For ill-conditioned kernels, centered eigenvalues may become slightly negative
-        - This is normal and doesn't indicate an error
     """
-    
     # Step 1: Validate input type and shape
     if not isinstance(kernel_matrix, cupy.ndarray):
         raise TypeError(
             f"kernel_matrix must be a CuPy ndarray, got {type(kernel_matrix).__name__}"
         )
-    
     if kernel_matrix.ndim != 2:
         raise ValueError(
             f"Kernel matrix must be 2-dimensional, got shape {kernel_matrix.shape}"
         )
-    
     n_rows, n_cols = kernel_matrix.shape
     if n_rows != n_cols:
         raise ValueError(
             f"Kernel matrix must be square. Got shape ({n_rows}, {n_cols})"
         )
-    
     if n_rows == 0:
         raise ValueError("Cannot center an empty matrix")
-    
-    # Step 2: Verify symmetry if requested (important for kernel matrices)
+
+    # Preserve the original dtype for computations, promoting if necessary
+    working_dtype = kernel_matrix.dtype
+    if working_dtype not in [cupy.float32, cupy.float64]:
+        logger.warning(
+            f"Converting kernel matrix from {working_dtype} to float64 for numerical stability"
+        )
+        working_dtype = cupy.float64
+        kernel_matrix = kernel_matrix.astype(working_dtype)
+
+    # Step 2: Verify symmetry if requested
     if verify_symmetry:
-        # Compute maximum absolute difference between K and K^T
-        symmetry_error = float(cupy.max(cupy.abs(kernel_matrix - kernel_matrix.T)))
-        
-        if symmetry_error > symmetry_tolerance:
-            raise ValueError(
-                f"Kernel matrix is not symmetric. Maximum asymmetry: {symmetry_error:.2e} "
-                f"(tolerance: {symmetry_tolerance:.2e}). "
-                "Kernel matrices must be symmetric by definition. "
-                "Check your kernel computation or set verify_symmetry=False to skip."
+        asymmetry_matrix = kernel_matrix - kernel_matrix.T
+        symmetry_error = float(cupy.max(cupy.abs(asymmetry_matrix)))
+        matrix_scale = float(cupy.max(cupy.abs(kernel_matrix)))
+        adaptive_tolerance = max(symmetry_tolerance, symmetry_tolerance * matrix_scale)
+
+        if symmetry_error > adaptive_tolerance:
+            relative_error = symmetry_error / max(1e-10, matrix_scale)
+            if relative_error < 1e-3:  # Less than 0.1% relative error
+                logger.warning(
+                    f"Kernel matrix has small asymmetry (absolute: {symmetry_error:.2e}, "
+                    f"relative: {relative_error:.2e}). Symmetrizing before centering."
+                )
+                kernel_matrix = (kernel_matrix + kernel_matrix.T) * 0.5
+            else:
+                raise ValueError(
+                    f"Kernel matrix is not symmetric. Maximum asymmetry: {symmetry_error:.2e} "
+                    f"(relative: {relative_error:.2e}, tolerance: {adaptive_tolerance:.2e})."
+                )
+    
+    # Step 3: Check for NaN or Inf values
+    if cupy.any(cupy.isnan(kernel_matrix)):
+        raise ValueError("Kernel matrix contains NaN values")
+    if cupy.any(cupy.isinf(kernel_matrix)):
+        raise ValueError("Kernel matrix contains infinite values")
+
+    # Step 4: Check for potentially problematic constant-like Gram matrices
+    # This detects a specific case where a cosine similarity matrix has collapsed,
+    # leading to a near-zero centered matrix, which is usually not intended.
+    diag_is_one = bool(cupy.allclose(cupy.diag(kernel_matrix), 1.0, rtol=1e-3, atol=1e-3))
+    if n_rows > 1 and diag_is_one:
+        offdiag_mask = ~cupy.eye(n_rows, dtype=bool)
+        scale = float(cupy.max(cupy.abs(kernel_matrix)))
+        # Use float64 for std dev calculation for better precision
+        offdiag_std = float(cupy.std(kernel_matrix[offdiag_mask], dtype=cupy.float64))
+
+        # Check if the standard deviation of off-diagonal elements is negligible
+        if offdiag_std <= (1e-6 * (scale if scale > 0.0 else 1.0)):
+            logger.warning(
+                "Kernel matrix resembles a cosine Gram matrix with nearly constant "
+                "off-diagonals and a diagonal of 1s. Centering this matrix will "
+                "result in a near-zero matrix. This may indicate collapsed embeddings "
+                "or poorly chosen kernel parameters."
             )
-        elif symmetry_error > 0:
-            logger.debug(
-                f"Minor asymmetry detected: {symmetry_error:.2e} "
-                "(within tolerance, will be corrected)"
-            )
-    
-    # Step 3: Compute the mean of each row
-    # keepdims=True maintains shape (n, 1) for broadcasting
-    # This represents the average kernel value between each sample and all others
-    row_means = kernel_matrix.mean(axis=1, keepdims=True)
-    
-    # Step 4: Compute the mean of each column
-    # keepdims=True maintains shape (1, n) for broadcasting
-    # Due to symmetry, col_means should equal row_means.T, but we compute separately
-    # to handle potential numerical differences
-    col_means = kernel_matrix.mean(axis=0, keepdims=True)
-    
-    # Step 5: Compute the grand mean (average of all kernel values)
-    # This represents the average kernel value across all sample pairs
-    grand_mean = float(kernel_matrix.mean())
-    
-    # Log statistics for debugging and analysis
+
+    # Step 5: Compute means using high-precision float64 for accuracy
+    row_means = kernel_matrix.mean(axis=1, keepdims=True, dtype=cupy.float64)
+    col_means = kernel_matrix.mean(axis=0, keepdims=True, dtype=cupy.float64)
+    grand_mean = float(kernel_matrix.mean(dtype=cupy.float64))
+
     logger.debug(
-        f"Centering statistics: "
-        f"grand_mean={grand_mean:.4f}, "
-        f"row_mean_range=[{float(row_means.min()):.4f}, {float(row_means.max()):.4f}], "
-        f"col_mean_range=[{float(col_means.min()):.4f}, {float(col_means.max()):.4f}]"
+        f"Centering statistics: grand_mean={grand_mean:.6f}, "
+        f"row_mean_range=[{float(row_means.min()):.6f}, {float(row_means.max()):.6f}]"
     )
-    
+
     # Step 6: Apply the double-centering formula
-    # K_centered = K - row_means - col_means + grand_mean
-    # Broadcasting handles the dimension alignment automatically
-    centered_kernel = kernel_matrix - row_means - col_means + grand_mean
-    
+    centered_kernel = (
+        kernel_matrix
+        - row_means.astype(working_dtype)
+        - col_means.astype(working_dtype)
+        + working_dtype(grand_mean)
+    )
+
     # Step 7: Enforce perfect symmetry if requested
-    # Floating-point operations can introduce tiny asymmetries
-    # Average with transpose to ensure exact symmetry: (A + A^T) / 2
     if enforce_symmetry:
         centered_kernel = (centered_kernel + centered_kernel.T) * 0.5
         logger.debug("Symmetry enforced via averaging with transpose")
-    
-    # Step 8: Verify centering was successful (optional validation)
+
+    # Step 8: Verify centering was successful (for debugging)
     if logger.isEnabledFor(logging.DEBUG):
-        # Check that row/column means are near zero
         max_row_mean = float(cupy.abs(centered_kernel.mean(axis=1)).max())
         max_col_mean = float(cupy.abs(centered_kernel.mean(axis=0)).max())
-        final_grand_mean = float(cupy.abs(centered_kernel.mean()))
-        
-        logger.debug(
-            f"Post-centering verification: "
-            f"max_row_mean={max_row_mean:.2e}, "
-            f"max_col_mean={max_col_mean:.2e}, "
-            f"grand_mean={final_grand_mean:.2e}"
-        )
-        
-        if max_row_mean > 1e-5 or max_col_mean > 1e-5:
+        verification_tolerance = (1e-5 if working_dtype == cupy.float32 else 1e-10) * max(1.0, float(cupy.abs(kernel_matrix).max()))
+        if max_row_mean > verification_tolerance or max_col_mean > verification_tolerance:
             logger.warning(
-                "Centered kernel has larger than expected mean values. "
-                "This may indicate numerical instability in the input kernel."
+                f"Centered kernel has larger than expected mean values "
+                f"(max_row: {max_row_mean:.2e}, max_col: {max_col_mean:.2e}, "
+                f"tolerance: {verification_tolerance:.2e})."
             )
-    
-    return centered_kernel
+
+    # Step 9: Return results
+    if return_centering_params:
+        centering_params = {
+            'row_means': row_means.squeeze(),
+            'grand_mean': grand_mean,
+            'n_samples': n_rows
+        }
+        return centered_kernel, centering_params
+    else:
+        return centered_kernel
 
 
 def center_kernel_vector(
@@ -630,7 +616,7 @@ def center_kernel_vector(
 def get_top_k_positive_eigenpairs(
     symmetric_matrix: cupy.ndarray,
     k: int,
-    eigenvalue_threshold: float = 1e-6,
+    eigenvalue_threshold: float = 1e-8,
     verify_symmetry: bool = True
 ) -> Tuple[cupy.ndarray, cupy.ndarray]:
     """
@@ -644,12 +630,21 @@ def get_top_k_positive_eigenpairs(
     - For symmetric matrix A: A = V * Λ * V^T, where V contains eigenvectors and Λ contains eigenvalues
     - Positive eigenvalues indicate positive semi-definite components
     - Top eigenvalues capture the most variance/energy in the matrix
+    - Eigenvectors form an orthonormal basis for the eigenspace
+
+    Notes:
+      - Uses cupy.linalg.eigh (Hermitian solver). Eigenvalues are returned in ascending order,
+        so we flip once (no redundant argsort).
+      - If verify_symmetry=True and asymmetry is detected but small, the matrix is symmetrized 
+        as (A + A^T)/2 to improve numerical stability
+      - Padded columns in eigenvectors are zero columns (not orthonormal by definition).
     
     Use Cases:
     - Principal Component Analysis (PCA)
     - Spectral clustering
     - Dimensionality reduction
     - Covariance matrix analysis
+    - Kernel methods and spectral embeddings
     
     Args:
         symmetric_matrix: Square symmetric matrix of shape (n, n). 
@@ -658,7 +653,7 @@ def get_top_k_positive_eigenpairs(
            (will be zero-padded).
         eigenvalue_threshold: Minimum eigenvalue to consider as "positive".
                              Values below this are treated as numerical zeros.
-                             Default: 1e-6 (suitable for float32 precision).
+                             Default: 1e-8 (suitable for float32/float64 precision).
         verify_symmetry: If True, verifies matrix symmetry before decomposition.
                         Set to False if you're certain the matrix is symmetric
                         to save computation time.
@@ -676,6 +671,7 @@ def get_top_k_positive_eigenpairs(
     Raises:
         ValueError: If matrix is not square, not symmetric (when verify_symmetry=True),
                    or if k < 1.
+        TypeError: If input is not a CuPy ndarray.
         
     Example:
         >>> # Create a positive semi-definite matrix
@@ -688,7 +684,8 @@ def get_top_k_positive_eigenpairs(
     Performance Notes:
         - cupy.linalg.eigh is optimized for Hermitian/symmetric matrices (O(n^3))
         - For very large matrices (n > 5000), consider iterative methods if only
-          a few eigenpairs are needed
+          a few eigenpairs are needed (e.g., cupy.sparse.linalg.eigsh)
+        - Memory usage: O(n^2) for the eigenvector matrix
     """
     
     # Step 1: Input validation - catch errors early
@@ -705,15 +702,38 @@ def get_top_k_positive_eigenpairs(
     if k < 1:
         raise ValueError(f"k must be at least 1, got {k}")
     
-    # Step 2: Verify symmetry if requested (important for numerical stability)
+    # Determine the working dtype (preserve original precision)
+    working_dtype = symmetric_matrix.dtype
+    if working_dtype not in [cupy.float32, cupy.float64]:
+        # If not already float, convert to float64 for better precision
+        working_dtype = cupy.float64
+        symmetric_matrix = symmetric_matrix.astype(working_dtype)
+    
+    # Step 2: Verify and potentially fix symmetry if requested
     if verify_symmetry:
         # Check if A ≈ A^T within numerical tolerance
-        symmetry_error = cupy.max(cupy.abs(symmetric_matrix - symmetric_matrix.T))
-        if symmetry_error > 1e-5:
-            raise ValueError(
-                f"Matrix is not symmetric. Maximum asymmetry: {float(symmetry_error):.2e}. "
-                "Set verify_symmetry=False to skip this check if you're certain."
-            )
+        asymmetry_matrix = symmetric_matrix - symmetric_matrix.T
+        max_asymmetry = float(cupy.max(cupy.abs(asymmetry_matrix)))
+        
+        # Set tolerance based on dtype and matrix scale
+        matrix_scale = float(cupy.max(cupy.abs(symmetric_matrix)))
+        relative_tolerance = 1e-5 if working_dtype == cupy.float32 else 1e-10
+        absolute_tolerance = relative_tolerance * max(1.0, matrix_scale)
+        
+        if max_asymmetry > absolute_tolerance:
+            # Check if we can symmetrize (small asymmetry)
+            if max_asymmetry < 1e-3 * matrix_scale:
+                logger.warning(
+                    f"Matrix has small asymmetry (max={max_asymmetry:.2e}). "
+                    f"Symmetrizing as (A + A^T)/2 for numerical stability."
+                )
+                symmetric_matrix = (symmetric_matrix + symmetric_matrix.T) / 2.0
+            else:
+                raise ValueError(
+                    f"Matrix is not symmetric. Maximum asymmetry: {max_asymmetry:.2e} "
+                    f"(relative: {max_asymmetry/max(1e-10, matrix_scale):.2e}). "
+                    "Set verify_symmetry=False to skip this check if you're certain."
+                )
     
     # Step 3: Warn if k exceeds matrix dimension (will require padding)
     matrix_size = symmetric_matrix.shape[0]
@@ -724,21 +744,20 @@ def get_top_k_positive_eigenpairs(
         )
     
     # Step 4: Perform eigendecomposition
-    # Convert to float32 for GPU efficiency (float64 is often overkill and slower)
     # eigh is specifically optimized for Hermitian (symmetric real) matrices
     try:
-        eigenvalues, eigenvectors = cupy.linalg.eigh(
-            symmetric_matrix.astype(cupy.float32)
-        )
+        eigenvalues, eigenvectors = cupy.linalg.eigh(symmetric_matrix)
     except cupy.linalg.LinAlgError as e:
         logger.error(f"Eigendecomposition failed: {e}")
-        raise ValueError(f"Failed to decompose matrix. It may be singular or ill-conditioned: {e}")
+        raise ValueError(
+            f"Failed to decompose matrix. It may be singular or ill-conditioned: {e}"
+        )
     
     # Step 5: Sort eigenvalues and eigenvectors in descending order
     # eigh returns eigenvalues in ascending order, so we reverse
-    descending_indices = cupy.argsort(eigenvalues)[::-1]
-    sorted_eigenvalues = eigenvalues[descending_indices]
-    sorted_eigenvectors = eigenvectors[:, descending_indices]
+    # Use negative indices for more efficient reversal
+    sorted_eigenvalues = eigenvalues[::-1]
+    sorted_eigenvectors = eigenvectors[:, ::-1]
     
     # Step 6: Filter for positive eigenvalues (above numerical threshold)
     positive_mask = sorted_eigenvalues > eigenvalue_threshold
@@ -752,13 +771,14 @@ def get_top_k_positive_eigenpairs(
             "Returning zero matrices."
         )
         return (
-            cupy.zeros((matrix_size, k), dtype=cupy.float32),
-            cupy.zeros(k, dtype=cupy.float32)
+            cupy.zeros((matrix_size, k), dtype=working_dtype),
+            cupy.zeros(k, dtype=working_dtype)
         )
     
-    # Step 8: Extract positive eigenpairs
-    positive_eigenvalues = sorted_eigenvalues[positive_mask]
-    positive_eigenvectors = sorted_eigenvectors[:, positive_mask]
+    # Step 8: Extract positive eigenpairs efficiently
+    # Instead of boolean indexing, use explicit slicing for better performance
+    positive_eigenvalues = sorted_eigenvalues[:num_positive]
+    positive_eigenvectors = sorted_eigenvectors[:, :num_positive]
     
     # Log the eigenvalue spectrum for debugging
     logger.debug(
@@ -771,8 +791,8 @@ def get_top_k_positive_eigenpairs(
     # Step 9: Return exactly k components (trim or pad as needed)
     if num_positive >= k:
         # We have enough positive eigenpairs - return the top k
-        final_eigenvectors = positive_eigenvectors[:, :k]
-        final_eigenvalues = positive_eigenvalues[:k]
+        final_eigenvectors = positive_eigenvectors[:, :k].astype(working_dtype)
+        final_eigenvalues = positive_eigenvalues[:k].astype(working_dtype)
         
         logger.debug(f"Returning top {k} of {num_positive} positive eigenpairs")
         
@@ -791,7 +811,7 @@ def get_top_k_positive_eigenpairs(
             pad_width=((0, 0), (0, pad_width)),
             mode='constant',
             constant_values=0
-        )
+        ).astype(working_dtype)
         
         # Pad eigenvalues with zeros
         final_eigenvalues = cupy.pad(
@@ -799,7 +819,20 @@ def get_top_k_positive_eigenpairs(
             pad_width=(0, pad_width),
             mode='constant',
             constant_values=0
+        ).astype(working_dtype)
+    
+    # Optional: Verify orthonormality of non-padded eigenvectors (for debugging)
+    if logger.isEnabledFor(logging.DEBUG) and num_positive > 0:
+        actual_k = min(k, num_positive)
+        orthogonality_check = cupy.eye(actual_k, dtype=working_dtype) - (
+            final_eigenvectors[:, :actual_k].T @ final_eigenvectors[:, :actual_k]
         )
+        max_orthogonality_error = float(cupy.max(cupy.abs(orthogonality_check)))
+        if max_orthogonality_error > 1e-5:
+            logger.warning(
+                f"Eigenvectors may not be perfectly orthonormal. "
+                f"Max error: {max_orthogonality_error:.2e}"
+            )
     
     return final_eigenvectors, final_eigenvalues
 
@@ -838,91 +871,149 @@ def balance_feature_streams(
 
 def compute_average_gram_matrix(
     normalized_embeddings: List[cupy.ndarray],
-    sample_indices: cupy.ndarray
+    sample_indices: cupy.ndarray,
+    verify_normalization: bool = True
 ) -> cupy.ndarray:
     """
-    Computes the average Gram matrix (cosine similarity matrix) across multiple embedding runs.
-    
-    This function calculates the average pairwise cosine similarities between selected samples
-    across an ensemble of embedding representations. Since the embeddings are pre-normalized,
-    the cosine similarity reduces to a simple dot product operation.
-    
+    Computes the average Gram matrix (cosine similarity) from multiple embedding runs.
+
+    This function is optimized for GPUs by stacking all embedding runs into a single
+    3D array and using batch matrix multiplication to compute all Gram matrices
+    simultaneously, avoiding Python for-loops for maximum performance.
+
     Mathematical Foundation:
-    - For normalized vectors u and v: cos(θ) = u·v / (||u|| * ||v||) = u·v (when ||u|| = ||v|| = 1)
-    - Gram matrix G = X @ X^T, where X is the matrix of sample vectors
-    - Average Gram = (1/n_runs) * Σ(G_i) for i in [1, n_runs]
-    
+    - For normalized vectors u and v: cos(θ) = u·v / (||u|| * ||v||) = u·v
+    - Gram matrix G_i for run i = X_i @ X_i^T, where X_i is the matrix of samples.
+    - Average Gram = (1/n_runs) * Σ(G_i), computed via cupy.mean on the batch.
+    - The resulting matrix is symmetric with diagonal elements ≈ 1.0.
+
     Args:
-        normalized_embeddings: List of embedding matrices, each of shape (n_total_samples, embedding_dim).
-                              Each matrix represents one run/iteration of the embedding process.
-                              IMPORTANT: Embeddings must be L2-normalized (unit vectors).
-        sample_indices: 1D array of indices selecting which samples to include in the Gram matrix.
-                       Shape: (n_samples,), where n_samples <= n_total_samples.
-    
+        normalized_embeddings: A list of L2-normalized embedding matrices. Each
+                               matrix must be a CuPy array of shape
+                               (n_total_samples, embedding_dim).
+        sample_indices: A 1D CuPy or NumPy array of integer indices specifying which
+                        samples to include in the Gram matrix calculation.
+        verify_normalization: If True, a random subset of embeddings is checked for
+                              proper L2 normalization. Disable for performance if
+                              you are certain they are normalized.
+
     Returns:
-        average_gram: Symmetric matrix of shape (n_samples, n_samples) containing the average
-                     cosine similarities. Element [i,j] represents the average cosine similarity
-                     between sample i and sample j across all embedding runs.
-                     Diagonal elements will be ~1.0 (self-similarity).
-    
+        A symmetric CuPy array of shape (n_samples, n_samples) representing the
+        average cosine similarity matrix. Element [i, j] is the average cosine
+        similarity between sample i and sample j across all runs.
+
     Raises:
-        ValueError: If normalized_embeddings is empty or if sample_indices contains invalid indices.
-        
-    Example:
-        >>> # Create 3 runs of normalized embeddings for 100 samples with 64 dimensions
-        >>> embeddings = [cupy.random.randn(100, 64) for _ in range(3)]
-        >>> embeddings = [e / cupy.linalg.norm(e, axis=1, keepdims=True) for e in embeddings]
-        >>> # Select samples 10, 20, 30, 40, 50
-        >>> indices = cupy.array([10, 20, 30, 40, 50])
-        >>> avg_gram = compute_average_gram_matrix(embeddings, indices)
-        >>> print(avg_gram.shape)  # Output: (5, 5)
+        ValueError: If inputs are empty, have inconsistent shapes, contain invalid
+                    indices, or if embeddings are found to be poorly normalized.
+        TypeError: If inputs are not of the expected types (list of CuPy arrays).
+
+    Performance Notes:
+        - This vectorized approach is significantly faster than a looped approach.
+        - Memory usage is higher, as it creates an intermediate 3D array of shape
+          (n_runs, n_samples, n_samples). For extremely large `n_runs` or `n_samples`
+          where memory is a constraint, a looped approach may be necessary.
+        - Complexity: O(n_runs * n_samples^2 * embedding_dim), but with much better
+          constants due to GPU parallelism.
     """
+    # --- Step 1: Comprehensive Input Validation ---
+    if not isinstance(normalized_embeddings, list) or not normalized_embeddings:
+        raise ValueError("normalized_embeddings must be a non-empty list of CuPy arrays.")
+
+    if not isinstance(sample_indices, (cupy.ndarray, np.ndarray)):
+        raise TypeError("sample_indices must be a CuPy or NumPy array.")
+
+    # Ensure sample_indices is a 1D CuPy array of integers
+    if isinstance(sample_indices, np.ndarray):
+        sample_indices = cupy.asarray(sample_indices)
+    if sample_indices.ndim != 1 or len(sample_indices) == 0:
+        raise ValueError("sample_indices must be a non-empty 1D array.")
+    if not cupy.issubdtype(sample_indices.dtype, cupy.integer):
+        logger.warning(f"Casting sample_indices from {sample_indices.dtype} to int32.")
+        sample_indices = sample_indices.astype(cupy.int32)
     
-    # Step 1: Validate inputs to prevent runtime errors
-    if not normalized_embeddings:
-        raise ValueError("normalized_embeddings list cannot be empty")
-    
-    if len(sample_indices) == 0:
-        raise ValueError("sample_indices cannot be empty")
-    
-    # Step 2: Extract dimensions for clarity and efficiency
-    n_selected_samples = len(sample_indices)  # Number of samples we're computing similarities for
-    n_embedding_runs = len(normalized_embeddings)  # Number of ensemble members
-    
-    # Step 3: Validate that indices are within bounds for all embedding runs
-    max_index = int(sample_indices.max())
-    for i, embedding_matrix in enumerate(normalized_embeddings):
-        if max_index >= embedding_matrix.shape[0]:
+    # --- Step 2: Dimension and Type Validation ---
+    n_selected_samples = len(sample_indices)
+    first_embedding = normalized_embeddings[0]
+
+    if not isinstance(first_embedding, cupy.ndarray):
+        raise TypeError("Elements of normalized_embeddings must be CuPy arrays.")
+
+    # Establish reference dimensions from the first embedding matrix.
+    n_total_samples, embedding_dimension = first_embedding.shape
+    working_dtype = first_embedding.dtype
+    if working_dtype not in [cupy.float32, cupy.float64]:
+        working_dtype = cupy.float32
+        logger.info(f"Embeddings are not float32/64. Using {working_dtype} for computation.")
+
+    # Validate index bounds and embedding consistency across all runs.
+    max_index = int(cupy.max(sample_indices))
+    if int(cupy.min(sample_indices)) < 0:
+        raise ValueError("sample_indices cannot contain negative values.")
+
+    for i, emb in enumerate(normalized_embeddings):
+        if not isinstance(emb, cupy.ndarray):
+            raise TypeError(f"Element {i} in normalized_embeddings is not a CuPy array.")
+        
+        # Check for consistent row and column counts.
+        if emb.shape[0] != n_total_samples:
             raise ValueError(
-                f"Sample index {max_index} exceeds embedding matrix size "
-                f"{embedding_matrix.shape[0]} in run {i}"
+                f"Inconsistent number of samples at index {i}. Expected {n_total_samples}, "
+                f"but got {emb.shape[0]}."
             )
-    
-    # Step 4: Initialize the accumulator matrix for averaging
-    # This will store the sum of all Gram matrices before averaging
-    gram_accumulator = cupy.zeros(
-        (n_selected_samples, n_selected_samples), 
-        dtype=cupy.float32
-    )
-    
-    # Step 5: Compute and accumulate Gram matrices for each embedding run
-    for _, embedding_matrix in enumerate(normalized_embeddings):
-        # Extract the subset of embeddings corresponding to our selected samples
-        # Shape: (n_selected_samples, embedding_dim)
-        selected_sample_vectors = embedding_matrix[sample_indices]
+        if emb.shape[1] != embedding_dimension:
+            raise ValueError(
+                f"Inconsistent embedding dimensions at index {i}. Expected {embedding_dimension}, "
+                f"but got {emb.shape[1]}."
+            )
+        if max_index >= emb.shape[0]:
+            raise ValueError(
+                f"Index {max_index} is out of bounds for embedding {i} "
+                f"(size: {emb.shape[0]})."
+            )
         
-        # Compute the Gram matrix (cosine similarity matrix) for this run
-        # Matrix multiplication: (n_samples, dim) @ (dim, n_samples) = (n_samples, n_samples)
-        # Since vectors are normalized, this gives us cosine similarities directly
-        current_gram_matrix = selected_sample_vectors @ selected_sample_vectors.T
-        
-        # Accumulate this run's Gram matrix
-        gram_accumulator += current_gram_matrix
+        # Optional: Verify that a sample of vectors are normalized
+        if verify_normalization:
+            norms = cupy.linalg.norm(emb[cupy.random.choice(emb.shape[0], 10)], axis=1)
+            if cupy.max(cupy.abs(norms - 1.0)) > 0.01:
+                logger.warning(f"Normalization issue detected in embedding {i}.")
+
+    # --- Step 3: Vectorized Gram Matrix Computation ---
+    # Stack the list of 2D arrays into a single 3D array.
+    # This is the key step that enables batch processing on the GPU.
+    # Shape: (n_runs, n_total_samples, embedding_dim)
+    try:
+        stacked_embeddings = cupy.stack(normalized_embeddings).astype(working_dtype)
+    except ValueError as e:
+        raise ValueError("Failed to stack embeddings. Ensure all matrices have the same shape.") from e
     
-    # Step 6: Compute the average by dividing by the number of runs
-    # Convert to float to ensure proper division (though cupy handles this well)
-    average_gram_matrix = gram_accumulator / float(n_embedding_runs)
+    # Select the specified samples from all runs in a single, batched operation.
+    # Shape: (n_runs, n_selected_samples, embedding_dim)
+    selected_embeddings = stacked_embeddings[:, sample_indices, :]
+
+    # Compute all Gram matrices at once using batched matrix multiplication.
+    # This performs (X @ X.T) for each run in parallel.
+    # Shape: (n_runs, n_selected_samples, n_selected_samples)
+    all_gram_matrices = selected_embeddings @ selected_embeddings.transpose((0, 2, 1))
+
+    # Average the Gram matrices along the 'runs' axis (axis=0).
+    average_gram_matrix = cupy.mean(all_gram_matrices, axis=0)
     
+    # --- Step 4: Finalization and Output Validation ---
+    # Clip to handle any minor floating-point errors.
+    average_gram_matrix = cupy.clip(average_gram_matrix, -1.0, 1.0)
+    
+    # Enforce perfect symmetry, correcting for potential numerical inaccuracies.
+    average_gram_matrix = (average_gram_matrix + average_gram_matrix.T) / 2.0
+    
+    # Validate output properties
+    diagonal_mean = float(cupy.diag(average_gram_matrix).mean())
+    if abs(diagonal_mean - 1.0) > 0.05:
+        logger.warning(
+            f"Diagonal mean is {diagonal_mean:.4f}, which deviates from the expected 1.0. "
+            "This may indicate normalization issues in the input embeddings."
+        )
+    logger.info(f"Average Gram matrix computed with shape {average_gram_matrix.shape} and diagonal mean {diagonal_mean:.4f}.")
+
     return average_gram_matrix
 
 
@@ -1392,9 +1483,7 @@ def create_consensus_embedding(
     
     normalized_embeddings = []
     for i, E in enumerate(embeddings_list):
-        # Convert to float32 for efficiency and normalize
-        E_float32 = E.astype(cupy.float32)
-        E_normalized = normalize_rows(E_float32)
+        E_normalized = normalize_rows(E)
         normalized_embeddings.append(E_normalized)
         
         # Check for numerical issues
@@ -1548,12 +1637,14 @@ def create_consensus_embedding(
     final_max = float(final_embedding.max())
     final_mean = float(final_embedding.mean())
     final_std = float(final_embedding.std())
+    variance_explained = eigenvalues[:n_components] / eigenvalues.sum()
     
     logger.debug(
         f"Consensus embedding completed successfully\n"
         f"  Output shape: {final_embedding.shape}\n"
         f"  Statistics: min={final_min:.4f}, max={final_max:.4f}, "
-        f"mean={final_mean:.4f}, std={final_std:.4f}"
+        f"mean={final_mean:.4f}, std={final_std:.4f}\n"
+        f"Variance explained by {n_components} components: {variance_explained.sum():.2%}"
     )
     
     return final_embedding
