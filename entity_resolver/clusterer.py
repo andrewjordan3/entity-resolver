@@ -894,14 +894,14 @@ class EntityClusterer:
         #   a) It is not the SNN noise cluster (snn != -1).
         #   b) It does not appear in the snn_to_hdb_map ('left_only').
         #   c) Its size meets the minimum threshold defined in parameters.
-        snn_sizes_with_map_indicator = snn_cluster_sizes_df.merge(
-            unique_snn_to_hdb_map[["snn"]], on="snn", how="left", indicator=True
-        )
+        # We perform an anti-join using .isin() to find SNN clusters that are
+        # not in the map, which circumvents the lack of 'indicator=True' in cudf.merge.
+        unmapped_snn_mask = ~snn_cluster_sizes_df["snn"].isin(unique_snn_to_hdb_map["snn"])
         
-        candidate_snn_clusters_df = snn_sizes_with_map_indicator[
-            (snn_sizes_with_map_indicator["snn"] != -1) &
-            (snn_sizes_with_map_indicator["_merge"] == "left_only") & 
-            (snn_sizes_with_map_indicator["size"] >= int(params.min_newcluster_size))
+        candidate_snn_clusters_df = snn_cluster_sizes_df[
+            (snn_cluster_sizes_df["snn"] != -1) &
+            unmapped_snn_mask &
+            (snn_cluster_sizes_df["size"] >= int(params.min_newcluster_size))
         ]
         
         if candidate_snn_clusters_df.empty:
