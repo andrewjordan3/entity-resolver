@@ -185,22 +185,19 @@ class ClusterMerger:
         # --- Validate and Filter Edges by State Compatibility ---
         logger.info("Validating similarity edges for state compatibility...")
 
-        # Create a helper DataFrame for state lookups from the original profiles.
-        cluster_states = cluster_profiles[['cluster_id', 'canonical_state']].copy()
-
-        def filter_edges_by_state(edge_df: cudf.DataFrame, states_df: cudf.DataFrame) -> cudf.DataFrame:
+        def filter_edges_by_state(edge_df: cudf.DataFrame, profiles_df: cudf.DataFrame) -> cudf.DataFrame:
             """Helper function to filter an edge list based on state compatibility."""
             if edge_df.empty:
                 return edge_df
             
             # Join to get the state for the source cluster
             edges_with_profiles = edge_df.merge(
-                states_df.rename(columns={'cluster_id': 'source_cluster_id', 'canonical_state': 'source_state', 'canonical_street_number': 'source_num'}),
+                profiles_df.rename(columns={'cluster_id': 'source_cluster_id', 'canonical_state': 'source_state', 'canonical_street_number': 'source_num'}),
                 on='source_cluster_id', how='left'
             )
             # Join to get the state for the destination cluster
             edges_with_profiles = edges_with_profiles.merge(
-                states_df.rename(columns={'cluster_id': 'destination_cluster_id', 'canonical_state': 'dest_state', 'canonical_street_number': 'dest_num'}),
+                profiles_df.rename(columns={'cluster_id': 'destination_cluster_id', 'canonical_state': 'dest_state', 'canonical_street_number': 'dest_num'}),
                 on='destination_cluster_id', how='left'
             )
             
@@ -220,8 +217,8 @@ class ClusterMerger:
             compatibility_mask = state_ok & street_num_ok
             return edge_df[compatibility_mask.values]
         
-        valid_name_edges = filter_edges_by_state(name_edges_with_cluster_ids, cluster_states)
-        valid_address_edges = filter_edges_by_state(address_edges_with_cluster_ids, cluster_states)
+        valid_name_edges = filter_edges_by_state(name_edges_with_cluster_ids, cluster_profiles)
+        valid_address_edges = filter_edges_by_state(address_edges_with_cluster_ids, cluster_profiles)
         
         logger.info(f"State validation complete. Valid name edges: {len(valid_name_edges)}, Valid address edges: {len(valid_address_edges)}")
 
