@@ -8,12 +8,12 @@ for clustering and matching operations.
 """
 
 import logging
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Union
 
 import cudf
 import cupy
 from cuml.feature_extraction.text import TfidfVectorizer, CountVectorizer
-from cuml.decomposition import PCA
+from cuml.decomposition import PCA, TruncatedSVD
 from sentence_transformers import SentenceTransformer
 import phonetics
 
@@ -550,49 +550,149 @@ class MultiStreamVectorizer:
         # Transfer back to GPU
         return cudf.Series(phonetic_text_pandas)
     
-    def _combine_streams(self, vector_streams: Dict[str, cupy.ndarray]) -> cupy.ndarray:
-        """
-        Normalizes, balances, and combines multiple vector streams.
+    # def _combine_streams(self, vector_streams: Dict[str, cupy.ndarray]) -> cupy.ndarray:
+    #     """
+    #     Normalizes, balances, and combines multiple vector streams.
 
-        This method first L2 normalizes each stream, then scales them by their
-        configured proportions before casting to float32 and concatenating.
-        A final L2 normalization is applied for UMAP compatibility.
+    #     This method first L2 normalizes each stream, then scales them by their
+    #     configured proportions before casting to float32 and concatenating.
+    #     A final L2 normalization is applied for UMAP compatibility.
+
+    #     Args:
+    #         vector_streams: Dictionary mapping stream names to vector arrays
+
+    #     Returns:
+    #         A single, combined, and normalized vector array.
+    #     """
+    #     logger.info(f"Normalizing, balancing, and combining {len(vector_streams)} feature streams...")
+        
+    #     # First, L2 normalize each stream
+    #     normalized_streams = {
+    #         name: normalize_rows(vectors) for name, vectors in vector_streams.items()
+    #     }
+        
+    #     # Second, balance the normalized streams by their proportions
+    #     balanced_vectors_list = balance_feature_streams(
+    #         vector_streams=normalized_streams,
+    #         proportions=self.config.stream_proportions
+    #     )
+        
+    #     # Cast all balanced streams to float32 before concatenation
+    #     final_streams = [vec.astype(cupy.float32, copy=False) for vec in balanced_vectors_list]
+    #     logger.debug(f"All streams cast to float32")
+        
+    #     # Concatenate the final streams
+    #     combined_vectors = cupy.concatenate(final_streams, axis=1)
+        
+    #     # Final L2 normalization for UMAP cosine distance
+    #     final_normalized_vectors = normalize_rows(combined_vectors)
+
+    #     logger.debug(
+    #         f"Combined vectors: shape={final_normalized_vectors.shape}, "
+    #         f"mean_norm={float(cupy.linalg.norm(final_normalized_vectors, axis=1).mean()):.4f}"
+    #     )
+        
+    #     return final_normalized_vectors
+
+    # *** Alternate feature stream combiner with another TruncatedSVD call
+    def _combine_streams(
+        self,
+        vector_streams: Dict[str, cupy.ndarray],
+        svd_n_components: int = 512,
+        return_svd_model: bool = False,
+    ) -> Union[cupy.ndarray, Tuple[cupy.ndarray, TruncatedSVD]]:
+        """
+        Normalize, balance, and fuse multiple feature streams; then reduce with cuML
+        TruncatedSVD and row-normalize the projection for cosine-metric downstream
+        steps (e.g., kNN/UMAP/HDBSCAN).
+
+        Processing stages:
+        1) Per-stream row-wise L2 normalization (via `normalize_rows`) to put each
+            stream into a cosine-stable geometry.
+        2) Stream balancing per `self.config.stream_proportions` to prevent any
+            single stream from dominating by scale.
+        3) Dense float32 concatenation into a single fused matrix of shape (N, D_total).
+        4) Row-wise L2 normalization of the fused matrix (again with `normalize_rows`)
+            so mixed streams share a common cosine space prior to SVD.
+        5) TruncatedSVD (GPU, no mean-centering) to `svd_n_components` dimensions,
+            producing a dense (N, K) projection.
+        6) Post-SVD row-wise L2 normalization to ensure cosine distances/similarities
+            are directly usable in the reduced space.
 
         Args:
-            vector_streams: Dictionary mapping stream names to vector arrays
+            vector_streams:
+                Mapping {stream_name -> CuPy dense array} where each array has shape
+                (N, d_i). Examples: {"tfidf": ..., "phonetic": ..., "semantic": ...}.
+            svd_n_components:
+                Target dimensionality K for TruncatedSVD (typ. 384–512 for text-heavy data).
+            return_svd_model:
+                If True, also return the fitted TruncatedSVD model for later transform-only use.
 
         Returns:
-            A single, combined, and normalized vector array.
+            If `return_svd_model` is False:
+                projected_normalized_vectors: cupy.ndarray of shape (N, svd_n_components),
+                row-L2 normalized (unit norm per row).
+            If `return_svd_model` is True:
+                (projected_normalized_vectors, svd_model)
+
+        Notes:
+            • TruncatedSVD does NOT mean-center, which preserves cosine geometry.
+            • Keep float32 unless you encounter numerical issues that justify float64.
+            • For reproducibility and tuning, you can add random_state / n_iter later.
         """
         logger.info(f"Normalizing, balancing, and combining {len(vector_streams)} feature streams...")
-        
-        # First, L2 normalize each stream
-        normalized_streams = {
-            name: normalize_rows(vectors) for name, vectors in vector_streams.items()
-        }
-        
-        # Second, balance the normalized streams by their proportions
-        balanced_vectors_list = balance_feature_streams(
-            vector_streams=normalized_streams,
-            proportions=self.config.stream_proportions
-        )
-        
-        # Cast all balanced streams to float32 before concatenation
-        final_streams = [vec.astype(cupy.float32, copy=False) for vec in balanced_vectors_list]
-        logger.debug(f"All streams cast to float32")
-        
-        # Concatenate the final streams
-        combined_vectors = cupy.concatenate(final_streams, axis=1)
-        
-        # Final L2 normalization for UMAP cosine distance
-        final_normalized_vectors = normalize_rows(combined_vectors)
 
-        logger.debug(
-            f"Combined vectors: shape={final_normalized_vectors.shape}, "
-            f"mean_norm={float(cupy.linalg.norm(final_normalized_vectors, axis=1).mean()):.4f}"
+        # ---- 1) Per-stream normalization -------------------------------------------------
+        # Each stream is row-L2 normalized using the project's robust `normalize_rows`.
+        per_stream_normalized: Dict[str, cupy.ndarray] = {
+            stream_name: normalize_rows(stream_vectors)
+            for stream_name, stream_vectors in vector_streams.items()
+        }
+
+        # ---- 2) Balance streams by configured proportions --------------------------------
+        # Scale each normalized stream by its configured weight before concatenation.
+        balanced_stream_arrays: List[cupy.ndarray] = balance_feature_streams(
+            vector_streams=per_stream_normalized,
+            proportions=self.config.stream_proportions,
         )
-        
-        return final_normalized_vectors
+
+        # ---- 3) Dense float32 concatenation ----------------------------------------------
+        # Standardize dtype for memory/speed and concatenate along feature axis.
+        balanced_stream_arrays = [arr.astype(cupy.float32, copy=False) for arr in balanced_stream_arrays]
+        fused_dense_vectors: cupy.ndarray = cupy.concatenate(balanced_stream_arrays, axis=1)
+
+        # ---- 4) Pre-SVD row-wise normalization ------------------------------------------
+        # Normalize rows of the fused matrix (again via `normalize_rows`) so the fused
+        # representation sits in a clean cosine space prior to SVD.
+        fused_dense_vectors = normalize_rows(fused_dense_vectors)
+        logger.debug("Fused matrix ready for SVD: shape=%s", fused_dense_vectors.shape)
+
+        # ---- 5) TruncatedSVD (cuML, GPU) -------------------------------------------------
+        # Reduce dimensionality without mean-centering (key for cosine geometry).
+        svd_model = TruncatedSVD(n_components=svd_n_components)
+        projected_vectors: cupy.ndarray = svd_model.fit_transform(fused_dense_vectors).astype(cupy.float32, copy=False)
+
+        # Optional: log cumulative explained variance ratio if available (attribute varies by cuML version).
+        evr = getattr(svd_model, "explained_variance_ratio_", None)
+        if evr is not None:
+            try:
+                cum_evr = float(cupy.asarray(evr).sum())
+                logger.info("TruncatedSVD: n_components=%d, cumulative explained variance ratio=%.4f",
+                            svd_n_components, cum_evr)
+            except Exception:
+                # Non-fatal; attribute shape/type varies across versions.
+                pass
+
+        # ---- 6) Post-SVD row-wise normalization -----------------------------------------
+        # Normalize rows of the SVD projection so cosine similarities/distances in the
+        # reduced space are ready for kNN/UMAP/HDBSCAN without further scaling.
+        projected_normalized_vectors: cupy.ndarray = normalize_rows(projected_vectors)
+        logger.debug("Projected matrix for downstream cosine metrics: shape=%s",
+                    projected_normalized_vectors.shape)
+
+        if return_svd_model:
+            return projected_normalized_vectors, svd_model
+        return projected_normalized_vectors
     
     def _reduce_feature_stream(
         self,

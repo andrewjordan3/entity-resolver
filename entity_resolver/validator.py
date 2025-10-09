@@ -638,7 +638,7 @@ class ClusterValidator:
         entities_with_profiles_df: cudf.DataFrame,
         all_profiles_df: cudf.DataFrame,
         margin_threshold: float = 0.1,
-        max_sample_size: int = 1000
+        max_sample_size: int = 500
     ) -> cudf.Series:
         """
         Identifies entities with a low assignment margin by comparing their current
