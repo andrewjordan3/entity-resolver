@@ -29,6 +29,7 @@ from .utils import (
     get_canonical_name_gpu, 
     get_best_address_gpu, 
     calculate_similarity_gpu,
+    check_state_compatibility
 )
 
 # Set up a logger for this module
@@ -356,9 +357,10 @@ class ClusterValidator:
         # Override 2: Enforce hard business rule (e.g., entity state must match profile state).
         if self.config.enforce_state_boundaries:
             logger.debug("Applying state boundary enforcement override.")
-            state_is_compatible = self._check_state_compatibility(
+            state_is_compatible = check_state_compatibility(
                 entities_with_profiles_df['addr_state'],
-                entities_with_profiles_df['profile_canonical_state']
+                entities_with_profiles_df['profile_canonical_state'],
+                self.config
             )
             # If compatibility is False, it's a mismatch. `~state_is_compatible` flags it.
             # We fill NaNs with True, assuming compatibility if data is missing.
@@ -1138,9 +1140,10 @@ class ClusterValidator:
         
         # --- Check state compatibility ---
         if self.config.enforce_state_boundaries:
-            pairs['state_compatible'] = self._check_state_compatibility(
+            pairs['state_compatible'] = check_state_compatibility(
                 pairs['addr_state'],
-                pairs['profile_canonical_state']
+                pairs['profile_canonical_state'],
+                self.config
             )
         else:
             pairs['state_compatible'] = True
@@ -1333,83 +1336,6 @@ class ClusterValidator:
         })
         
         return final_gdf
-
-    def _check_state_compatibility(
-        self,
-        entity_states: cudf.Series,
-        cluster_states: cudf.Series
-    ) -> cudf.Series:
-        """
-        Checks if two state series are compatible using a vectorized GPU approach.
-
-        States are compatible if:
-        1. They are identical.
-        2. One or both are missing/null.
-        3. They are in the configured `allow_neighboring_states` list.
-        """
-        # 1. Base case: states are compatible if they are identical or one is null.
-        states_match = (
-            (entity_states == cluster_states) |
-            entity_states.isna() |
-            cluster_states.isna()
-        )
-
-        # 2. If all pairs are already compatible, we are done.
-        if states_match.all() or not self.config.allow_neighboring_states:
-            return states_match
-
-        # 3. Handle neighboring states for the remaining mismatches.
-        # Isolate pairs that are not yet considered a match.
-        # Get mismatched indices
-        mismatched_indices = states_match[~states_match].index
-        
-        # Create DataFrame BUT PRESERVE THE INDEX
-        mismatched_df = cudf.DataFrame({
-            's1': entity_states.loc[mismatched_indices],
-            's2': cluster_states.loc[mismatched_indices]
-        }, index=mismatched_indices)  # KEEP THE ORIGINAL INDEX
-        
-        # Now track which indices have non-null values before dropna
-        non_null_mask = ~(mismatched_df['s1'].isna() | mismatched_df['s2'].isna())
-        
-        # Only process non-null pairs
-        mismatched_df_clean = mismatched_df[non_null_mask].reset_index().rename(columns={'index': 'original_index'})
-
-        if mismatched_df_clean.empty:
-            return states_match
-
-        logger.debug(f"Checking {len(mismatched_df)} mismatched state pairs against neighbors config.")
-
-        # Create a DataFrame of allowed neighbor pairs for efficient joining.
-        allowed_pairs_list = self.config.allow_neighboring_states
-        allowed_df = cudf.DataFrame(allowed_pairs_list, columns=['p1', 'p2'])
-
-        # Check for matches in both directions, e.g., (IL, WI) and (WI, IL).
-        # Merge 1: (s1, s2) -> (p1, p2)
-        merged1 = mismatched_df_clean.merge(allowed_df, left_on=['s1', 's2'], right_on=['p1', 'p2'], how='inner')
-        # Merge 2: (s1, s2) -> (p2, p1)
-        merged2 = mismatched_df_clean.merge(allowed_df, left_on=['s1', 's2'], right_on=['p2', 'p1'], how='inner')
-
-        # Use the preserved 'original_index' column ---
-        # Instead of using the incorrect .index attribute of the merged DataFrames,
-        # we now use the values from the column that faithfully tracked the original index.
-        allowed_indices_from_merge1 = merged1['original_index']
-        allowed_indices_from_merge2 = merged2['original_index']
-
-        # Combine indices of all pairs found in the allowed list.
-        # The index of the merged result corresponds to the index of mismatched_df,
-        # which in turn corresponds to the original index in the states_match series.
-        allowed_indices = cudf.concat([
-            allowed_indices_from_merge1, 
-            allowed_indices_from_merge2
-        ]).unique()
-
-        # Update the states_match series for the newly validated neighbors.
-        if not allowed_indices.empty:
-            allowed_idx = allowed_indices.astype(states_match.index.dtype).values
-            states_match.loc[allowed_idx] = True
-
-        return states_match
 
     @staticmethod
     def _own_gpu_df(

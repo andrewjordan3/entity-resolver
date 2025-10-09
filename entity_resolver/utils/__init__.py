@@ -68,7 +68,9 @@ from .clustering import (
 # Validation
 from .validation import (
     validate_no_duplicates,
-    validate_canonical_consistency
+    validate_canonical_consistency,
+    check_state_compatibility,
+    check_street_number_compatibility
 )
 
 # Matrix operations
@@ -120,6 +122,8 @@ __all__ = [
     # validation.py
     'validate_no_duplicates',
     'validate_canonical_consistency',
+    'check_state_compatibility',
+    'check_street_number_compatibility',
 
     # matrix_ops.py
     'ensure_finite_matrix',

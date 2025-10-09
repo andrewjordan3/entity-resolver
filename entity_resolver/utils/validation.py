@@ -9,6 +9,8 @@ import cudf
 import logging
 from typing import Optional
 
+from ..config import ValidationConfig
+
 # Set up a logger for this module.
 logger = logging.getLogger(__name__)
 
@@ -154,3 +156,131 @@ def validate_canonical_consistency(final_gdf: cudf.DataFrame) -> bool:
 
     logger.info("✅ Final validation PASSED: Canonical names and addresses are consistent.")
     return True
+
+def check_state_compatibility(
+    entity_states: cudf.Series,
+    cluster_states: cudf.Series,
+    config: ValidationConfig
+) -> cudf.Series:
+    """
+    Checks if two state series are compatible using a vectorized GPU approach.
+
+    Return a boolean Series (aligned to `entity_states.index`) indicating whether
+    each (entity_state, cluster_state) pair is considered compatible.
+
+    Compatibility definition:
+      • True if states are exactly equal.
+      • True if either state is missing/null (treat missing as compatible).
+      • True if the pair appears in `config.allow_neighboring_states` (either order).
+      • Otherwise False.
+
+    Notes/guarantees:
+      • Output index == input indices; no reordering.
+      • Neighbor checks are applied only if `config.enforce_state_boundaries` is True.
+      • Pairs with any null are treated as already compatible and are not sent to neighbor checks
+    """
+    # 1. Base case: states are compatible if they are identical or one is null.
+    states_match = (
+        (entity_states == cluster_states) |
+        entity_states.isna() |
+        cluster_states.isna()
+    )
+
+    # 2. If all pairs are already compatible, we are done.
+    if states_match.all() or not config.enforce_state_boundaries:
+        return states_match
+
+    # 3. Handle neighboring states for the remaining mismatches.
+    # Isolate pairs that are not yet considered a match.
+    # Get mismatched indices
+    mismatched_indices = states_match[~states_match].index
+    
+    # Create DataFrame BUT PRESERVE THE INDEX
+    mismatched_df = cudf.DataFrame({
+        's1': entity_states.loc[mismatched_indices],
+        's2': cluster_states.loc[mismatched_indices]
+    }, index=mismatched_indices)  # KEEP THE ORIGINAL INDEX
+    
+    # Now track which indices have non-null values before dropna
+    non_null_mask = ~(mismatched_df['s1'].isna() | mismatched_df['s2'].isna())
+    
+    # Only process non-null pairs
+    mismatched_df_clean = mismatched_df[non_null_mask].reset_index().rename(columns={'index': 'original_index'})
+
+    if mismatched_df_clean.empty:
+        return states_match
+
+    logger.debug(f"Checking {len(mismatched_df)} mismatched state pairs against neighbors config.")
+
+    # Create a DataFrame of allowed neighbor pairs for efficient joining.
+    allowed_pairs_list = config.allow_neighboring_states
+    allowed_df = cudf.DataFrame(allowed_pairs_list, columns=['p1', 'p2'])
+
+    # Check for matches in both directions, e.g., (IL, WI) and (WI, IL).
+    # Merge 1: (s1, s2) -> (p1, p2)
+    merged1 = mismatched_df_clean.merge(allowed_df, left_on=['s1', 's2'], right_on=['p1', 'p2'], how='inner')
+    # Merge 2: (s1, s2) -> (p2, p1)
+    merged2 = mismatched_df_clean.merge(allowed_df, left_on=['s1', 's2'], right_on=['p2', 'p1'], how='inner')
+
+    # Use the preserved 'original_index' column ---
+    # Instead of using the incorrect .index attribute of the merged DataFrames,
+    # we now use the values from the column that faithfully tracked the original index.
+    allowed_indices_from_merge1 = merged1['original_index']
+    allowed_indices_from_merge2 = merged2['original_index']
+
+    # Combine indices of all pairs found in the allowed list.
+    # The index of the merged result corresponds to the index of mismatched_df,
+    # which in turn corresponds to the original index in the states_match series.
+    allowed_indices = cudf.concat([
+        allowed_indices_from_merge1, 
+        allowed_indices_from_merge2
+    ]).unique()
+
+    # Update the states_match series for the newly validated neighbors.
+    if not allowed_indices.empty:
+        allowed_idx = allowed_indices.astype(states_match.index.dtype).values
+        states_match.loc[allowed_idx] = True
+
+    return states_match
+
+def check_street_number_compatibility(
+    source_numbers: cudf.Series,
+    target_numbers: cudf.Series,
+    threshold: int
+) -> cudf.Series:
+    """
+    Return a boolean Series (aligned to `source_numbers.index`) indicating whether
+    each pair of street numbers is considered compatible.
+
+    Compatibility rule (inclusive threshold):
+      • True if |source - target| ≤ `threshold`.
+      • True if either value is missing or non-numeric (treat unknown as compatible).
+      • False otherwise.
+
+    Inputs:
+      • `source_numbers`, `target_numbers` may be strings or numerics; messy values
+        like '123A' or '' are coerced to null.
+      • `threshold` is an integer tolerance in house-number units. The comparison is inclusive.
+
+    Notes:
+      • Output index == input indices; no reordering.
+      • This function is vectorized and GPU-friendly (cuDF/CuPy under the hood).
+
+    Returns:
+      cudf.Series[bool] of the same length as inputs.
+    """
+    # Convert series to numeric, coercing any non-numeric values (e.g., '123-A') to NaT.
+    # This is a robust way to handle potentially messy street number data.
+    source_numeric = cudf.to_numeric(source_numbers, errors='coerce')
+    target_numeric = cudf.to_numeric(target_numbers, errors='coerce')
+
+    # Check for nulls. If either number is null, we consider them compatible
+    # as we lack sufficient information to rule out a match.
+    is_either_null = source_numeric.isna() | target_numeric.isna()
+
+    # Calculate the absolute difference for the non-null pairs.
+    # We fillna with a value outside the threshold to ensure they evaluate to False.
+    diff = (source_numeric - target_numeric).abs().fillna(threshold + 1)
+
+    # A pair is compatible if the difference is within the threshold OR if one was null.
+    return (diff <= threshold) | is_either_null

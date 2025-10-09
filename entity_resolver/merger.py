@@ -23,6 +23,8 @@ from .utils import (
     get_best_address_gpu, 
     find_similar_pairs, 
     find_graph_components,
+    check_state_compatibility,
+    check_street_number_compatibility,
 )
 
 # Set up a logger for this module with descriptive name
@@ -179,11 +181,54 @@ class ClusterMerger:
             'source_cluster_id': positional_index_to_cluster_id.iloc[address_similarity_edges['source']].reset_index(drop=True),
             'destination_cluster_id': positional_index_to_cluster_id.iloc[address_similarity_edges['destination']].reset_index(drop=True)
         })
+
+        # --- Validate and Filter Edges by State Compatibility ---
+        logger.info("Validating similarity edges for state compatibility...")
+
+        # Create a helper DataFrame for state lookups from the original profiles.
+        cluster_states = cluster_profiles[['cluster_id', 'canonical_state']].copy()
+
+        def filter_edges_by_state(edge_df: cudf.DataFrame, states_df: cudf.DataFrame) -> cudf.DataFrame:
+            """Helper function to filter an edge list based on state compatibility."""
+            if edge_df.empty:
+                return edge_df
+            
+            # Join to get the state for the source cluster
+            edges_with_profiles = edge_df.merge(
+                states_df.rename(columns={'cluster_id': 'source_cluster_id', 'canonical_state': 'source_state', 'canonical_street_number': 'source_num'}),
+                on='source_cluster_id', how='left'
+            )
+            # Join to get the state for the destination cluster
+            edges_with_profiles = edges_with_profiles.merge(
+                states_df.rename(columns={'cluster_id': 'destination_cluster_id', 'canonical_state': 'dest_state', 'canonical_street_number': 'dest_num'}),
+                on='destination_cluster_id', how='left'
+            )
+            
+            # Run the compatibility check using the new standalone function
+            state_ok = check_state_compatibility(
+                edges_with_profiles['source_state'],
+                edges_with_profiles['dest_state'],
+                self.validation_config
+            )
+            street_num_ok = check_street_number_compatibility(
+                edges_with_profiles['source_num'],
+                edges_with_profiles['dest_num'],
+                self.validation_config.street_number_threshold
+            )
+            
+            # An edge is only valid if BOTH checks pass.
+            compatibility_mask = state_ok & street_num_ok
+            return edge_df[compatibility_mask.values]
         
+        valid_name_edges = filter_edges_by_state(name_edges_with_cluster_ids, cluster_states)
+        valid_address_edges = filter_edges_by_state(address_edges_with_cluster_ids, cluster_states)
+        
+        logger.info(f"State validation complete. Valid name edges: {len(valid_name_edges)}, Valid address edges: {len(valid_address_edges)}")
+
         # The core merge requirement: an edge exists only if clusters are similar in BOTH name AND address.
         # We find this by performing an inner merge on the two edge lists.
-        final_similarity_edges = address_edges_with_cluster_ids.merge(
-            name_edges_with_cluster_ids, 
+        final_similarity_edges = valid_address_edges.merge(
+            valid_name_edges, 
             on=['source_cluster_id', 'destination_cluster_id'],
             how='inner'
         )
@@ -762,7 +807,34 @@ class ClusterMerger:
             canonical_address = ""
 
         # =============================================================================
-        # Step 3: Assemble the Final Profile DataFrame
+        # Step 3: Determine the Canonical State
+        # =============================================================================
+        # Find the most frequently occurring, non-null state within the cluster group.
+        # This state will represent the canonical location of the entire cluster.
+        valid_states = cluster_group['addr_state'].dropna()
+
+        if not valid_states.empty:
+            # value_counts() is a highly efficient way to get counts for unique values.
+            # It returns a Series sorted by count, so the first index is the most common state.
+            state_counts = valid_states.value_counts()
+            canonical_state = state_counts.index[0]
+        else:
+            # If there are no valid states in the group, the canonical state is null.
+            canonical_state = None
+
+        # =============================================================================
+        # Step 4: Canonical Street Number
+        # =============================================================================
+        numeric_street_numbers = cudf.to_numeric(cluster_group['addr_street_number'], errors='coerce').dropna()
+        if not numeric_street_numbers.empty:
+            # Find the most common valid street number.
+            street_num_counts = numeric_street_numbers.value_counts()
+            canonical_street_number = street_num_counts.index[0]
+        else:
+            canonical_street_number = None
+
+        # =============================================================================
+        # Step 5: Assemble the Final Profile DataFrame
         # =============================================================================
         # The `groupby().apply()` construct requires that the function returns a
         # DataFrame. We create a single-row DataFrame containing the cluster's ID
@@ -777,7 +849,9 @@ class ClusterMerger:
         profile_df = cudf.DataFrame({
             'cluster_id': [cluster_id],
             'canonical_name_representation': [canonical_name],
-            'canonical_address_representation': [canonical_address]
+            'canonical_address_representation': [canonical_address],
+            'canonical_state': [canonical_state],
+            'canonical_street_number': [canonical_street_number]
         })
         
         return profile_df
