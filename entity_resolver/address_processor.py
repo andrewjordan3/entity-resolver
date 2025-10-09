@@ -279,7 +279,7 @@ class AddressProcessor:
         # Log a few samples for debugging and verification purposes.
         sample_size = min(3, len(combined_address))
         if sample_size > 0 and not combined_address.empty:
-            sample = combined_address.head(sample_size).to_pandas().tolist()
+            sample = combined_address.sample(sample_size).to_pandas().tolist()
             logger.debug(f"Combined address samples: {sample}")
 
         return combined_address
