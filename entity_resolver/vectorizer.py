@@ -1,930 +1,665 @@
 # entity_resolver/vectorizer.py
 """
-MultiStreamVectorizer module for transforming textual entity data into numerical embeddings.
+High-Level Orchestrator for Multi-Context Entity Embedding.
 
-This module provides sophisticated vectorization capabilities using multiple encoding
-streams (TF-IDF, phonetic, and semantic) to create rich representations of entity data
-for clustering and matching operations.
+This module provides the `EmbeddingOrchestrator`, the primary user-facing class
+for the entire vectorization pipeline. Its role is to manage the complex process
+of converting a DataFrame of raw entity data into three distinct, analysis-ready
+embedding matrices.
+
+Architectural Role
+------------------
+The orchestrator acts as a "manager" or "controller" in the vectorization process.
+It does not perform the low-level vectorization itself. Instead, it coordinates
+the work of three specialized "worker" classes (`SingleContextVectorizer`), one
+for each embedding context (combined, name, and address).
+
+Its key responsibilities are:
+1.  **Data Ingestion**: Accepts a `cudf.DataFrame` of entity records.
+2.  **Indexing and Alignment**: Creates a `canonical_gdf` with a stable, sequential
+    index (`canonical_id`) to guarantee a one-to-one correspondence between the
+    rows in the DataFrame and the rows in the output embedding matrices. This is
+    critical for preventing data misalignment issues.
+3.  **Text Stream Preparation**: Coordinates with the `embedding_streams` utility to
+    prepare all the specialized text inputs required by the downstream vectorizers.
+4.  **Process Delegation**: Manages three instances of `SingleContextVectorizer` and
+    delegates the `fit_transform` task for each context to the appropriate worker.
+5.  **State Management**: Stores the final, canonical embedding matrices as public
+    attributes (`combined_embeddings`, `name_embeddings`, `address_embeddings`) for
+    easy access.
+6.  **Model Persistence**: Provides `get_models` and `set_models` methods to
+    seamlessly save and load the trained state of all underlying models.
+
+Workflow
+--------
+1.  Instantiate `EmbeddingOrchestrator` with a `VectorizerConfig`.
+2.  Call the `.fit_transform(gdf)` method with your data.
+3.  The orchestrator performs all internal steps.
+4.  Access the results via `orchestrator.canonical_gdf`,
+    `orchestrator.combined_embeddings`, etc.
+
+Usage Example
+-------------
+```python
+from entity_resolver.config import VectorizerConfig
+from entity_resolver.embedding_orchestrator import EmbeddingOrchestrator
+import cudf
+
+# 1. Create a configuration object
+config = VectorizerConfig()
+
+# 2. Instantiate the orchestrator
+orchestrator = EmbeddingOrchestrator(config)
+
+# 3. Load your data into a cuDF DataFrame
+gdf = cudf.read_csv("your_entity_data.csv")
+
+# 4. Run the end-to-end vectorization process
+orchestrator.fit_transform(gdf)
+
+# 5. Access the aligned results
+aligned_data = orchestrator.canonical_gdf
+combined_vectors = orchestrator.combined_embeddings
+name_vectors = orchestrator.name_embeddings
+address_vectors = orchestrator.address_embeddings
+
+# `aligned_data.loc[i]` corresponds to `combined_vectors[i]`
+```
 """
 
 import logging
-from typing import Dict, Any, Tuple, List, Union
+from typing import Dict, Any, Optional, Tuple, Union
 
 import cudf
 import cupy
-from cuml.feature_extraction.text import TfidfVectorizer, CountVectorizer
-from cuml.decomposition import PCA, TruncatedSVD
-from sentence_transformers import SentenceTransformer
-import phonetics
 
-# Local package imports
 from .config import VectorizerConfig
-from .components import GPUTruncatedSVD
-from .utils import (
-    nfkc_normalize_series,
-    normalize_rows,
-    balance_feature_streams,
-    prepare_text_streams,
-)
+from .context_vectorizer import SingleContextVectorizer
+from .utils import prepare_text_streams
 
 # Set up module-level logger
 logger = logging.getLogger(__name__)
 
-
-class MultiStreamVectorizer:
+class EmbeddingOrchestrator:
     """
-    Orchestrate conversion of entity data into high-dimensional vectors.
+    Orchestrates multi-context vectorization of entity data.
 
-    This class implements a multi-stream approach to vectorization, combining:
-    1. TF-IDF (Syntactic): Character n-gram based similarity
-    2. Phonetic (Sound-based): Metaphone algorithm for sound similarity
-    3. Semantic (Meaning-based): Deep learning language models for semantic similarity
-
-    The streams are balanced and concatenated to create a comprehensive
-    representation that captures different aspects of entity similarity.
+    This high-level class manages the end-to-end process of converting a DataFrame
+    of entities into three distinct, canonical embedding matrices: `combined`, `name`,
+    and `address`. It ensures perfect alignment between the data and matrices via a
+    stable `canonical_gdf`.
 
     Attributes:
-        config (VectorizerConfig): Configuration for all vectorization parameters
-        trained_encoders (Dict[str, Any]): Fitted encoder models (TF-IDF, phonetic, semantic)
-        reduction_models (Dict[str, Any]): Fitted dimensionality reduction models
+        config (VectorizerConfig): The configuration object.
+        canonical_gdf (cudf.DataFrame): A DataFrame with a stable 'canonical_id' index,
+            ensuring alignment with the embedding matrices.
+        combined_embeddings (cupy.ndarray): Embeddings from name + address data.
+        name_embeddings (cupy.ndarray): Embeddings from name-only data.
+        address_embeddings (cupy.ndarray): Embeddings from address-only data.
     """
-    
     def __init__(self, config: VectorizerConfig):
         """
-        Initialize the vectorizer with configuration settings.
+        Initializes the EmbeddingOrchestrator.
 
         Args:
-            config: VectorizerConfig object containing all vectorization parameters
-                   including encoder settings, reduction parameters, and stream weights
+            config: A `VectorizerConfig` object containing all parameters for
+                    the vectorization and reduction pipeline.
         """
         self.config = config
-        self.trained_encoders: Dict[str, Any] = {}
-        self.reduction_models: Dict[str, Any] = {}
+        self.canonical_gdf: Optional[cudf.DataFrame] = None
+        self.combined_embeddings: Optional[cupy.ndarray] = None
+        self.name_embeddings: Optional[cupy.ndarray] = None
+        self.address_embeddings: Optional[cupy.ndarray] = None
+
+        # Instantiate three dedicated "worker" vectorizers, one for each context.
+        # This encapsulates the state (trained models) for each context cleanly.
+        self.combined_vectorizer = SingleContextVectorizer(config, 'combined')
+        self.name_vectorizer = SingleContextVectorizer(config, 'name')
+        self.address_vectorizer = SingleContextVectorizer(config, 'address')
         
-        logger.info(f"Initialized MultiStreamVectorizer with encoders: {config.encoders}")
-        logger.debug(f"Stream proportions: {config.stream_proportions}")
-        logger.debug(f"Semantic model: {config.semantic_model}")
+        logger.info("Initialized EmbeddingOrchestrator with 3 distinct context vectorizers.")
+        logger.debug(f"Orchestrator configured with final SVD components: {config.final_svd_components}")
 
-    def fit_transform(self, gdf: cudf.DataFrame) -> Tuple[cudf.DataFrame, cupy.ndarray]:
+    def fit_transform(self, gdf: cudf.DataFrame) -> None:
         """
-        Fit all vectorization models and transform data in one step.
+        Fits all models and transforms the data to create the three embedding matrices.
 
-        This method trains all specified encoders and reduction models on the
-        input data, then returns the vectorized representation.
+        This is the main entry point for the class. It executes the entire
+        vectorization pipeline from start to finish. The results (the canonical
+        DataFrame and the three embedding matrices) are stored as attributes on
+        the instance upon completion.
 
         Args:
-            gdf: Pre-processed cuDF DataFrame with 'normalized_text' column
-
-        Returns:
-            Tuple of (input DataFrame, combined vector matrix as cupy.ndarray)
-
-        Raises:
-            ValueError: If no valid encoders are specified
-            RuntimeError: If vectorization fails
+            gdf: The input `cudf.DataFrame` containing the raw, pre-processed
+                 entity data. It must contain the columns required by the
+                 `prepare_text_streams` function.
         """
-        logger.info("Starting fit_transform for vectorization")
-        return self._process_encoding(gdf, is_training=True)
+        if not isinstance(gdf, cudf.DataFrame) or gdf.empty:
+            logger.error("Input to fit_transform must be a non-empty cuDF DataFrame.")
+            raise ValueError("Input must be a non-empty cuDF DataFrame.")
 
-    def transform(self, gdf: cudf.DataFrame) -> Tuple[cudf.DataFrame, cupy.ndarray]:
-        """
-        Transform data using pre-fitted models.
+        logger.info(f"Starting embedding orchestration for {len(gdf):,} records.")
 
-        This method applies already-trained encoders and reduction models to
-        new data, maintaining consistency with the training phase.
+        # Step 1: Create the canonical DataFrame. This is a critical step for
+        # ensuring that the rows of the output matrices can always be reliably
+        # mapped back to the original data, even if the input gdf had a
+        # non-standard or non-unique index.
+        self.canonical_gdf = gdf.copy(deep=True)
+        self.canonical_gdf['canonical_id'] = cupy.arange(len(gdf))
+        self.canonical_gdf = self.canonical_gdf.set_index('canonical_id')
+        logger.debug("Created canonical_gdf with stable 'canonical_id' index for data-matrix alignment.")
 
-        Args:
-            gdf: Pre-processed cuDF DataFrame with 'normalized_text' column
+        # Step 2: Prepare all text streams for all three contexts using the utility.
+        # This call creates the specialized string inputs for every stream and context.
+        logger.info("Preparing text streams for all three contexts (combined, name, address)...")
+        all_streams = prepare_text_streams(
+            self.canonical_gdf,
+            use_address_in_encoding=self.config.use_address_in_encoding
+        )
+        logger.debug("Completed text stream preparation.")
 
-        Returns:
-            Tuple of (input DataFrame, combined vector matrix as cupy.ndarray)
+        # Step 3: Sequentially process each context. The orchestrator delegates the
+        # actual vectorization work to the specialized SingleContextVectorizer instances.
+        logger.info("--- Starting 'combined' context vectorization ---")
+        self.combined_embeddings = self.combined_vectorizer.fit_transform(all_streams.combined)
+        logger.info(f"--- Completed 'combined' context. Matrix shape: {self.combined_embeddings.shape} ---")
 
-        Raises:
-            RuntimeError: If models haven't been fitted yet
-            ValueError: If input data format is incompatible
-        """
-        logger.info("Starting transform for vectorization")
-        return self._process_encoding(gdf, is_training=False)
+        logger.info("--- Starting 'name' context vectorization ---")
+        self.name_embeddings = self.name_vectorizer.fit_transform(all_streams.name)
+        logger.info(f"--- Completed 'name' context. Matrix shape: {self.name_embeddings.shape} ---")
 
-    def _process_encoding(
+        logger.info("--- Starting 'address' context vectorization ---")
+        self.address_embeddings = self.address_vectorizer.fit_transform(all_streams.address)
+        logger.info(f"--- Completed 'address' context. Matrix shape: {self.address_embeddings.shape} ---")
+
+        logger.info("Embedding orchestration complete. All 3 embedding matrices are now available as attributes.")
+
+    def transform(
         self, 
-        gdf: cudf.DataFrame, 
-        is_training: bool
-    ) -> Tuple[cudf.DataFrame, cupy.ndarray]:
+        gdf: cudf.DataFrame
+    ) -> Tuple[cupy.ndarray, cupy.ndarray, cupy.ndarray]:
         """
-        Core logic for encoding entity data into numerical vectors.
+        Transforms new data using the already-fitted models.
 
-        This method coordinates the entire vectorization pipeline, processing
-        each stream independently then combining them into a unified representation.
+        This method is for inference. It takes a new DataFrame of entity data and
+        applies the pre-existing, trained vectorization pipeline to it. It does not
+        modify the internal state of the orchestrator (e.g., `canonical_gdf`).
 
         Args:
-            gdf: Input cuDF DataFrame with entity data
-            is_training: Whether to fit new models (True) or use existing ones (False)
+            gdf: A `cudf.DataFrame` containing new, unseen entity data to be transformed.
 
         Returns:
-            Tuple of (input DataFrame, combined vector matrix)
+            A tuple containing the three new embedding matrices in the order:
+            (combined_embeddings, name_embeddings, address_embeddings).
 
         Raises:
-            ValueError: If no valid encoders are configured or processed
+            RuntimeError: If the method is called before `fit_transform` has been
+                          run or before models have been loaded via `set_models`.
         """
-        operation_mode = "Training" if is_training else "Transforming"
-        logger.info(
-            f"{operation_mode} vectorization with {len(gdf):,} records "
-            f"using streams: {self.config.encoders}"
-        )
-        
-        # Step 1: Prepare base text by combining relevant fields
-        text_streams = prepare_text_streams(gdf)
-        phonetic_text = text_streams.combined.phonetic
-        semantic_text = text_streams.combined.semantic
-        tfidf_text = text_streams.combined.tfidf
-        logger.debug(f"Prepared base text for {len(gdf):,} records")
-        
-        # Step 2: Process each encoder stream independently
-        vector_streams = {}
-        
-        # TF-IDF stream for syntactic similarity
-        if 'tfidf' in self.config.encoders:
-            logger.debug("Processing TF-IDF stream...")
-            vector_streams['tfidf'] = self._encode_tfidf_stream(
-                tfidf_text, 
-                is_training
-            )
-            logger.info(f"TF-IDF stream shape: {vector_streams['tfidf'].shape}")
-            
-        # Phonetic stream for sound-based similarity
-        if 'phonetic' in self.config.encoders:
-            logger.debug("Processing phonetic stream...")
-            # Phonetic encoding works best on entity names only
-            vector_streams['phonetic'] = self._encode_phonetic_stream(
-                phonetic_text, 
-                is_training
-            )
-            logger.info(f"Phonetic stream shape: {vector_streams['phonetic'].shape}")
-            
-        # Semantic stream for meaning-based similarity
-        if 'semantic' in self.config.encoders:
-            logger.debug("Processing semantic stream...")
-            # Semantic encoding also works best on entity names only
-            vector_streams['semantic'] = self._encode_semantic_stream(
-                semantic_text, 
-                is_training
-            )
-            logger.info(f"Semantic stream shape: {vector_streams['semantic'].shape}")
-        
-        # Validate that at least one stream was processed
-        if not vector_streams:
-            raise ValueError(
-                "No valid encoders were specified or processed. "
-                f"Check configuration: {self.config.encoders}"
+        if not self._is_fitted:
+            raise RuntimeError(
+                "The orchestrator has not been fitted yet. "
+                "Call 'fit_transform' or 'set_models' before calling 'transform'."
             )
         
-        # Step 3: Balance and combine all streams into final vectors
-        combined_vectors = self._combine_streams(vector_streams)
-        
-        logger.info(
-            f"Vectorization complete. Final shape: {combined_vectors.shape} "
-            f"({combined_vectors.nbytes / 1e6:.2f} MB)"
-        )
-        
-        return gdf, combined_vectors
+        if not isinstance(gdf, cudf.DataFrame) or gdf.empty:
+            logger.error("Input to transform must be a non-empty cuDF DataFrame.")
+            raise ValueError("Input must be a non-empty cuDF DataFrame.")
 
-    def _prepare_text_streams(
+        logger.info(f"Transforming {len(gdf):,} new records using pre-fitted models.")
+
+        # Step 1: Prepare text streams for the new, incoming data.
+        logger.debug("Preparing text streams for the new data...")
+        all_streams = prepare_text_streams(
+            gdf,
+            use_address_in_encoding=self.config.use_address_in_encoding
+        )
+        logger.debug("Text stream preparation for new data complete.")
+
+        # Step 2: Delegate the transform task to each of the worker vectorizers.
+        # These calls will use the models that were trained during the `fit_transform` phase.
+        logger.info("--- Transforming 'combined' context ---")
+        combined_vectors = self.combined_vectorizer.transform(all_streams.combined)
+
+        logger.info("--- Transforming 'name' context ---")
+        name_vectors = self.name_vectorizer.transform(all_streams.name)
+
+        logger.info("--- Transforming 'address' context ---")
+        address_vectors = self.address_vectorizer.transform(all_streams.address)
+
+        logger.info("Transformation of new data complete.")
+        
+        return (combined_vectors, name_vectors, address_vectors)
+
+    def get_aligned_embeddings(
         self,
-        gdf: cudf.DataFrame, 
-    ) -> Dict[str, cudf.Series]:
+        data_slice: Union[cudf.DataFrame, cudf.Series],
+        validate_indices: bool = True,
+        include_data: bool = False
+    ) -> Union[Dict[str, cupy.ndarray], Tuple[cudf.DataFrame, Dict[str, cupy.ndarray]]]:
         """
-        Prepares distinct, optimized text streams for each vectorization strategy.
-
-        This function takes a DataFrame with pre-parsed name and address columns and
-        creates three specific text representations, each tailored to the needs of a
-        particular encoder:
-
-        1.  **Phonetic Text**: The entity name (`normalized_text`) only. Phonetic
-            algorithms are designed for names, and applying them to common address
-            terms (e.g., "street", "road") introduces noise.
-
-        2.  **Semantic Text**: A clean, natural-language phrase. It combines the entity
-            name with only the semantically meaningful parts of the address: street
-            name, city, and state. High-variance numerical identifiers like street
-            numbers and zip codes are excluded as they provide little semantic meaning
-            to models like BGE.
-
-        3.  **TF-IDF Text**: A comprehensive string for character n-gram analysis. It
-            includes all name and address components, as character-level patterns in
-            numerical data (like zip codes) can be a strong matching signal for TF-IDF.
-            The entity name is repeated three times to increase its weight in the
-            final vector.
-
-        Args:
-            gdf: A cuDF DataFrame containing `normalized_text` and the pre-parsed
-                `addr_*` columns.
-
-        Returns:
-            A dictionary mapping each stream name ('phonetic', 'semantic', 'tfidf')
-            to its corresponding, fully prepared cuDF Series of strings.
-        """
-        logger.debug("Preparing optimized text streams for vectorizers.")
+        Retrieves embedding matrix rows that align perfectly with a given data slice.
         
-        name_text = gdf['normalized_text'].fillna('').astype(str)
+        This is a critical utility for post-clustering analysis and downstream operations.
+        After running `fit_transform`, the `canonical_gdf` is typically filtered based on
+        cluster assignments, quality scores, or other criteria. This method ensures you get
+        the exact embedding vectors corresponding to your filtered data, maintaining perfect
+        row-to-row alignment.
         
-        # --- 1. Load Individual Address Components ---
-        if self.config.use_address_in_encoding:
-            logger.debug("Loading pre-parsed address columns.")
-            # Load each address column, filling any missing values with an empty string
-            # to ensure clean concatenation.
-            street_num = gdf['addr_street_number'].fillna('').astype(str)
-            street_name = gdf['addr_street_name'].fillna('').astype(str)
-            city = gdf['addr_city'].fillna('').astype(str)
-            state = gdf['addr_state'].fillna('').astype(str)
-            zip_code = gdf['addr_zip'].fillna('').astype(str)
+        The method is robust to different data slice formats:
+        - DataFrame with `canonical_id` as index
+        - DataFrame with `canonical_id` as a column (after reset_index)
+        - Series with `canonical_id` as index
+        
+        Performance Characteristics
+        ---------------------------
+        This method uses advanced integer array indexing on GPU arrays, which is highly
+        efficient even for large slices. The operation is O(n) where n is the size of
+        the data slice, not the original dataset size.
+        
+        Typical workflow:
+        1. orchestrator.fit_transform(gdf) creates canonical_gdf with canonical_id index
+        2. User performs clustering/filtering: filtered_gdf = canonical_gdf[canonical_gdf['cluster'] == 5]
+        3. User retrieves aligned embeddings: embeddings = orchestrator.get_aligned_embeddings(filtered_gdf)
+        4. Embeddings dict contains vectors in same order as filtered_gdf rows
+
+        Parameters
+        ----------
+        data_slice : cudf.DataFrame or cudf.Series
+            A subset of the orchestrator's `canonical_gdf`. Must contain `canonical_id`
+            values either as the index or as a column. The order of rows in this slice
+            determines the order of vectors in the returned embedding matrices.
             
-            # Log how many records actually have meaningful address data.
-            if 'addr_normalized_key' in gdf.columns:
-                non_empty_addresses = (gdf['addr_normalized_key'].notna() & (gdf['addr_normalized_key'] != '')).sum()
-                logger.debug(f"Found address information for {non_empty_addresses:,}/{len(gdf):,} records.")
-
-        else:
-            logger.debug("No address information will be used for encoding.")
-            # If not using addresses, create empty series to ensure concatenation works without errors.
-            empty_series = cudf.Series([''] * len(gdf), dtype='str', index=gdf.index)
-            street_num, street_name, city, state, zip_code = [empty_series] * 5
-
-        # --- 2. Create the Three Optimized Text Streams ---
-        
-        # Stream 1: Phonetic Text (Name only)
-        phonetic_text = name_text
-        logger.info("Created 'phonetic' text stream (name only).")
-
-        # Stream 2: Semantic Text (Name + Street Name + City + State)
-        semantic_address = (street_name + ' ' + city + ' ' + state)
-        semantic_text = (name_text + ' ' + semantic_address)
-        logger.info("Created 'semantic' text stream (name + semantic address parts).")
-
-        # Stream 3: TF-IDF Text (Weighted Name + All Address Parts)
-        weighted_name = (name_text + ' ' + name_text + ' ' + name_text)
-        full_address = (street_num + ' ' + street_name + ' ' + city + ' ' + state + ' ' + zip_code)
-        tfidf_text = (weighted_name + ' ' + full_address)
-        logger.info("Created 'tfidf' text stream (weighted name + full address).")
-        
-        # --- 3. Apply Final NFKC Normalization to All Streams ---
-        logger.debug("Applying final NFKC normalization to all text streams.")
-        # Assuming nfkc_normalize_series is a method of the same class
-        phonetic_text_normalized = nfkc_normalize_series(phonetic_text)
-        semantic_text_normalized = nfkc_normalize_series(semantic_text)
-        tfidf_text_normalized = nfkc_normalize_series(tfidf_text)
-        
-        return {
-            'phonetic': phonetic_text_normalized,
-            'semantic': semantic_text_normalized,
-            'tfidf': tfidf_text_normalized,
-        }
-    
-    def _encode_tfidf_stream(
-        self, 
-        text_series: cudf.Series, 
-        is_training: bool
-    ) -> cupy.ndarray:
-        """
-        Encode text using TF-IDF vectorization with dimensionality reduction.
-
-        This stream captures syntactic similarity through character n-grams,
-        making it robust to minor spelling variations and typos.
-
-        Args:
-            text_series: Text data to encode
-            is_training: Whether to fit new models
-
-        Returns:
-            Dense array of TF-IDF vectors after reduction
-        """
-        logger.info("Processing TF-IDF (syntactic) stream...")
-        
-        # Create high-dimensional sparse vectors from character n-grams
-        sparse_vectors = self._apply_tfidf_vectorizer(text_series, is_training)
-        logger.debug(
-            f"TF-IDF sparse vectors: shape={sparse_vectors.shape}, "
-            f"density={sparse_vectors.nnz / (sparse_vectors.shape[0] * sparse_vectors.shape[1]):.4f}"
-        )
-        
-        # Reduce to dense, lower-dimensional representation
-        dense_vectors = self._reduce_feature_stream(
-            vectors=sparse_vectors,
-            stream_name='tfidf',
-            is_training=is_training
-        )
-        
-        return dense_vectors
-    
-    def _encode_phonetic_stream(
-        self, 
-        text_series: cudf.Series, 
-        is_training: bool
-    ) -> cupy.ndarray:
-        """
-        Encode text using phonetic algorithms with dimensionality reduction.
-
-        This stream captures sound-based similarity using the Metaphone algorithm,
-        helpful for matching entities with similar pronunciations but different
-        spellings (e.g., "Smith" vs "Smythe").
-
-        Args:
-            text_series: Text data to encode
-            is_training: Whether to fit new models
-
-        Returns:
-            Dense array of phonetic vectors after reduction
-        """
-        logger.info("Processing Phonetic (sound-based) stream...")
-        
-        # Convert text to phonetic representation
-        phonetic_text_series = self._convert_to_phonetic(text_series)
-        logger.debug("Phonetic conversion complete")
-        
-        # Create sparse vectors from phonetic words
-        sparse_vectors = self._apply_phonetic_vectorizer(phonetic_text_series, is_training)
-        logger.debug(
-            f"Phonetic sparse vectors: shape={sparse_vectors.shape}, "
-            f"density={sparse_vectors.nnz / (sparse_vectors.shape[0] * sparse_vectors.shape[1]):.4f}"
-        )
-        
-        # Reduce to dense representation
-        dense_vectors = self._reduce_feature_stream(
-            vectors=sparse_vectors,
-            stream_name='phonetic',
-            is_training=is_training
-        )
-        
-        return dense_vectors
-    
-    def _encode_semantic_stream(
-        self, 
-        text_series: cudf.Series, 
-        is_training: bool
-    ) -> cupy.ndarray:
-        """
-        Encode text using semantic embeddings from transformer models.
-
-        This stream captures meaning-based similarity using pre-trained language
-        models, helpful for matching entities with similar meanings but different
-        surface forms (e.g., "IBM" vs "International Business Machines").
-
-        Args:
-            text_series: Text data to encode
-            is_training: Whether to load new model
-
-        Returns:
-            Dense array of semantic embeddings
-
-        Raises:
-            RuntimeError: If model not found in transform mode
-        """
-        logger.info("Processing Semantic (meaning-based) stream...")
-        
-        encoder_key = 'semantic_model'
-        
-        if is_training:
-            # Load the specified model from HuggingFace on first use
-            logger.info(f"Loading semantic model: {self.config.semantic_model}")
-            model = SentenceTransformer(self.config.semantic_model)
-            self.trained_encoders[encoder_key] = model
-            logger.debug(f"Model embedding dimension: {model.get_sentence_embedding_dimension()}")
-        else:
-            # Use already loaded model
-            model = self.trained_encoders.get(encoder_key)
-            if not model:
-                raise RuntimeError(
-                    "Semantic model not found. Call fit_transform first to load the model."
-                )
-        
-        # Convert to list for sentence transformer (runs on CPU)
-        text_list = text_series.to_pandas().tolist()
-        logger.debug(f"Encoding {len(text_list):,} texts with batch size {self.config.semantic_batch_size}")
-        
-        # Generate embeddings (CPU operation)
-        vectors_cpu = model.encode(
-            text_list,
-            batch_size=self.config.semantic_batch_size,
-            show_progress_bar=False,
-            convert_to_numpy=True
-        )
-        
-        # Transfer to GPU
-        dense_vectors = cupy.asarray(vectors_cpu)
-        logger.info(f"Semantic stream complete. Shape: {dense_vectors.shape}")
-        
-        return dense_vectors
-    
-    def _apply_tfidf_vectorizer(
-        self, 
-        text_series: cudf.Series, 
-        is_training: bool
-    ) -> cupy.sparse.csr_matrix:
-        """
-        Fit or transform data using TF-IDF vectorizer.
-
-        Args:
-            text_series: Text data to vectorize
-            is_training: Whether to fit new vectorizer
-
-        Returns:
-            Sparse CSR matrix of TF-IDF features
-
-        Raises:
-            RuntimeError: If vectorizer not found in transform mode
-        """
-        encoder_key = 'tfidf_vectorizer'
-        
-        if is_training:
-            # Configure and fit new TF-IDF vectorizer
-            tfidf_params = self.config.tfidf_params.to_kwargs()
+        validate_indices : bool, default=True
+            If True, performs validation checks on the canonical_id values:
+            - Ensures all indices are within valid bounds [0, N) where N is dataset size
+            - Checks for negative indices (indicates data corruption)
+            - Warns if duplicate indices are present (may indicate user error)
+            - Verifies indices exist in the original canonical_gdf
+            Set to False to skip validation for performance (only if you're certain indices are valid).
             
-            logger.debug(f"Fitting TF-IDF with params: {tfidf_params}")
-            model = TfidfVectorizer(**tfidf_params)
-            sparse_vectors = model.fit_transform(text_series)
-            
-            self.trained_encoders[encoder_key] = model
-            logger.debug(f"TF-IDF vocabulary size: {len(model.vocabulary_)}")
-        else:
-            # Use existing vectorizer
-            model = self.trained_encoders.get(encoder_key)
-            if not model:
-                raise RuntimeError(
-                    "TF-IDF vectorizer not found. Call fit_transform first to train the model."
-                )
-            sparse_vectors = model.transform(text_series)
-        
-        return sparse_vectors
-    
-    def _apply_phonetic_vectorizer(
-        self, 
-        text_series: cudf.Series, 
-        is_training: bool
-    ) -> cupy.sparse.csr_matrix:
-        """
-        Fit or transform data using phonetic CountVectorizer.
+        include_data : bool, default=False
+            If True, returns a tuple of (aligned_data, aligned_embeddings) where aligned_data
+            is the data_slice with canonical_id as the index (if it wasn't already). This is
+            convenient for keeping data and embeddings together in subsequent operations.
+            If False, returns only the aligned_embeddings dictionary.
 
-        Args:
-            text_series: Phonetic text data to vectorize
-            is_training: Whether to fit new vectorizer
-
-        Returns:
-            Sparse CSR matrix of phonetic features
-
-        Raises:
-            RuntimeError: If vectorizer not found in transform mode
-        """
-        encoder_key = 'phonetic_vectorizer'
-        
-        if is_training:
-            # Configure and fit new phonetic vectorizer
-            logger.debug(f"Fitting phonetic vectorizer with params: {self.config.phonetic_params}")
-            model = CountVectorizer(**self.config.phonetic_params.model_dump())
-            sparse_vectors = model.fit_transform(text_series)
-            
-            self.trained_encoders[encoder_key] = model
-            logger.debug(f"Phonetic vocabulary size: {len(model.vocabulary_)}")
-        else:
-            # Use existing vectorizer
-            model = self.trained_encoders.get(encoder_key)
-            if not model:
-                raise RuntimeError(
-                    "Phonetic vectorizer not found. Call fit_transform first to train the model."
-                )
-            sparse_vectors = model.transform(text_series)
-        
-        return sparse_vectors
-    
-    def _convert_to_phonetic(self, text_series: cudf.Series) -> cudf.Series:
-        """
-        Convert text to phonetic representation using Metaphone algorithm.
-
-        This method processes each word individually and combines their phonetic
-        representations, limiting to the first few words to focus on core entity names.
-
-        Args:
-            text_series: Text data to convert
-
-        Returns:
-            cudf.Series containing phonetic representations
-        """
-        def multi_word_metaphone(text: str) -> str:
-            """
-            Convert multi-word string to phonetic form.
-            
-            Args:
-                text: Input text string
+        Returns
+        -------
+        If include_data=False (default):
+            dict of {str: cupy.ndarray}
+                Dictionary mapping context names to their aligned embedding matrices:
+                - 'combined': Embeddings from name + address (shape: n_slice × d_combined)
+                - 'name': Embeddings from name only (shape: n_slice × d_name)
+                - 'address': Embeddings from address only (shape: n_slice × d_address)
                 
-            Returns:
-                Space-separated phonetic representation
-            """
-            if not isinstance(text, str) or not text:
-                return "EMPTY"
+        If include_data=True:
+            tuple of (cudf.DataFrame, dict of {str: cupy.ndarray})
+                First element: The data_slice with canonical_id guaranteed as index
+                Second element: The aligned embeddings dictionary (as above)
+
+        Raises
+        ------
+        RuntimeError
+            If the orchestrator has not been fitted yet (no embeddings available).
             
-            # Process only first few words to capture core entity name
-            words = text.split()[:self.config.phonetic_max_words]
-            phonetic_words = []
-            
-            for word in words:
-                if word:  # Skip empty strings
-                    try:
-                        # dmetaphone returns a tuple (primary, alternate)
-                        primary, alternate = phonetics.dmetaphone(word)
-                        
-                        # Add the primary code if it exists
-                        if primary:
-                            phonetic_words.append(primary)
-                        
-                        # Add the alternate code if it exists and is different
-                        if alternate and alternate != primary:
-                            phonetic_words.append(alternate)
-                    except Exception as e:
-                        logger.debug(f"Phonetic conversion failed for '{word}': {e}")
-                        # Use original word if phonetic conversion fails
-                        phonetic_words.append(word)
-            
-            return ' '.join(phonetic_words) if phonetic_words else "EMPTY"
-        
-        # Must run on CPU due to Python library dependency
-        logger.debug(f"Converting {len(text_series):,} texts to phonetic representation")
-        phonetic_text_pandas = text_series.to_pandas().apply(multi_word_metaphone)
-        
-        # Transfer back to GPU
-        return cudf.Series(phonetic_text_pandas)
-    
-    # def _combine_streams(self, vector_streams: Dict[str, cupy.ndarray]) -> cupy.ndarray:
-    #     """
-    #     Normalizes, balances, and combines multiple vector streams.
+        ValueError
+            - If input is not a cudf.DataFrame or cudf.Series
+            - If input is empty (no rows to align)
+            - If canonical_id is not found as index or column
+            - If any source embedding matrix is None/missing
+            - If validation is enabled and indices are invalid:
+                * Indices out of bounds (< 0 or >= dataset size)
+                * Indices not found in original canonical_gdf
+                
+        Warnings
+        --------
+        If validation is enabled and duplicate canonical_id values are detected, a warning
+        is logged. Duplicates will cause the same embedding vector to appear multiple times
+        in the output, which may indicate an error in your filtering logic.
 
-    #     This method first L2 normalizes each stream, then scales them by their
-    #     configured proportions before casting to float32 and concatenating.
-    #     A final L2 normalization is applied for UMAP compatibility.
+        Examples
+        --------
+        Basic usage after clustering:
+        
+        >>> # After fit_transform and clustering
+        >>> orchestrator.fit_transform(gdf)
+        >>> # ... perform clustering ...
+        >>> 
+        >>> # Filter to cluster 3
+        >>> cluster_3_data = orchestrator.canonical_gdf[
+        ...     orchestrator.canonical_gdf['cluster_id'] == 3
+        ... ]
+        >>> 
+        >>> # Get aligned embeddings for this cluster
+        >>> embeddings = orchestrator.get_aligned_embeddings(cluster_3_data)
+        >>> 
+        >>> # Now you can compute intra-cluster distances
+        >>> from cuml.metrics import pairwise_distances
+        >>> distances = pairwise_distances(embeddings['combined'], metric='cosine')
+        
+        With data included:
+        
+        >>> # Get both data and embeddings together
+        >>> data, embeddings = orchestrator.get_aligned_embeddings(
+        ...     cluster_3_data,
+        ...     include_data=True
+        ... )
+        >>> 
+        >>> # Data and embeddings guaranteed to align
+        >>> assert len(data) == embeddings['combined'].shape[0]
+        >>> assert data.index.name == 'canonical_id'
+        
+        Skip validation for performance (use carefully):
+        
+        >>> # If you know indices are valid, skip validation
+        >>> embeddings = orchestrator.get_aligned_embeddings(
+        ...     large_slice,
+        ...     validate_indices=False  # Faster but no safety checks
+        ... )
 
-    #     Args:
-    #         vector_streams: Dictionary mapping stream names to vector arrays
-
-    #     Returns:
-    #         A single, combined, and normalized vector array.
-    #     """
-    #     logger.info(f"Normalizing, balancing, and combining {len(vector_streams)} feature streams...")
+        Notes
+        -----
+        - The returned embedding matrices maintain the exact row order of the input data_slice
+        - This method does NOT modify the orchestrator's state or stored embeddings
+        - Memory usage: Returns new arrays (not views), so large slices require memory
+        - For very small slices (< 100 rows), validation overhead is negligible
+        - For very large slices (> 1M rows), consider validate_indices=False after testing
         
-    #     # First, L2 normalize each stream
-    #     normalized_streams = {
-    #         name: normalize_rows(vectors) for name, vectors in vector_streams.items()
-    #     }
-        
-    #     # Second, balance the normalized streams by their proportions
-    #     balanced_vectors_list = balance_feature_streams(
-    #         vector_streams=normalized_streams,
-    #         proportions=self.config.stream_proportions
-    #     )
-        
-    #     # Cast all balanced streams to float32 before concatenation
-    #     final_streams = [vec.astype(cupy.float32, copy=False) for vec in balanced_vectors_list]
-    #     logger.debug(f"All streams cast to float32")
-        
-    #     # Concatenate the final streams
-    #     combined_vectors = cupy.concatenate(final_streams, axis=1)
-        
-    #     # Final L2 normalization for UMAP cosine distance
-    #     final_normalized_vectors = normalize_rows(combined_vectors)
-
-    #     logger.debug(
-    #         f"Combined vectors: shape={final_normalized_vectors.shape}, "
-    #         f"mean_norm={float(cupy.linalg.norm(final_normalized_vectors, axis=1).mean()):.4f}"
-    #     )
-        
-    #     return final_normalized_vectors
-
-    # *** Alternate feature stream combiner with another TruncatedSVD call
-    def _combine_streams(
-        self,
-        vector_streams: Dict[str, cupy.ndarray],
-        svd_n_components: int = 512,
-        return_svd_model: bool = False,
-    ) -> Union[cupy.ndarray, Tuple[cupy.ndarray, TruncatedSVD]]:
+        See Also
+        --------
+        EmbeddingOrchestrator.fit_transform : Creates the canonical_gdf and embeddings
+        EmbeddingOrchestrator.transform : Transform new data without refitting
         """
-        Normalize, balance, and fuse multiple feature streams; then reduce with cuML
-        TruncatedSVD and row-normalize the projection for cosine-metric downstream
-        steps (e.g., kNN/UMAP/HDBSCAN).
-
-        Processing stages:
-        1) Per-stream row-wise L2 normalization (via `normalize_rows`) to put each
-            stream into a cosine-stable geometry.
-        2) Stream balancing per `self.config.stream_proportions` to prevent any
-            single stream from dominating by scale.
-        3) Dense float32 concatenation into a single fused matrix of shape (N, D_total).
-        4) Row-wise L2 normalization of the fused matrix (again with `normalize_rows`)
-            so mixed streams share a common cosine space prior to SVD.
-        5) TruncatedSVD (GPU, no mean-centering) to `svd_n_components` dimensions,
-            producing a dense (N, K) projection.
-        6) Post-SVD row-wise L2 normalization to ensure cosine distances/similarities
-            are directly usable in the reduced space.
-
-        Args:
-            vector_streams:
-                Mapping {stream_name -> CuPy dense array} where each array has shape
-                (N, d_i). Examples: {"tfidf": ..., "phonetic": ..., "semantic": ...}.
-            svd_n_components:
-                Target dimensionality K for TruncatedSVD (typ. 384–512 for text-heavy data).
-            return_svd_model:
-                If True, also return the fitted TruncatedSVD model for later transform-only use.
-
-        Returns:
-            If `return_svd_model` is False:
-                projected_normalized_vectors: cupy.ndarray of shape (N, svd_n_components),
-                row-L2 normalized (unit norm per row).
-            If `return_svd_model` is True:
-                (projected_normalized_vectors, svd_model)
-
-        Notes:
-            • TruncatedSVD does NOT mean-center, which preserves cosine geometry.
-            • Keep float32 unless you encounter numerical issues that justify float64.
-            • For reproducibility and tuning, you can add random_state / n_iter later.
-        """
-        logger.info(f"Normalizing, balancing, and combining {len(vector_streams)} feature streams...")
-
-        # ---- 1) Per-stream normalization -------------------------------------------------
-        # Each stream is row-L2 normalized using the project's robust `normalize_rows`.
-        per_stream_normalized: Dict[str, cupy.ndarray] = {
-            stream_name: normalize_rows(stream_vectors)
-            for stream_name, stream_vectors in vector_streams.items()
-        }
-
-        # ---- 2) Balance streams by configured proportions --------------------------------
-        # Scale each normalized stream by its configured weight before concatenation.
-        balanced_stream_arrays: List[cupy.ndarray] = balance_feature_streams(
-            vector_streams=per_stream_normalized,
-            proportions=self.config.stream_proportions,
-        )
-
-        # ---- 3) Dense float32 concatenation ----------------------------------------------
-        # Standardize dtype for memory/speed and concatenate along feature axis.
-        balanced_stream_arrays = [arr.astype(cupy.float32, copy=False) for arr in balanced_stream_arrays]
-        fused_dense_vectors: cupy.ndarray = cupy.concatenate(balanced_stream_arrays, axis=1)
-
-        # ---- 4) Pre-SVD row-wise normalization ------------------------------------------
-        # Normalize rows of the fused matrix (again via `normalize_rows`) so the fused
-        # representation sits in a clean cosine space prior to SVD.
-        fused_dense_vectors = normalize_rows(fused_dense_vectors)
-        logger.debug("Fused matrix ready for SVD: shape=%s", fused_dense_vectors.shape)
-
-        # ---- 5) TruncatedSVD (cuML, GPU) -------------------------------------------------
-        # Reduce dimensionality without mean-centering (key for cosine geometry).
-        svd_model = TruncatedSVD(n_components=svd_n_components)
-        projected_vectors: cupy.ndarray = svd_model.fit_transform(fused_dense_vectors).astype(cupy.float32, copy=False)
-
-        # Optional: log cumulative explained variance ratio if available (attribute varies by cuML version).
-        evr = getattr(svd_model, "explained_variance_ratio_", None)
-        if evr is not None:
-            try:
-                cum_evr = float(cupy.asarray(evr).sum())
-                logger.info("TruncatedSVD: n_components=%d, cumulative explained variance ratio=%.4f",
-                            svd_n_components, cum_evr)
-            except Exception:
-                # Non-fatal; attribute shape/type varies across versions.
-                pass
-
-        # ---- 6) Post-SVD row-wise normalization -----------------------------------------
-        # Normalize rows of the SVD projection so cosine similarities/distances in the
-        # reduced space are ready for kNN/UMAP/HDBSCAN without further scaling.
-        projected_normalized_vectors: cupy.ndarray = normalize_rows(projected_vectors)
-        logger.debug("Projected matrix for downstream cosine metrics: shape=%s",
-                    projected_normalized_vectors.shape)
-
-        if return_svd_model:
-            return projected_normalized_vectors, svd_model
-        return projected_normalized_vectors
-    
-    def _reduce_feature_stream(
-        self,
-        vectors: cupy.sparse.csr_matrix | cupy.ndarray,
-        stream_name: str,
-        is_training: bool
-    ) -> cupy.ndarray:
-        """
-        Reduce dimensionality of feature stream using SVD and/or PCA.
-
-        This method applies a two-stage reduction pipeline:
-        1. SVD for initial high-ratio reduction from sparse to dense
-        2. Optional PCA for further denoising and dimension reduction
-
-        Args:
-            vectors: Input vectors (sparse or dense)
-            stream_name: Name of the stream for configuration lookup
-            is_training: Whether to fit new reduction models
-
-        Returns:
-            Dense array of reduced vectors
-        """
-        logger.info(
-            f"Reducing '{stream_name}' stream from shape {vectors.shape} "
-            f"using reducers: {self.config.sparse_reducers}"
-        )
+        # -------------------------------------------------------------------------
+        # Phase 1: Input validation and state checking
+        # -------------------------------------------------------------------------
+        logger.info(f"Aligning embeddings for a data slice with {len(data_slice):,} records.")
         
-        current_vectors = vectors
-        
-        # Get stream-specific reduction parameters
-        if stream_name == 'tfidf':
-            svd_params = self.config.tfidf_svd_params
-            pca_params = self.config.tfidf_pca_params
-        elif stream_name == 'phonetic':
-            svd_params = self.config.phonetic_svd_params
-            pca_params = self.config.phonetic_pca_params
-        else:
-            # It's good practice to handle unexpected cases.
-            raise ValueError(f"Invalid stream name provided: '{stream_name}'")
-
-        # Stage 1: SVD for initial reduction from sparse matrix
-        if 'svd' in self.config.sparse_reducers:
-            current_vectors = self._apply_svd_reduction(
-                current_vectors, 
-                stream_name, 
-                svd_params, 
-                is_training
+        # Check if orchestrator has been fitted
+        if not self._is_fitted:
+            logger.error("Alignment requested but orchestrator is not fitted.")
+            raise RuntimeError(
+                "Cannot align embeddings: the orchestrator has not been fitted yet. "
+                "Call fit_transform() first to create embeddings."
             )
-            logger.debug(f"After SVD: shape={current_vectors.shape}")
-        
-        # Stage 2: Optional PCA for further reduction and denoising
-        if 'pca' in self.config.sparse_reducers and pca_params is not None:
-            current_vectors = self._apply_pca_reduction(
-                current_vectors, 
-                stream_name, 
-                pca_params, 
-                is_training
+
+        # Validate input type and non-emptiness
+        if not isinstance(data_slice, (cudf.DataFrame, cudf.Series)):
+            logger.error(f"Invalid input type: {type(data_slice)}")
+            raise ValueError(
+                "Input data_slice must be a cudf.DataFrame or cudf.Series. "
+                f"Received: {type(data_slice)}"
             )
-            logger.debug(f"After PCA: shape={current_vectors.shape}")
         
-        logger.info(
-            f"Reduction for '{stream_name}' complete. "
-            f"Final shape: {current_vectors.shape}"
-        )
-        
-        # Ensure output is dense array
-        if hasattr(current_vectors, 'toarray'):
-            return current_vectors.toarray()
-        return current_vectors
-    
-    def _apply_svd_reduction(
-        self, 
-        sparse_vectors: cupy.sparse.csr_matrix | cupy.ndarray,
-        stream_name: str, 
-        svd_params: Dict[str, Any],
-        is_training: bool
-    ) -> cupy.ndarray:
-        """
-        Apply Truncated SVD reduction with spectral damping.
+        if data_slice.empty:
+            logger.error("Alignment requested for empty data slice.")
+            raise ValueError(
+                "Input data_slice is empty. Cannot align embeddings for zero records."
+            )
 
-        This method uses SVD for dimensionality reduction and applies spectral
-        damping to balance component contributions, avoiding over-emphasis on
-        high-variance components while not excessively amplifying noise.
-
-        Spectral Damping:
-        - beta=1.0: Full whitening (equalizes all components, high noise risk)
-        - beta=0.0: No whitening (preserves original variance distribution)
-        - beta=0.4: Balanced approach (reduces dominance without noise amplification)
-
-        Args:
-            sparse_vectors: Input vectors (sparse or dense)
-            stream_name: Name of stream for model storage
-            svd_params: SVD configuration parameters
-            is_training: Whether to fit new SVD model
-
-        Returns:
-            Dense array of reduced and damped vectors
-
-        Raises:
-            RuntimeError: If SVD model not found in transform mode
-        """
-        svd_key = f'{stream_name}_svd_reducer'
-        
-        if is_training:
-            logger.debug(f"Fitting TruncatedSVD for '{stream_name}' with params: {svd_params}")
-            svd_model = GPUTruncatedSVD(self.config.eigsh_fallback_params, svd_params)
-            dense_vectors = svd_model.fit_transform(sparse_vectors)
-            self.reduction_models[svd_key] = svd_model
-            
-            # Log explained variance information
-            if hasattr(svd_model, 'explained_variance_ratio_'):
-                cumsum_variance = cupy.cumsum(svd_model.explained_variance_ratio_)
-                variance_90 = int(cupy.searchsorted(cumsum_variance, cupy.array([0.9]))) + 1
-                logger.debug(
-                    f"SVD explained variance: "
-                    f"{float(cumsum_variance[-1]):.4f} total, "
-                    f"{variance_90} components for 90% variance"
-                )
-        else:
-            svd_model = self.reduction_models.get(svd_key)
-            if not svd_model:
-                raise RuntimeError(
-                    f"SVD reducer for {stream_name} not found. "
-                    f"Call fit_transform first to train the model."
-                )
-            dense_vectors = svd_model.transform(sparse_vectors)
-        
-        # Apply spectral damping to balance component contributions
-        beta = self.config.damping_beta
-        logger.debug(f"Applying spectral damping with beta={beta} to SVD output")
-        
-        # Calculate scaling factors based on singular values
-        # Clamp to epsilon for numerical stability
-        safe_singular_values = cupy.maximum(svd_model.singular_values_, self.config.epsilon)
-        scaling_factors = safe_singular_values ** (-beta)
-        
-        # Apply damping to vectors
-        damped_vectors = dense_vectors * scaling_factors
+        # Verify all embedding matrices exist
+        if self.combined_embeddings is None:
+            raise ValueError("Combined embeddings are missing. Run fit_transform() first.")
+        if self.name_embeddings is None:
+            raise ValueError("Name embeddings are missing. Run fit_transform() first.")
+        if self.address_embeddings is None:
+            raise ValueError("Address embeddings are missing. Run fit_transform() first.")
         
         logger.debug(
-            f"SVD reduction for '{stream_name}' complete. "
-            f"Shape: {damped_vectors.shape}, "
-            f"Mean norm after damping: {float(cupy.linalg.norm(damped_vectors, axis=1).mean()):.4f}"
+            f"Source embedding shapes: "
+            f"combined={self.combined_embeddings.shape}, "
+            f"name={self.name_embeddings.shape}, "
+            f"address={self.address_embeddings.shape}"
+        )
+
+        # -------------------------------------------------------------------------
+        # Phase 2: Extract canonical_id values from data slice
+        # -------------------------------------------------------------------------
+        # Robustly find canonical_id whether it's in the index or a column.
+        # This handles cases where users have reset_index() on their slice.
+        
+        canonical_id_source = None  # Track where we found it for logging
+        
+        if data_slice.index.name == 'canonical_id':
+            logger.debug("Found 'canonical_id' as the index of the data slice.")
+            alignment_indices = data_slice.index.to_cupy()
+            canonical_id_source = 'index'
+            aligned_data_with_index = data_slice  # Already has correct index
+            
+        elif 'canonical_id' in getattr(data_slice, 'columns', []):
+            logger.debug("Found 'canonical_id' as a column in the data slice.")
+            alignment_indices = data_slice['canonical_id'].to_cupy()
+            canonical_id_source = 'column'
+            
+            # If user wants data back, set canonical_id as index for consistency
+            if include_data:
+                aligned_data_with_index = data_slice.set_index('canonical_id')
+            else:
+                aligned_data_with_index = None
+                
+        else:
+            logger.error(
+                "Alignment failed: 'canonical_id' not found as index or column. "
+                f"Available columns: {getattr(data_slice, 'columns', []).tolist() if hasattr(data_slice, 'columns') else 'N/A (Series)'}, "
+                f"Index name: {data_slice.index.name}"
+            )
+            raise ValueError(
+                "Input data_slice must have 'canonical_id' as either its index or as a column. "
+                "The canonical_id is created during fit_transform and is required for alignment."
+            )
+
+        num_indices = len(alignment_indices)
+        logger.debug(
+            f"Extracted {num_indices:,} canonical_id values from data_slice {canonical_id_source}."
+        )
+
+        # -------------------------------------------------------------------------
+        # Phase 3: Validate indices (optional but recommended)
+        # -------------------------------------------------------------------------
+        if validate_indices:
+            logger.debug("Performing validation checks on canonical_id indices...")
+            
+            # Check 1: Ensure indices are within valid bounds
+            max_valid_index = len(self.combined_embeddings) - 1
+            min_index = int(alignment_indices.min())
+            max_index = int(alignment_indices.max())
+            
+            if min_index < 0:
+                logger.error(f"Negative canonical_id detected: {min_index}")
+                raise ValueError(
+                    f"Invalid canonical_id values: found negative index {min_index}. "
+                    "canonical_id must be non-negative integers. This indicates data corruption."
+                )
+            
+            if max_index > max_valid_index:
+                logger.error(
+                    f"Out-of-bounds canonical_id: {max_index} exceeds maximum valid index {max_valid_index}"
+                )
+                raise ValueError(
+                    f"Invalid canonical_id values: index {max_index} is out of bounds. "
+                    f"Valid range is [0, {max_valid_index}]. "
+                    "This data_slice contains indices not present in the original canonical_gdf."
+                )
+            
+            logger.debug(f"Index range validation passed: [{min_index}, {max_index}] within [0, {max_valid_index}]")
+            
+            # Check 2: Warn about duplicate indices (may indicate user error)
+            unique_indices = cupy.unique(alignment_indices)
+            num_unique = len(unique_indices)
+            
+            if num_unique < num_indices:
+                num_duplicates = num_indices - num_unique
+                logger.warning(
+                    f"Duplicate canonical_id values detected: {num_duplicates:,} duplicates among {num_indices:,} total indices. "
+                    "This will cause the same embedding vectors to appear multiple times in the output. "
+                    "If this is unintentional, check your data filtering logic."
+                )
+            else:
+                logger.debug(f"No duplicate indices detected (all {num_indices:,} indices are unique).")
+            
+            # Check 3: Verify indices exist in original canonical_gdf (if available)
+            if self.canonical_gdf is not None and 'canonical_id' in [self.canonical_gdf.index.name] + (self.canonical_gdf.columns.tolist() if hasattr(self.canonical_gdf, 'columns') else []):
+                # Get canonical_id values from stored canonical_gdf
+                if self.canonical_gdf.index.name == 'canonical_id':
+                    valid_canonical_ids = self.canonical_gdf.index.to_cupy()
+                elif 'canonical_id' in self.canonical_gdf.columns:
+                    valid_canonical_ids = self.canonical_gdf['canonical_id'].to_cupy()
+                else:
+                    valid_canonical_ids = None
+                
+                if valid_canonical_ids is not None:
+                    # Check if all alignment_indices exist in valid_canonical_ids
+                    # Using isin-style check with unique values for efficiency
+                    valid_set = cupy.unique(valid_canonical_ids)
+                    are_valid = cupy.isin(unique_indices, valid_set)
+                    
+                    if not cupy.all(are_valid):
+                        invalid_indices = unique_indices[~are_valid]
+                        num_invalid = len(invalid_indices)
+                        logger.error(
+                            f"Found {num_invalid} canonical_id values that don't exist in canonical_gdf"
+                        )
+                        raise ValueError(
+                            f"Invalid canonical_id values: {num_invalid} indices from data_slice "
+                            "do not exist in the original canonical_gdf. "
+                            "This data_slice was not derived from the same fit_transform run."
+                        )
+                    
+                    logger.debug("All canonical_id values verified to exist in original canonical_gdf.")
+            
+            logger.info("Validation checks passed: all canonical_id values are valid.")
+        else:
+            logger.debug("Skipping validation checks (validate_indices=False).")
+
+        # -------------------------------------------------------------------------
+        # Phase 4: Perform advanced integer array indexing
+        # -------------------------------------------------------------------------
+        # GPU-accelerated indexing operation - highly efficient even for large slices
+        logger.debug("Performing advanced integer array indexing on embedding matrices...")
+        
+        try:
+            aligned_combined = self.combined_embeddings[alignment_indices]
+            aligned_name = self.name_embeddings[alignment_indices]
+            aligned_address = self.address_embeddings[alignment_indices]
+        except IndexError as e:
+            logger.error(f"Indexing failed during alignment: {e}")
+            raise ValueError(
+                f"Failed to index embedding matrices with provided canonical_id values. "
+                f"This should not happen after validation. Original error: {e}"
+            )
+        
+        # Verify output shapes match expectations
+        expected_shape_0 = num_indices
+        actual_shapes = {
+            'combined': aligned_combined.shape,
+            'name': aligned_name.shape,
+            'address': aligned_address.shape
+        }
+        
+        for context_name, shape in actual_shapes.items():
+            if shape[0] != expected_shape_0:
+                logger.error(
+                    f"Shape mismatch for {context_name}: expected {expected_shape_0} rows, got {shape[0]}"
+                )
+                raise RuntimeError(
+                    f"Internal error: aligned {context_name} embeddings have incorrect shape {shape}. "
+                    f"Expected ({expected_shape_0}, ?)."
+                )
+        
+        logger.info(
+            f"Successfully aligned all three embedding contexts to the data slice. "
+            f"Output shapes: combined={aligned_combined.shape}, "
+            f"name={aligned_name.shape}, address={aligned_address.shape}"
         )
         
-        return damped_vectors
-    
-    def _apply_pca_reduction(
-        self,
-        dense_vectors: cupy.ndarray,
-        stream_name: str,
-        pca_params: Dict[str, Any],
-        is_training: bool
-    ) -> cupy.ndarray:
-        """
-        Apply PCA reduction to dense vectors for further denoising.
-
-        PCA is applied as a second stage after SVD to further reduce dimensions
-        and remove noise while preserving the most important variance directions.
-
-        Args:
-            dense_vectors: Dense input vectors
-            stream_name: Name of stream for model storage
-            pca_params: PCA configuration parameters
-            is_training: Whether to fit new PCA model
-
-        Returns:
-            Further reduced dense vectors
-
-        Raises:
-            RuntimeError: If PCA model not found in transform mode
-        """
-        pca_key = f'{stream_name}_pca_reducer'
+        # -------------------------------------------------------------------------
+        # Phase 5: Package and return results
+        # -------------------------------------------------------------------------
+        aligned_embeddings = {
+            'combined': aligned_combined,
+            'name': aligned_name,
+            'address': aligned_address
+        }
         
-        if is_training:
-            logger.debug(f"Fitting PCA for '{stream_name}' with params: {pca_params}")
-            pca_model = PCA(**pca_params)
-            reduced_vectors = pca_model.fit_transform(dense_vectors)
-            self.reduction_models[pca_key] = pca_model
+        if include_data:
+            if aligned_data_with_index is None:
+                # Edge case: shouldn't happen, but handle gracefully
+                logger.warning("include_data=True but aligned_data_with_index is None. Returning data_slice as-is.")
+                aligned_data_with_index = data_slice
             
-            # Log explained variance information
-            if hasattr(pca_model, 'explained_variance_ratio_'):
-                total_variance = float(cupy.sum(pca_model.explained_variance_ratio_))
-                logger.debug(
-                    f"PCA explained variance for '{stream_name}': {total_variance:.4f}"
-                )
+            logger.debug("Returning both aligned data and embeddings.")
+            return aligned_data_with_index, aligned_embeddings
         else:
-            pca_model = self.reduction_models.get(pca_key)
-            if not pca_model:
-                raise RuntimeError(
-                    f"PCA reducer for {stream_name} not found. "
-                    f"Call fit_transform first to train the model."
-                )
-            reduced_vectors = pca_model.transform(dense_vectors)
+            logger.debug("Returning aligned embeddings only.")
+            return aligned_embeddings
 
-        logger.debug(f"Successfully applied PCA to '{stream_name}' stream with output dtype: {reduced_vectors.dtype}")
-        
-        return reduced_vectors
-    
     def get_models(self) -> Dict[str, Any]:
         """
-        Get trained encoders and reduction models for persistence.
+        Gathers all trained models from all contexts for persistence.
+
+        This method collects the dictionaries of trained encoders and reduction
+        models from each of the three `SingleContextVectorizer` instances and
+        packages them into a single, top-level dictionary, keyed by context.
 
         Returns:
-            Dictionary containing all trained models for saving
+            A dictionary containing the trained models for all three contexts,
+            structured as {'combined': {...}, 'name': {...}, 'address': {...}}.
         """
+        logger.info("Gathering trained models from all contexts for persistence.")
         return {
-            'encoders': self.trained_encoders,
-            'reduction_models': self.reduction_models
+            'combined': self.combined_vectorizer.get_models(),
+            'name': self.name_vectorizer.get_models(),
+            'address': self.address_vectorizer.get_models(),
         }
-    
-    def set_models(
-        self, 
-        trained_encoders: Dict[str, Any], 
-        reduction_models: Dict[str, Any]
-    ) -> None:
-        """
-        Load pre-trained encoders and reduction models.
 
-        This method is used when loading a saved model to restore the trained
-        state of all vectorization components.
+    def set_models(self, all_models: Dict[str, Any]):
+        """
+        Loads pre-trained models into all context vectorizers.
+
+        This method allows you to restore a previously trained state. It takes a
+        dictionary (typically loaded from a file) and distributes the model
+        dictionaries to the appropriate `SingleContextVectorizer` instance based
+        on the context keys ('combined', 'name', 'address').
 
         Args:
-            trained_encoders: Dictionary of trained encoder models
-            reduction_models: Dictionary of trained reduction models
+            all_models: A dictionary containing the trained models for each context.
+                        Should match the structure returned by `get_models`.
         """
-        self.trained_encoders = trained_encoders
-        self.reduction_models = reduction_models
-        logger.info(
-            f"Loaded {len(trained_encoders)} encoder models and "
-            f"{len(reduction_models)} reduction models"
+        logger.info("Loading pre-trained models into all context vectorizers.")
+        
+        # Safely load models for each context, logging a warning if a context is missing.
+        if 'combined' in all_models:
+            self.combined_vectorizer.set_models(all_models['combined'])
+        else:
+            logger.warning("No models found for 'combined' context during set_models call.")
+
+        if 'name' in all_models:
+            self.name_vectorizer.set_models(all_models['name'])
+        else:
+            logger.warning("No models found for 'name' context during set_models call.")
+
+        if 'address' in all_models:
+            self.address_vectorizer.set_models(all_models['address'])
+        else:
+            logger.warning("No models found for 'address' context during set_models call.")
+
+        logger.info("Finished loading models for all contexts.")
+
+    @property
+    def _is_fitted(self) -> bool:
+        """Check if all context vectorizers have been fitted."""
+        return (
+            self.combined_vectorizer._is_fitted and
+            self.name_vectorizer._is_fitted and
+            self.address_vectorizer._is_fitted
         )
-        logger.debug(f"Encoder models: {list(trained_encoders.keys())}")
-        logger.debug(f"Reduction models: {list(reduction_models.keys())}")
+    
+    @property
+    def embeddings(self) -> Dict[str, cupy.ndarray]:
+       """Convenient access to all embedding matrices."""
+       return {
+           'combined': self.combined_embeddings,
+           'name': self.name_embeddings,
+           'address': self.address_embeddings
+       }

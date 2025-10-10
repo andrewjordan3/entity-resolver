@@ -907,6 +907,12 @@ class VectorizerConfig(BaseModel):
         description="Parameters for the robust SVD fallback mechanism, used only if the primary solver fails."
     )
 
+    final_svd_components: int = Field(
+        default=512, 
+        gt=128, 
+        description="Target dimensionality for canonical embedding matrices"
+    )
+
     @model_validator(mode='after')
     def validate_stream_proportions(self) -> 'VectorizerConfig':
         """

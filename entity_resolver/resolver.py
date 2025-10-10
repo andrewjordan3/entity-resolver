@@ -27,8 +27,6 @@ except ImportError:
         "GPU libraries (cuDF/cuML/CuPy) not found. GPU acceleration is disabled. "
         "Install rapids-ai packages to enable GPU support."
     )
-    # Create dummy reference to avoid NameError in type hints
-    #cudf = None
 
 # ============================================================================
 # LOCAL PACKAGE IMPORTS
@@ -39,7 +37,7 @@ from .config import ResolverConfig, load_config
 # Pipeline component imports - each handles a specific stage
 from .normalizer import TextNormalizer
 from .address_processor import AddressProcessor
-from .vectorizer import MultiStreamVectorizer
+from .vectorizer import EmbeddingOrchestrator
 from .clusterer import EntityClusterer
 from .validator import ClusterValidator
 from .merger import ClusterMerger
@@ -153,8 +151,8 @@ class EntityResolver:
         self.logger.debug("AddressProcessor initialized")
         
         # Vectorization component for creating embeddings
-        self.vectorizer = MultiStreamVectorizer(self.config.vectorizer)
-        self.logger.debug("MultiStreamVectorizer initialized")
+        self.vectorizer = EmbeddingOrchestrator(self.config.vectorizer)
+        self.logger.debug("EmbeddingOrchestrator initialized")
         
         # Clustering component for grouping similar entities
         self.clusterer = EntityClusterer(self.config.clusterer)
@@ -436,7 +434,8 @@ class EntityResolver:
         
         # Step 3: Create vector embeddings
         self.logger.info("Step 3/7: Creating vector embeddings...")
-        gdf, vectors = self.vectorizer.fit_transform(gdf)
+        canonical_embeddings = self.vectorizer.fit_transform(gdf)
+        vectors = canonical_embeddings.combined_embeddings
         self.logger.debug(f"Created embeddings with shape {vectors.shape}")
         
         # Step 4: Cluster similar entities

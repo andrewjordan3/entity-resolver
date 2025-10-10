@@ -23,7 +23,7 @@ Modules:
 # Text processing
 from .text import (
     get_canonical_name_gpu,
-    nfkc_normalize_series
+    nfkc_normalize_series,
 )
 
 # Address operations
@@ -32,13 +32,13 @@ from .address import (
     create_address_key_gpu,
     calculate_address_score_gpu,
     get_best_address_gpu,
-    normalize_us_states
+    normalize_us_states,
 )
 
 # Similarity calculations
 from .similarity import (
     calculate_similarity_gpu,
-    find_similar_pairs
+    find_similar_pairs,
 )
 
 # Vector operations
@@ -49,20 +49,20 @@ from .vector import (
     center_kernel_vector,
     get_top_k_positive_eigenpairs,
     create_consensus_embedding,
-    create_initial_vector
+    create_initial_vector,
 )
 
 # Graph operations
 from .graph import (
     create_edge_list,
     find_graph_components,
-    build_mutual_rank_graph
+    build_mutual_rank_graph,
 )
 
 # Clustering operations
 from .clustering import (
     attach_noise_points,
-    merge_snn_clusters
+    merge_snn_clusters,
 )
 
 # Validation
@@ -70,7 +70,7 @@ from .validation import (
     validate_no_duplicates,
     validate_canonical_consistency,
     check_state_compatibility,
-    check_street_number_compatibility
+    check_street_number_compatibility,
 )
 
 # Matrix operations
@@ -78,14 +78,18 @@ from .matrix_ops import (
     ensure_finite_matrix,
     winsorize_matrix,
     scale_by_frobenius_norm,
-    prune_sparse_matrix
+    prune_sparse_matrix,
 )
 
 # GPU memory operations
 from .clean_mem import gpu_memory_cleanup
 
 # String preparation for vectorization
-from .embedding_streams import prepare_text_streams
+from .embedding_streams import (
+    prepare_text_streams,
+    TextStreamSet,
+    AllTextStreams,
+)
 
 # The public API of the 'utils' package.
 __all__ = [
@@ -138,5 +142,7 @@ __all__ = [
     'gpu_memory_cleanup',
 
     # embedding_streams.py
-    'prepare_text_streams'
+    'prepare_text_streams',
+    'TextStreamSet',
+    'AllTextStreams'
 ]
