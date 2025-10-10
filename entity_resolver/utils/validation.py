@@ -90,7 +90,7 @@ def validate_no_duplicates(
             logger.error(f"  '{name}' at '{addr}' appears in {cluster_count} different clusters.")
         return False
 
-    logger.info("✅ Validation PASSED{phase}: No cross-cluster duplicates found.")
+    logger.info(f"✅ Validation PASSED{phase}: No cross-cluster duplicates found.")
     return True
 
 

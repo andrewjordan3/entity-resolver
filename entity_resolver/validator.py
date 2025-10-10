@@ -56,12 +56,6 @@ class ClusterValidator:
         """
         self.config = validation_config
         self.vectorizer_config = vectorizer_config
-
-        # *** NOTE: Must move to config file at some point ***
-        self.MIN_STATE_BATCH_SIZE: int = 1 # minimum rows to process for similarity
-        
-        # Cache for similarity computations, cleared after each main run.
-        self._similarity_cache = {}
         
         # Define a consistent schema for empty results to prevent concat errors.
         self.EMPTY_ASSIGNMENT_SCHEMA = {
@@ -79,10 +73,10 @@ class ClusterValidator:
         
         # Tolerance parameters to make validation less aggressive
         # These provide a buffer zone where entities can stay in their current cluster
-        self.validation_tolerance = 0.05  # 5% tolerance on similarity thresholds
+        self.validation_tolerance = 0.01  # 1% tolerance on similarity thresholds
         self.min_improvement_threshold = 0.1  # Require 10% improvement to reassign
         self.keep_original_if_close = True  # Keep original assignment if scores are close
-        self.soft_threshold_penalty = 0.2  # Penalty for being below threshold (not elimination)
+        self.soft_threshold_penalty = 0.05  # Penalty for being below threshold (not elimination)
         self.name_threshold = self.config.name_fuzz_ratio / 100.0
         self.addr_threshold = self.config.address_fuzz_ratio / 100.0
 
@@ -100,6 +94,8 @@ class ClusterValidator:
             The cuDF DataFrame with validated and potentially reassigned clusters.
         """
         logger.info("Starting GPU-efficient cluster validation with reassignment...")
+
+        gdf['cluster'] = gdf['cluster'].fillna(-1).astype('int32')
 
         # --- Step 1: Build comprehensive profiles for all existing clusters ---
         clustered_gdf = gdf[gdf['cluster'] != -1]
@@ -136,9 +132,6 @@ class ClusterValidator:
         # --- Step 5: Apply the new assignments to the original DataFrame ---
         final_gdf = self._apply_final_assignments(gdf, best_assignments)
 
-        # Clear the similarity cache after validation to free memory.
-        self._similarity_cache.clear()
-
         logger.info("Reassignment complete. Returning validated DataFrame.")
         return final_gdf
 
@@ -151,55 +144,73 @@ class ClusterValidator:
         - Canonical address
         - State information
         - Cluster statistics (size, average probability)
-
-        Note: This method iterates through unique clusters. While a fully vectorized
-        `groupby().apply()` is possible, the current approach is clear and performs
-        well when the number of unique clusters is not excessively large.
         """
         logger.debug("Building cluster profiles on GPU...")
 
-        # Get cluster size and average probability in a single pass
+        # Step 1: Calculate aggregate statistics for each cluster in a single pass.
+        # This is an efficient, vectorized operation that computes the mean probability
+        # and size (count) for every unique cluster.
         cluster_stats = clustered_gdf.groupby('cluster').agg(
             avg_probability=('cluster_probability', 'mean'),
             size=('normalized_text', 'count')
         ).reset_index()
 
-        unique_clusters = cluster_stats['cluster'].unique().to_pandas()
-
-        canonical_info_list = []
-        for cid in unique_clusters:
-            cluster_subset = clustered_gdf[clustered_gdf['cluster'] == cid]
-            if cluster_subset.empty:
-                continue
-
-            # Get canonical name using TF-IDF similarity
-            c_name = get_canonical_name_gpu(
-                cluster_subset['normalized_text'],
+        # Step 2: Define a function to process each group (i.e., each cluster).
+        # This function encapsulates the logic to find the canonical name and address
+        # for a single cluster's data. It will be applied to each group in parallel.
+        def get_canonical_info(cluster_group):
+            """
+            Processes a single cluster's DataFrame to extract its canonical info.
+            """
+            # Determine the most representative name for the cluster using TF-IDF.
+            canonical_name = get_canonical_name_gpu(
+                cluster_group['normalized_text'],
                 self.vectorizer_config.similarity_tfidf
             )
 
-            # Get best address representation
-            best_addr = get_best_address_gpu(cluster_subset)
+            # Find the best address representation for the cluster.
+            best_address_info = get_best_address_gpu(cluster_group)
 
-            if not best_addr.empty:
-                canonical_info_list.append({
-                    'cluster': cid,
-                    'profile_canonical_name': c_name,
-                    'profile_canonical_addr_key': best_addr['addr_normalized_key'].iloc[0],
-                    'profile_canonical_state': best_addr['addr_state'].iloc[0]
+            # If a valid address is found, create a cudf.Series with the canonical info.
+            # This Series will become a single row in the resulting DataFrame after the
+            # .apply() operation is complete.
+            if not best_address_info.empty:
+                return cudf.Series({
+                    'profile_canonical_name': canonical_name,
+                    'profile_canonical_addr_key': best_address_info['addr_normalized_key'].iloc[0],
+                    'profile_canonical_state': best_address_info['addr_state'].iloc[0]
+                })
+            # If no address is found, return a Series with None for address fields.
+            # We still return the canonical name. This ensures a consistent output
+            # schema for all groups, which is critical for the .apply() operation.
+            else:
+                return cudf.Series({
+                    'profile_canonical_name': canonical_name,
+                    'profile_canonical_addr_key': None,
+                    'profile_canonical_state': None
                 })
 
-        if not canonical_info_list:
+        # Step 3: Apply the processing function to each cluster group.
+        # The .groupby('cluster').apply(...) pattern is the key to vectorization here.
+        # It takes each cluster's subset of data and runs the `get_canonical_info`
+        # function on it, then intelligently combines the results into a new DataFrame.
+        # The original 'cluster' column is preserved as the index, so we reset it.
+        canonical_info_gdf = clustered_gdf.groupby('cluster').apply(get_canonical_info).reset_index()
+
+        if canonical_info_gdf.empty:
             return cudf.DataFrame()
 
-        profiles_gdf = cudf.DataFrame(canonical_info_list)
+        # Step 4: Merge the canonical information with the pre-calculated cluster statistics.
+        # This joins the two DataFrames based on the common 'cluster' column.
+        profiles_gdf = canonical_info_gdf.merge(cluster_stats, on='cluster')
 
-        # Merge with statistics
-        profiles_gdf = profiles_gdf.merge(cluster_stats, on='cluster')
-
-        # Pre-compute normalized features for faster similarity computation
-        profiles_gdf['profile_name_len'] = profiles_gdf['profile_canonical_name'].str.len()
-        profiles_gdf['profile_addr_len'] = profiles_gdf['profile_canonical_addr_key'].str.len()
+        # Step 5: Pre-compute normalized features for faster downstream similarity computations.
+        # These string operations are also vectorized and executed efficiently on the GPU.
+        # We fill any potential NA values in the address key with an empty string
+        # to prevent errors when calculating its length.
+        # NOTE: I don't think these columns are used anywhere
+        # profiles_gdf['profile_name_len'] = profiles_gdf['profile_canonical_name'].str.len()
+        # profiles_gdf['profile_addr_len'] = profiles_gdf['profile_canonical_addr_key'].fillna('').str.len()
 
         return profiles_gdf
 

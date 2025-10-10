@@ -24,6 +24,7 @@ from .utils import (
     nfkc_normalize_series,
     normalize_rows,
     balance_feature_streams,
+    prepare_text_streams,
 )
 
 # Set up module-level logger
@@ -132,10 +133,10 @@ class MultiStreamVectorizer:
         )
         
         # Step 1: Prepare base text by combining relevant fields
-        text_streams = self._prepare_text_streams(gdf)
-        phonetic_text = text_streams['phonetic']
-        semantic_text = text_streams['semantic']
-        tfidf_text = text_streams['tfidf']
+        text_streams = prepare_text_streams(gdf)
+        phonetic_text = text_streams.combined.phonetic
+        semantic_text = text_streams.combined.semantic
+        tfidf_text = text_streams.combined.tfidf
         logger.debug(f"Prepared base text for {len(gdf):,} records")
         
         # Step 2: Process each encoder stream independently

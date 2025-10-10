@@ -84,6 +84,9 @@ from .matrix_ops import (
 # GPU memory operations
 from .clean_mem import gpu_memory_cleanup
 
+# String preparation for vectorization
+from .embedding_streams import prepare_text_streams
+
 # The public API of the 'utils' package.
 __all__ = [
     # text.py
@@ -131,6 +134,9 @@ __all__ = [
     'scale_by_frobenius_norm',
     'prune_sparse_matrix',
 
-    #clean_mem.py
-    'gpu_memory_cleanup'
+    # clean_mem.py
+    'gpu_memory_cleanup',
+
+    # embedding_streams.py
+    'prepare_text_streams'
 ]
