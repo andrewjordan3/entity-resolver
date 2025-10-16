@@ -359,6 +359,201 @@ def get_canonical_name_gpu(
 
     return best_name
 
+def find_canonical_name(
+    all_names_in_group: cudf.Series,
+    unique_names_series: cudf.Series,
+    unique_name_vectors: cupy.ndarray
+) -> str:
+    """
+    Selects the best canonical name from a group using pre-computed embeddings.
+
+    This function implements a sophisticated scoring model to identify the most
+    representative name within a cluster. It operates on the GPU and is designed
+    for use after canonical embeddings have been generated. The final choice is
+    based on a combination of three factors, ensuring a robust selection that
+    balances popularity, similarity, and descriptiveness.
+
+    Scoring Model
+    -------------
+    The winning name is the one with the highest final score, calculated as:
+    `final_score = (centrality_score + frequency_score) * length_bonus`
+
+    1.  **Centrality Score**:
+        This is the most powerful component. It leverages the rich, multi-modal
+        "name-only" embeddings to determine how similar a candidate name is to all
+        other *frequent* names in the group. A high centrality score means a name
+        is at the "center of gravity" of the cluster's name space, making it a
+        strong candidate. This is calculated via `calculate_centrality_score`.
+
+    2.  **Frequency Score**:
+        A straightforward but strong signal based on the raw frequency of each
+        unique name within the group. The most common name is often the correct one,
+        and this score directly reflects that.
+
+    3.  **Length Bonus**:
+        A simple heuristic that acts as a tie-breaker and favors more descriptive
+        names. It provides a small bonus to longer names, helping to select fully
+        spelled-out company names over abbreviations (e.g., "Crystal Clean LLC"
+        over "Crystal Clean").
+
+    Parameters
+    ----------
+    all_names_in_group : cudf.Series
+        A Series containing ALL name candidates for a single group, including
+        duplicates. This is used to accurately calculate `name_counts`.
+
+    unique_names_series : cudf.Series
+        A Series containing only the UNIQUE name candidates for the group. The
+        final scores are calculated for each name in this series. Must be
+        aligned row-for-row with `unique_name_vectors`.
+
+    unique_name_vectors : cupy.ndarray
+        A dense CuPy array of shape (N, D) containing the pre-computed, L2-normalized,
+        "name-only" canonical embeddings for each name in `unique_names_series`.
+        Must be aligned row-for-row with `unique_names_series`.
+
+    Returns
+    -------
+    str
+        The string of the highest-scoring canonical name. Returns an empty string
+        if the input `all_names_in_group` is empty.
+
+    See Also
+    --------
+    entity_resolver.centrality_score.calculate_centrality_score : The function
+        used to compute the centrality score component.
+    entity_resolver.embedding_orchestrator.EmbeddingOrchestrator : The class
+        used to generate the canonical vectors required by this function.
+    """
+    if all_names_in_group.empty:
+        logger.warning("find_canonical_name received an empty series.")
+        return ""
+
+    if len(unique_names_series) == 1:
+        return unique_names_series.iloc[0]
+
+    logger.debug(f"Finding canonical name from {len(unique_names_series)} unique candidates (out of {len(all_names_in_group)} total).")
+
+    # --- Score Calculation ---
+    # Ensure the name counts are aligned with the unique names series.
+    name_counts = all_names_in_group.value_counts().reindex(unique_names_series).fillna(0)
+
+    # 1. Calculate the centrality score using the canonical vectors.
+    centrality_score = _calculate_centrality_score_with_vectors(unique_name_vectors, name_counts)
+
+    # 2. Get the direct frequency score (normalized by total count).
+    total_count = name_counts.sum()
+    if total_count == 0:
+        # Avoid division by zero if counts are all zero for some reason
+        frequency_score = cupy.zeros(len(name_counts), dtype=cupy.float32)
+    else:
+        frequency_score = (name_counts.values / total_count).astype(cupy.float32)
+
+    # 3. Calculate the length bonus.
+    length_bonus = _calculate_length_bonus(unique_names_series)
+
+    # --- Combine Scores ---
+    # The base score combines centrality and raw frequency. A name can score
+    # well by being frequent itself, or by being very similar to other
+    # frequent names.
+    base_score = centrality_score + frequency_score
+
+    # The final score is modulated by the length bonus. This helps break ties
+    # and promotes more descriptive names.
+    final_scores = base_score * length_bonus
+    logger.debug(f"Calculated final scores for {len(final_scores)} unique names.")
+
+    # Find the index of the highest score and return the corresponding name.
+    best_name_index = int(cupy.argmax(final_scores))
+    best_name = unique_names_series.iloc[best_name_index]
+    logger.debug(f"Selected '{best_name}' as the canonical name with score {final_scores[best_name_index]:.4f}.")
+
+    return best_name
+
+def _calculate_centrality_score_with_vectors(
+    aligned_name_vectors: cupy.ndarray,
+    name_counts: cudf.Series
+) -> cupy.ndarray:
+    """
+    Calculates a centrality score for each unique name using canonical embeddings.
+
+    This score is high for names that are both frequent and highly similar to
+    other frequent names within a group. This version leverages
+    pre-computed, canonical "name-only" embeddings for a faster, more accurate,
+    and more consistent similarity measurement.
+
+    The logic is unified and efficient:
+    1.  It computes cosine similarity directly from the L2-normalized input vectors.
+        This is a simple and fast matrix multiplication (`vectors @ vectors.T`).
+    2.  It weights the resulting similarity matrix by the frequency of each name.
+    3.  The final score reflects how similar a name is to other popular names in
+        its group, based on the rich, multi-modal understanding captured in the
+        canonical embeddings.
+
+    Parameters
+    ----------
+    aligned_name_vectors : cupy.ndarray
+        A dense CuPy array of shape (N, D) containing the "name-only" canonical
+        embeddings. These vectors MUST be L2-normalized and must be perfectly
+        aligned (row-for-row) with the `name_counts` Series.
+        
+    name_counts : cudf.Series
+        A Series of length N containing the frequency count for each unique name,
+        aligned with the `aligned_name_vectors`.
+
+    Returns
+    -------
+    cupy.ndarray
+        A 1D CuPy array of centrality scores of length N, one for each unique name.
+        
+    Usage Example (within your pipeline)
+    -------------------------------------
+    # Assume 'cluster_group' is a DataFrame for a single cluster, and
+    # 'orchestrator' is your fitted EmbeddingOrchestrator instance.
+    
+    # Get the embeddings aligned to this specific cluster group
+    aligned_embeddings = orchestrator.get_aligned_embeddings(cluster_group)
+    name_vectors = aligned_embeddings['name']
+    
+    # Get the name counts for this group
+    counts = cluster_group['name'].value_counts()
+    
+    # Calculate the score
+    scores = calculate_centrality_score(name_vectors, counts)
+    """
+    n_unique = aligned_name_vectors.shape[0]
+    logger.debug(f"Calculating centrality for {n_unique} unique names using canonical embeddings.")
+
+    if n_unique == 0:
+        return cupy.array([], dtype=cupy.float32)
+    if n_unique == 1:
+        # A single item is, by definition, 100% central to its group.
+        return cupy.ones(1, dtype=cupy.float32)
+
+    # 1. Calculate frequency weights (proportion of total items in the group).
+    # These weights determine the "importance" of each name in the calculation.
+    total_items = name_counts.sum()
+    freq_weights = (name_counts.values / total_items).astype(cupy.float32)
+
+    # 2. Calculate the cosine similarity matrix.
+    # Because the input vectors are already L2-normalized, cosine similarity is
+    # simply the dot product of the matrix with its transpose. This is extremely
+    # fast on the GPU.
+    # The resulting matrix has shape (N, N). similarity_matrix[i, j] is the
+    # similarity between name i and name j.
+    similarity_matrix = aligned_name_vectors @ aligned_name_vectors.T
+
+    # 3. Calculate the centrality score.
+    # This is the core of the algorithm. For each name (each row in the similarity
+    # matrix), we calculate a weighted sum of its similarities to all other names.
+    # The weight is the frequency of the other names. A high score means "I am
+    # highly similar to other names that are very common in this group."
+    # The '@' operator performs matrix-vector multiplication.
+    centrality_score = similarity_matrix @ freq_weights
+
+    logger.debug(f"Centrality score calculation complete for {n_unique} names.")
+    return centrality_score
+
 def _nfkc_normalize(text_element: str) -> str:
     """
     Applies a three-stage normalization for maximum text canonicalization.

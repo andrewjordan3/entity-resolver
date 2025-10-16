@@ -481,3 +481,93 @@ def find_similar_pairs(
     # Return only the source and destination columns, which correspond to the
     # integer indices of the items in the original `string_series`.
     return matched_pairs[['source', 'destination']]
+
+def calculate_embedding_similarity(
+    vectors_a: cupy.ndarray,
+    vectors_b: cupy.ndarray
+) -> cupy.ndarray:
+    """
+    Calculates the row-wise cosine similarity between two dense embedding matrices.
+
+    This function provides a highly efficient, GPU-accelerated method for comparing
+    two sets of vectors. It is the modern replacement for on-the-fly TF-IDF or
+    edit distance calculations and is designed to work directly with the output of
+    the `EmbeddingOrchestrator`. It includes robust validation to ensure inputs
+    are clean, finite, and correctly shaped before calculation.
+
+    Core Assumption
+    ---------------
+    This function operates under the critical assumption that the input vectors
+    (`vectors_a` and `vectors_b`) are already L2-normalized (i.e., each row vector
+    has a length of 1.0). This is a guarantee provided by the `EmbeddingOrchestrator`'s
+    pipeline.
+
+    When vectors are L2-normalized, their cosine similarity is mathematically
+    equivalent to their dot product. This function calculates the row-wise dot
+    product, which is a simple and extremely fast element-wise multiplication
+    followed by a sum.
+
+    Parameters
+    ----------
+    vectors_a : cupy.ndarray
+        A dense, 2D CuPy array of shape (N, D) containing L2-normalized embeddings.
+    vectors_b : cupy.ndarray
+        A second dense, 2D CuPy array of the exact same shape (N, D) containing
+        L2-normalized embeddings to be compared row-wise with `vectors_a`.
+
+    Returns
+    -------
+    cupy.ndarray
+        A 1D, contiguous CuPy array of float32 similarity scores of length N. The
+        value at index `i` is the cosine similarity between `vectors_a[i]` and `vectors_b[i]`.
+
+    Raises
+    ------
+    ValueError
+        If the input arrays are not 2D CuPy ndarrays, are empty, or do not have
+        the exact same shape.
+    """
+    logger.debug(f"Calculating row-wise embedding similarity for matrices of shape {vectors_a.shape}.")
+
+    # --- Input Validation ---
+    if not isinstance(vectors_a, cupy.ndarray) or not isinstance(vectors_b, cupy.ndarray):
+        raise ValueError("Inputs `vectors_a` and `vectors_b` must be CuPy ndarrays.")
+
+    if vectors_a.ndim != 2 or vectors_b.ndim != 2:
+        raise ValueError(
+            f"Input vectors must be 2-dimensional. "
+            f"Got dimensions: vectors_a={vectors_a.ndim}, vectors_b={vectors_b.ndim}."
+        )
+
+    if vectors_a.shape != vectors_b.shape:
+        raise ValueError(
+            f"Input vector shapes do not match: "
+            f"vectors_a shape is {vectors_a.shape}, vectors_b shape is {vectors_b.shape}."
+        )
+
+    if vectors_a.size == 0:
+        logger.warning("Input vectors are empty. Returning an empty similarity array.")
+        return cupy.array([], dtype=cupy.float32)
+
+    # --- Data Sanitization ---
+    # Ensure that both matrices contain only finite values (no NaN or infinity).
+    # This is a critical step to prevent silent corruption of results or CUDA errors.
+    logger.debug("Ensuring input matrices contain finite values.")
+    vectors_a = ensure_finite_matrix(vectors_a, replace_non_finite=True, copy=False)
+    vectors_b = ensure_finite_matrix(vectors_b, replace_non_finite=True, copy=False)
+
+    # --- Calculation ---
+    # For L2-normalized vectors, the cosine similarity is the dot product.
+    # The row-wise dot product is calculated by performing an element-wise
+    # multiplication and then summing across the feature dimension (axis=1).
+    # This is a single, highly optimized GPU operation.
+    similarity_scores = (vectors_a * vectors_b).sum(axis=1)
+
+    logger.debug(f"Similarity calculation complete. Mean similarity: {float(similarity_scores.mean()):.4f}")
+    
+    # --- Finalization ---
+    # Ensure the output array is in a contiguous block of memory and has the
+    # standard float32 dtype for consistency in downstream operations.
+    final_scores = cupy.ascontiguousarray(similarity_scores, dtype=cupy.float32)
+
+    return final_scores

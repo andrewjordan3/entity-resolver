@@ -24,6 +24,7 @@ Modules:
 from .text import (
     get_canonical_name_gpu,
     nfkc_normalize_series,
+    find_canonical_name,
 )
 
 # Address operations
@@ -39,6 +40,7 @@ from .address import (
 from .similarity import (
     calculate_similarity_gpu,
     find_similar_pairs,
+    calculate_embedding_similarity,
 )
 
 # Vector operations
@@ -96,6 +98,7 @@ __all__ = [
     # text.py
     'get_canonical_name_gpu',
     'nfkc_normalize_series',
+    'find_canonical_name',
 
     # address.py
     'safe_parse_address',
@@ -107,6 +110,7 @@ __all__ = [
     # similarity.py
     'calculate_similarity_gpu',
     'find_similar_pairs',
+    'calculate_embedding_similarity',
 
     # vector.py
     'normalize_rows',

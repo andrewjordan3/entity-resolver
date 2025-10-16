@@ -434,60 +434,61 @@ class EntityResolver:
         
         # Step 3: Create vector embeddings
         self.logger.info("Step 3/7: Creating vector embeddings...")
-        canonical_embeddings = self.vectorizer.fit_transform(gdf)
-        vectors = canonical_embeddings.combined_embeddings
+        self.vectorizer.fit_transform(gdf)
+        canonical_gdf = self.vectorizer.canonical_gdf.copy()
+        vectors = self.vectorizer.combined_embeddings
         self.logger.debug(f"Created embeddings with shape {vectors.shape}")
         
         # Step 4: Cluster similar entities
         self.logger.info("Step 4/7: Clustering similar entities...")
-        gdf, _ = self.clusterer.fit_transform(gdf, vectors)
-        unique_clusters = gdf['cluster'].nunique()
+        canonical_gdf, _ = self.clusterer.fit_transform(canonical_gdf, vectors)
+        unique_clusters = canonical_gdf['cluster'].nunique()
         self.logger.debug(f"Initial clustering produced {unique_clusters:,} clusters")
         
         # Step 5: Validate and merge clusters
         self.logger.info("Step 5/7: Validating and merging clusters...")
         
         # Validate cluster quality and reassign outliers
-        gdf = self.validator.validate_with_reassignment(gdf)
+        canonical_gdf = self.validator.validate_with_reassignment(canonical_gdf, self.vectorizer)
         self.logger.debug("Cluster validation and reassignment complete")
         
         # Merge highly similar clusters
-        gdf = self.merger.merge_clusters(gdf)
-        self.logger.debug(f"Cluster merging complete, {gdf['cluster'].nunique():,} clusters remain")
+        canonical_gdf = self.merger.merge_clusters(canonical_gdf)
+        self.logger.debug(f"Cluster merging complete, {canonical_gdf['cluster'].nunique():,} clusters remain")
         
         # Verify no duplicate cluster assignments
-        validate_no_duplicates(gdf, 'cluster', "merging")
+        validate_no_duplicates(canonical_gdf, 'cluster', "merging")
         
         # Step 6: Refine clusters and build canonical mapping
         self.logger.info("Step 6/7: Refining clusters and building canonical map...")
         
         # Apply final refinement rules
-        gdf = self.refiner.refine_clusters(gdf)
+        canonical_gdf = self.refiner.refine_clusters(canonical_gdf)
         self.logger.debug("Cluster refinement complete")
         
         # Verify no duplicate final cluster assignments
-        validate_no_duplicates(gdf, 'final_cluster', "refining")
+        validate_no_duplicates(canonical_gdf, 'final_cluster', "refining")
         
         # Build mapping of clusters to canonical entities
-        self.canonical_map_ = self.refiner.build_canonical_map(gdf)
+        self.canonical_map_ = self.refiner.build_canonical_map(canonical_gdf)
         self.logger.debug(f"Built canonical map with {len(self.canonical_map_):,} entries")
         
         # Step 7: Apply canonical names and calculate scores
         self.logger.info("Step 7/7: Applying canonical names and scoring...")
         
         # Apply canonical mapping to all records
-        gdf = self.refiner.apply_canonical_map(gdf, self.canonical_map_)
+        canonical_gdf = self.refiner.apply_canonical_map(canonical_gdf, self.canonical_map_)
         
         # Validate canonical name consistency
-        validate_canonical_consistency(gdf)
+        validate_canonical_consistency(canonical_gdf)
         self.logger.debug("Canonical name consistency validated")
         
         # Calculate confidence scores and quality flags
-        gdf = self.scorer.score_and_flag(gdf)
+        canonical_gdf = self.scorer.score_and_flag(canonical_gdf)
         self.logger.debug("Confidence scoring complete")
         
         # Store final resolved DataFrame
-        self.resolved_gdf_ = gdf
+        self.resolved_gdf_ = canonical_gdf
         self.logger.info("Training pipeline execution complete")
     
     def _execute_prediction_pipeline(self, gdf: cudf.DataFrame) -> cudf.DataFrame:

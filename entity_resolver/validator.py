@@ -24,12 +24,14 @@ from cudf.api.types import (
 
 # --- Local Package Imports ---
 from .config import ValidationConfig, VectorizerConfig
+from .vectorizer import EmbeddingOrchestrator
 from .utils import (
     gpu_memory_cleanup, 
-    get_canonical_name_gpu, 
     get_best_address_gpu, 
     calculate_similarity_gpu,
-    check_state_compatibility
+    check_state_compatibility,
+    find_canonical_name,
+    calculate_embedding_similarity,
 )
 
 # Set up a logger for this module
@@ -80,7 +82,10 @@ class ClusterValidator:
         self.name_threshold = self.config.name_fuzz_ratio / 100.0
         self.addr_threshold = self.config.address_fuzz_ratio / 100.0
 
-    def validate_with_reassignment(self, gdf: cudf.DataFrame) -> cudf.DataFrame:
+        # Store the instantiated EmbeddingOrchastrator for use across the class
+        self.vectorizer_class: EmbeddingOrchestrator | None = None
+
+    def validate_with_reassignment(self, gdf: cudf.DataFrame, vectorizer: EmbeddingOrchestrator) -> cudf.DataFrame:
         """
         Evicts invalid members and reassigns them to more appropriate clusters.
 
@@ -93,6 +98,7 @@ class ClusterValidator:
         Returns:
             The cuDF DataFrame with validated and potentially reassigned clusters.
         """
+        self.vectorizer_class = vectorizer
         logger.info("Starting GPU-efficient cluster validation with reassignment...")
 
         gdf['cluster'] = gdf['cluster'].fillna(-1).astype('int32')
@@ -162,10 +168,25 @@ class ClusterValidator:
             """
             Processes a single cluster's DataFrame to extract its canonical info.
             """
+            # 1. Prepare the full name series from the group for frequency counts
+            #    and any other logic that needs the complete data.
+            all_names_in_group = cluster_group['normalized_text']
+
+            # 2. Get the unique names and their corresponding aligned vectors.
+            #    This is the core of the new, more efficient approach.
+            unique_names_df = cluster_group.drop_duplicates(subset=['normalized_text'])
+    
+            aligned_embeddings = self.vectorizer_class.get_aligned_embeddings(unique_names_df)
+            unique_name_vectors = aligned_embeddings['name']
+
+            # The unique names in the correct order, aligned with the vectors.
+            unique_names_series = unique_names_df['normalized_text']
+ 
             # Determine the most representative name for the cluster using TF-IDF.
-            canonical_name = get_canonical_name_gpu(
-                cluster_group['normalized_text'],
-                self.vectorizer_config.similarity_tfidf
+            canonical_name = find_canonical_name(
+                all_names_in_group,
+                unique_names_series,
+                unique_name_vectors
             )
 
             # Find the best address representation for the cluster.
@@ -299,18 +320,63 @@ class ClusterValidator:
             cluster_profiles_df, on='cluster', how='left'
         )
 
-        # Calculate name and address similarity scores against the assigned profile.
-        name_similarity_scores = calculate_similarity_gpu(
-            entities_with_profiles_df['normalized_text'],
-            entities_with_profiles_df['profile_canonical_name'],
-            self.vectorizer_config.similarity_tfidf
-        ).fillna(0.0)
+        # Get the embeddings for each individual entity (vectors_a).
+        aligned_vectors_dict = self.vectorizer_class.get_aligned_embeddings(entities_with_profiles_df)
+        vectors_a_names = aligned_vectors_dict['name']
+        vectors_a_address = aligned_vectors_dict['address']
 
-        addr_similarity_scores = calculate_similarity_gpu(
-            entities_with_profiles_df['addr_normalized_key'],
-            entities_with_profiles_df['profile_canonical_addr_key'],
-            self.vectorizer_config.similarity_tfidf
-        ).fillna(0.0)
+        # Get the embeddings for each entity's canonical profile name (vectors_b).
+        # To do this, we map the profile name string to its original vector's index.
+
+        # Create a lookup table: map every unique name/address in the original dataset to its canonical_id.
+        name_to_id_map = (self.vectorizer_class.canonical_gdf.reset_index()
+            .drop_duplicates(subset=['normalized_text'])
+            .set_index('normalized_text')['canonical_id']
+        )
+        address_to_id_map = (self.vectorizer_class.canonical_gdf.reset_index()
+            .drop_duplicates(subset=['addr_normalized_key'])
+            .set_index('addr_normalized_key')['canonical_id']
+        )
+
+        # 2b. Use the map to find the canonical_id for each row's profile_canonical_name/address.
+        canonical_name_indices = entities_with_profiles_df['profile_canonical_name'].map(name_to_id_map).to_cupy()
+        canonical_address_indices = entities_with_profiles_df['profile_canonical_addr_key'].map(address_to_id_map).to_cupy()
+
+        # 2c. Use these indices to select the correct vectors from the master name_embeddings matrix.
+        vectors_b_names = self.vectorizer_class.name_embeddings[canonical_name_indices]
+        vectors_b_address = self.vectorizer_class.address_embeddings[canonical_address_indices]
+
+        # # Calculate name and address similarity scores against the assigned profile.
+        # name_similarity_scores = calculate_similarity_gpu(
+        #     entities_with_profiles_df['normalized_text'],
+        #     entities_with_profiles_df['profile_canonical_name'],
+        #     self.vectorizer_config.similarity_tfidf
+        # ).fillna(0.0)
+
+        # addr_similarity_scores = calculate_similarity_gpu(
+        #     entities_with_profiles_df['addr_normalized_key'],
+        #     entities_with_profiles_df['profile_canonical_addr_key'],
+        #     self.vectorizer_config.similarity_tfidf
+        # ).fillna(0.0)
+
+        name_similarity_scores_array = calculate_embedding_similarity(
+            vectors_a_names,
+            vectors_b_names
+        )
+        address_similarity_scores_array = calculate_embedding_similarity(
+            vectors_a_address,
+            vectors_b_address
+        )
+
+        # Convert the result back to a cuDF Series with the correct index
+        name_similarity_scores = cudf.Series(
+            name_similarity_scores_array,
+            index=entities_with_profiles_df.index
+        )
+        addr_similarity_scores = cudf.Series(
+            address_similarity_scores_array,
+            index=entities_with_profiles_df.index
+        )
 
         # Compute a weighted average to get the final match score.
         current_match_scores = (name_similarity_scores * 0.6 + addr_similarity_scores * 0.4)
@@ -334,11 +400,13 @@ class ClusterValidator:
         logger.debug(f"Mahalanobis vote identified {mahalanobis_outlier_vote.sum()} potential outliers.")
 
         # Vote 2: FDR Control - Is this entity's match score statistically indistinguishable from a random match?
-        logger.info("Initiating Vote 2: FDR outlier detection via shuffling.")
-        fdr_outlier_vote = self._detect_fdr_outliers_by_shuffling(
-            entities_with_profiles_df
-        )
-        logger.debug(f"FDR vote identified {fdr_outlier_vote.sum()} potential outliers.")
+        # *** This method needs work ***
+        # logger.info("Initiating Vote 2: FDR outlier detection via shuffling.")
+        # fdr_outlier_vote = self._detect_fdr_outliers_by_shuffling(
+        #     entities_with_profiles_df
+        # )
+        # logger.debug(f"FDR vote identified {fdr_outlier_vote.sum()} potential outliers.")
+        fdr_outlier_vote = cudf.Series(False, index=entities_with_profiles_df.index, dtype='bool')
 
         # Vote 3: Margin Test - Is there another cluster that is almost as good a fit (or better)?
         logger.info("Initiating Vote 3: Low-margin assignment detection.")
@@ -541,107 +609,107 @@ class ClusterValidator:
     # _benjamini_hochberg_gpu. I can use the _calculate_cluster_centroids 
     # function from entity_resolver/utils/clustering.py.
     # *************************************************************************
-    @gpu_memory_cleanup
-    def _detect_fdr_outliers_by_shuffling(
-        self,
-        entities_with_profiles_df: cudf.DataFrame,
-        fdr_level: float = 0.05,
-        n_shuffles: int = 10
-    ) -> cudf.Series:
-        """
-        Detects outliers using a non-parametric empirical null generated by
-        shuffling cluster profiles, followed by False Discovery Rate (FDR) control.
+    # @gpu_memory_cleanup
+    # def _detect_fdr_outliers_by_shuffling(
+    #     self,
+    #     entities_with_profiles_df: cudf.DataFrame,
+    #     fdr_level: float = 0.05,
+    #     n_shuffles: int = 10
+    # ) -> cudf.Series:
+    #     """
+    #     Detects outliers using a non-parametric empirical null generated by
+    #     shuffling cluster profiles, followed by False Discovery Rate (FDR) control.
 
-        This method tests whether an entity's `current_match_score` is significantly
-        better than scores obtained by matching it against randomly chosen cluster
-        profiles. By shuffling many times, we create a strong "null distribution" of
-        scores that occur by chance. We then use the Benjamini-Hochberg procedure
-        to find a p-value threshold that controls the FDR at the specified level.
+    #     This method tests whether an entity's `current_match_score` is significantly
+    #     better than scores obtained by matching it against randomly chosen cluster
+    #     profiles. By shuffling many times, we create a strong "null distribution" of
+    #     scores that occur by chance. We then use the Benjamini-Hochberg procedure
+    #     to find a p-value threshold that controls the FDR at the specified level.
 
-        Args:
-            entities_with_profiles_df: DataFrame of entities with their scores.
-            fdr_level: The desired False Discovery Rate (e.g., 0.05 means we accept
-                    that up to 5% of flagged outliers may be false positives).
-            n_shuffles: The number of times to shuffle profiles to build the null distribution.
+    #     Args:
+    #         entities_with_profiles_df: DataFrame of entities with their scores.
+    #         fdr_level: The desired False Discovery Rate (e.g., 0.05 means we accept
+    #                 that up to 5% of flagged outliers may be false positives).
+    #         n_shuffles: The number of times to shuffle profiles to build the null distribution.
 
-        Returns:
-            A boolean cudf.Series, where True indicates a statistically insignificant match (an outlier).
-        """
-        logger.info("Starting FDR outlier detection via shuffling.")
-        num_entities = len(entities_with_profiles_df)
-        if num_entities == 0:
-            logger.warning("FDR detection called with an empty DataFrame.")
-            return cudf.Series(dtype=bool)
+    #     Returns:
+    #         A boolean cudf.Series, where True indicates a statistically insignificant match (an outlier).
+    #     """
+    #     logger.info("Starting FDR outlier detection via shuffling.")
+    #     num_entities = len(entities_with_profiles_df)
+    #     if num_entities == 0:
+    #         logger.warning("FDR detection called with an empty DataFrame.")
+    #         return cudf.Series(dtype=bool)
 
-        logger.debug(f"Building null distribution with {n_shuffles} shuffles for {num_entities} entities.")
-        # Keep string columns as cuDF Series. Calling .values on a string column
-        # is not supported as CuPy does not have a native string dtype. Numeric columns
-        # can still be converted to CuPy arrays for performance.
-        entity_text_series = entities_with_profiles_df['normalized_text']
-        entity_addr_series = entities_with_profiles_df['addr_normalized_key']
-        actual_match_scores = entities_with_profiles_df['current_match_score'].values
+    #     logger.debug(f"Building null distribution with {n_shuffles} shuffles for {num_entities} entities.")
+    #     # Keep string columns as cuDF Series. Calling .values on a string column
+    #     # is not supported as CuPy does not have a native string dtype. Numeric columns
+    #     # can still be converted to CuPy arrays for performance.
+    #     entity_text_series = entities_with_profiles_df['normalized_text']
+    #     entity_addr_series = entities_with_profiles_df['addr_normalized_key']
+    #     actual_match_scores = entities_with_profiles_df['current_match_score'].values
         
-        profile_name_series = entities_with_profiles_df['profile_canonical_name']
-        profile_addr_series = entities_with_profiles_df['profile_canonical_addr_key']
+    #     profile_name_series = entities_with_profiles_df['profile_canonical_name']
+    #     profile_addr_series = entities_with_profiles_df['profile_canonical_addr_key']
         
-        # --- Build Empirical Null Distribution ---
-        # We concatenate scores from multiple shuffles to create a more stable and
-        # robust null distribution than a single shuffle would provide.
-        null_score_accumulator = []
-        for i in range(n_shuffles):
-            logger.debug(f"Running shuffle {i+1}/{n_shuffles}...")
-            # Shuffle the profiles by creating a random permutation of indices.
-            # Note: .take() uses positional indices not a dataframe index.
-            shuffled_indices = cp.random.permutation(num_entities)
+    #     # --- Build Empirical Null Distribution ---
+    #     # We concatenate scores from multiple shuffles to create a more stable and
+    #     # robust null distribution than a single shuffle would provide.
+    #     null_score_accumulator = []
+    #     for i in range(n_shuffles):
+    #         logger.debug(f"Running shuffle {i+1}/{n_shuffles}...")
+    #         # Shuffle the profiles by creating a random permutation of indices.
+    #         # Note: .take() uses positional indices not a dataframe index.
+    #         shuffled_indices = cp.random.permutation(num_entities)
             
-            # Use .take() to reorder the cuDF Series according to the shuffled indices.
-            shuffled_profile_name_series = profile_name_series.take(shuffled_indices)
-            shuffled_profile_addr_series = profile_addr_series.take(shuffled_indices)
+    #         # Use .take() to reorder the cuDF Series according to the shuffled indices.
+    #         shuffled_profile_name_series = profile_name_series.take(shuffled_indices)
+    #         shuffled_profile_addr_series = profile_addr_series.take(shuffled_indices)
 
-            # The .take() operation resets the index. We must reassign the original
-            # index to the new shuffled series to ensure they align for the row-wise
-            # similarity calculation. This resolves the ValueError.
-            shuffled_profile_name_series.index = entity_text_series.index
-            shuffled_profile_addr_series.index = entity_addr_series.index
+    #         # The .take() operation resets the index. We must reassign the original
+    #         # index to the new shuffled series to ensure they align for the row-wise
+    #         # similarity calculation. This resolves the ValueError.
+    #         shuffled_profile_name_series.index = entity_text_series.index
+    #         shuffled_profile_addr_series.index = entity_addr_series.index
 
-            # Calculate similarity scores against these incorrect, random profiles.
-            shuffled_name_sim = calculate_similarity_gpu(
-                entity_text_series,
-                shuffled_profile_name_series,
-                self.vectorizer_config.similarity_tfidf
-            ).fillna(0.0)
+    #         # Calculate similarity scores against these incorrect, random profiles.
+    #         shuffled_name_sim = calculate_similarity_gpu(
+    #             entity_text_series,
+    #             shuffled_profile_name_series,
+    #             self.vectorizer_config.similarity_tfidf
+    #         ).fillna(0.0)
 
-            shuffled_addr_sim = calculate_similarity_gpu(
-                entity_addr_series,
-                shuffled_profile_addr_series,
-                self.vectorizer_config.similarity_tfidf
-            ).fillna(0.0)
+    #         shuffled_addr_sim = calculate_similarity_gpu(
+    #             entity_addr_series,
+    #             shuffled_profile_addr_series,
+    #             self.vectorizer_config.similarity_tfidf
+    #         ).fillna(0.0)
             
-            # These scores represent what we'd expect from random pairings.
-            null_scores_for_shuffle = shuffled_name_sim.values * 0.6 + shuffled_addr_sim.values * 0.4
-            null_score_accumulator.append(null_scores_for_shuffle)
+    #         # These scores represent what we'd expect from random pairings.
+    #         null_scores_for_shuffle = shuffled_name_sim.values * 0.6 + shuffled_addr_sim.values * 0.4
+    #         null_score_accumulator.append(null_scores_for_shuffle)
 
-        # Combine all shuffles into one large array and sort it for fast searching.
-        null_scores_distribution = cp.concatenate(null_score_accumulator)
-        null_scores_distribution_sorted = cp.sort(null_scores_distribution)
-        logger.debug(f"Null distribution created with {len(null_scores_distribution)} total scores.")
+    #     # Combine all shuffles into one large array and sort it for fast searching.
+    #     null_scores_distribution = cp.concatenate(null_score_accumulator)
+    #     null_scores_distribution_sorted = cp.sort(null_scores_distribution)
+    #     logger.debug(f"Null distribution created with {len(null_scores_distribution)} total scores.")
 
-        # --- P-Value Calculation and FDR Control ---
-        logger.debug(f"Calculating p-values and applying Benjamini-Hochberg correction at alpha={fdr_level}.")
-        # For each actual score, find its rank within the null distribution.
-        # A low rank means the score is unusually low, even compared to random matches.
-        rank_in_null = cp.searchsorted(null_scores_distribution_sorted, actual_match_scores, side='right')
+    #     # --- P-Value Calculation and FDR Control ---
+    #     logger.debug(f"Calculating p-values and applying Benjamini-Hochberg correction at alpha={fdr_level}.")
+    #     # For each actual score, find its rank within the null distribution.
+    #     # A low rank means the score is unusually low, even compared to random matches.
+    #     rank_in_null = cp.searchsorted(null_scores_distribution_sorted, actual_match_scores, side='right')
         
-        # Calculate p-values using Laplace smoothing (+1) to avoid p=0 or p=1.
-        # p-value = "probability of observing a score this low or lower by chance".
-        p_values = (rank_in_null + 1) / (len(null_scores_distribution_sorted) + 1)
+    #     # Calculate p-values using Laplace smoothing (+1) to avoid p=0 or p=1.
+    #     # p-value = "probability of observing a score this low or lower by chance".
+    #     p_values = (rank_in_null + 1) / (len(null_scores_distribution_sorted) + 1)
         
-        # Apply Benjamini-Hochberg procedure to find which p-values are significant
-        # while controlling for the false discovery rate.
-        is_outlier = self._benjamini_hochberg_gpu(p_values, fdr_level)
+    #     # Apply Benjamini-Hochberg procedure to find which p-values are significant
+    #     # while controlling for the false discovery rate.
+    #     is_outlier = self._benjamini_hochberg_gpu(p_values, fdr_level)
         
-        logger.info(f"FDR detection complete. Total outliers found: {is_outlier.sum()}.")
-        return cudf.Series(is_outlier, index=entities_with_profiles_df.index)
+    #     logger.info(f"FDR detection complete. Total outliers found: {is_outlier.sum()}.")
+    #     return cudf.Series(is_outlier, index=entities_with_profiles_df.index)
 
     @gpu_memory_cleanup
     def _detect_low_margin_assignments_vectorized(
@@ -711,18 +779,63 @@ class ClusterValidator:
         ]
         logger.debug(f"Cross-join created {len(entity_to_all_profiles_cross_df)} pairs for comparison.")
         
+        # Get the embeddings for each individual entity (vectors_a).
+        aligned_vectors_dict = self.vectorizer_class.get_aligned_embeddings(entity_to_all_profiles_cross_df)
+        vectors_a_names = aligned_vectors_dict['name']
+        vectors_a_address = aligned_vectors_dict['address']
+
+        # Get the embeddings for each entity's canonical profile name (vectors_b).
+        # To do this, we map the profile name string to its original vector's index.
+
+        # Create a lookup table: map every unique name/address in the original dataset to its canonical_id.
+        name_to_id_map = (self.vectorizer_class.canonical_gdf.reset_index()
+            .drop_duplicates(subset=['normalized_text'])
+            .set_index('normalized_text')['canonical_id']
+        )
+        address_to_id_map = (self.vectorizer_class.canonical_gdf.reset_index()
+            .drop_duplicates(subset=['addr_normalized_key'])
+            .set_index('addr_normalized_key')['canonical_id']
+        )
+
+        # 2b. Use the map to find the canonical_id for each row's profile_canonical_name/address.
+        canonical_name_indices = entity_to_all_profiles_cross_df['profile_canonical_name_alt'].map(name_to_id_map).to_cupy()
+        canonical_address_indices = entity_to_all_profiles_cross_df['profile_canonical_addr_key_alt'].map(address_to_id_map).to_cupy()
+
+        # 2c. Use these indices to select the correct vectors from the master name_embeddings matrix.
+        vectors_b_names = self.vectorizer_class.name_embeddings[canonical_name_indices]
+        vectors_b_address = self.vectorizer_class.address_embeddings[canonical_address_indices]
+
         # Calculate match scores for every entity against every *other* profile.
-        alt_name_sim = calculate_similarity_gpu(
-            entity_to_all_profiles_cross_df['normalized_text'], 
-            entity_to_all_profiles_cross_df['profile_canonical_name_alt'], 
-            self.vectorizer_config.similarity_tfidf
-        ).fillna(0.0)
+        # alt_name_sim = calculate_similarity_gpu(
+        #     entity_to_all_profiles_cross_df['normalized_text'], 
+        #     entity_to_all_profiles_cross_df['profile_canonical_name_alt'], 
+        #     self.vectorizer_config.similarity_tfidf
+        # ).fillna(0.0)
         
-        alt_addr_sim = calculate_similarity_gpu(
-            entity_to_all_profiles_cross_df['addr_normalized_key'], 
-            entity_to_all_profiles_cross_df['profile_canonical_addr_key_alt'], 
-            self.vectorizer_config.similarity_tfidf
-        ).fillna(0.0)
+        # alt_addr_sim = calculate_similarity_gpu(
+        #     entity_to_all_profiles_cross_df['addr_normalized_key'], 
+        #     entity_to_all_profiles_cross_df['profile_canonical_addr_key_alt'], 
+        #     self.vectorizer_config.similarity_tfidf
+        # ).fillna(0.0)
+
+        alt_name_similarity_scores_array = calculate_embedding_similarity(
+            vectors_a_names,
+            vectors_b_names
+        )
+        alt_address_similarity_scores_array = calculate_embedding_similarity(
+            vectors_a_address,
+            vectors_b_address
+        )
+
+        # Convert the result back to a cuDF Series with the correct index
+        alt_name_sim = cudf.Series(
+            alt_name_similarity_scores_array,
+            index=entity_to_all_profiles_cross_df.index
+        )
+        alt_addr_sim = cudf.Series(
+            alt_address_similarity_scores_array,
+            index=entity_to_all_profiles_cross_df.index
+        )
         
         entity_to_all_profiles_cross_df['alt_score'] = (alt_name_sim * 0.6 + alt_addr_sim * 0.4)
         
@@ -1136,18 +1249,63 @@ class ClusterValidator:
         if pairs.empty:
             return cudf.DataFrame(self.EMPTY_ASSIGNMENT_SCHEMA)
         
+        # Get the embeddings for each individual entity (vectors_a).
+        aligned_vectors_dict = self.vectorizer_class.get_aligned_embeddings(pairs)
+        vectors_a_names = aligned_vectors_dict['name']
+        vectors_a_address = aligned_vectors_dict['address']
+
+        # Get the embeddings for each entity's canonical profile name (vectors_b).
+        # To do this, we map the profile name string to its original vector's index.
+
+        # Create a lookup table: map every unique name/address in the original dataset to its canonical_id.
+        name_to_id_map = (self.vectorizer_class.canonical_gdf.reset_index()
+            .drop_duplicates(subset=['normalized_text'])
+            .set_index('normalized_text')['canonical_id']
+        )
+        address_to_id_map = (self.vectorizer_class.canonical_gdf.reset_index()
+            .drop_duplicates(subset=['addr_normalized_key'])
+            .set_index('addr_normalized_key')['canonical_id']
+        )
+
+        # 2b. Use the map to find the canonical_id for each row's profile_canonical_name/address.
+        canonical_name_indices = pairs['profile_canonical_name'].map(name_to_id_map).to_cupy()
+        canonical_address_indices = pairs['profile_canonical_addr_key'].map(address_to_id_map).to_cupy()
+
+        # 2c. Use these indices to select the correct vectors from the master name_embeddings matrix.
+        vectors_b_names = self.vectorizer_class.name_embeddings[canonical_name_indices]
+        vectors_b_address = self.vectorizer_class.address_embeddings[canonical_address_indices]
+
+        name_similarity_scores_array = calculate_embedding_similarity(
+            vectors_a_names,
+            vectors_b_names
+        )
+        address_similarity_scores_array = calculate_embedding_similarity(
+            vectors_a_address,
+            vectors_b_address
+        )
+
+        # Convert the result back to a cuDF Series with the correct index
+        pairs['name_sim'] = cudf.Series(
+            name_similarity_scores_array,
+            index=pairs.index
+        )
+        pairs['addr_sim'] = cudf.Series(
+            address_similarity_scores_array,
+            index=pairs.index
+        )
+
         # --- Calculate ALL similarities first (no filtering yet) ---
-        pairs['name_sim'] = calculate_similarity_gpu(
-            pairs['normalized_text'],
-            pairs['profile_canonical_name'],
-            self.vectorizer_config.similarity_tfidf
-        )
+        # pairs['name_sim'] = calculate_similarity_gpu(
+        #     pairs['normalized_text'],
+        #     pairs['profile_canonical_name'],
+        #     self.vectorizer_config.similarity_tfidf
+        # )
         
-        pairs['addr_sim'] = calculate_similarity_gpu(
-            pairs['addr_normalized_key'],
-            pairs['profile_canonical_addr_key'],
-            self.vectorizer_config.similarity_tfidf
-        )
+        # pairs['addr_sim'] = calculate_similarity_gpu(
+        #     pairs['addr_normalized_key'],
+        #     pairs['profile_canonical_addr_key'],
+        #     self.vectorizer_config.similarity_tfidf
+        # )
         
         # --- Check state compatibility ---
         if self.config.enforce_state_boundaries:
