@@ -19,9 +19,10 @@ from .config import (
     ClustererConfig,
 )
 from .utils import (
-    get_canonical_name_gpu, 
-    get_best_address_gpu, 
-    find_similar_pairs, 
+    get_canonical_name_gpu,
+    find_canonical_name,
+    get_best_address_gpu,
+    find_similar_pairs,
     find_graph_components,
     check_state_compatibility,
     check_street_number_compatibility,
@@ -66,7 +67,7 @@ class ClusterMerger:
         self.name_similarity_threshold = validation_config.name_fuzz_ratio / 100.0
         self.address_similarity_threshold = validation_config.address_fuzz_ratio / 100.0
 
-    def merge_clusters(self, entity_dataframe: cudf.DataFrame) -> cudf.DataFrame:
+    def merge_clusters(self, entity_dataframe: cudf.DataFrame, vectorizer) -> cudf.DataFrame:
         """
         Main orchestration method for the complete cluster merging process.
 
@@ -77,20 +78,22 @@ class ClusterMerger:
         Args:
             entity_dataframe: The cuDF DataFrame containing entities with initial cluster
                             assignments from the primary clustering algorithm.
+            vectorizer: The EmbeddingOrchestrator instance containing fitted embeddings
+                       for canonical name selection.
 
         Returns:
             cudf.DataFrame: The input DataFrame with updated cluster labels after
                           all merging operations have been applied.
         """
         # Phase 1: Merge clusters based on similarity metrics
-        entity_dataframe = self._merge_similar_clusters(entity_dataframe)
-        
+        entity_dataframe = self._merge_similar_clusters(entity_dataframe, vectorizer)
+
         # Phase 2: Consolidate any remaining identical entities
         entity_dataframe = self._consolidate_identical_entities(entity_dataframe)
-        
+
         return entity_dataframe
 
-    def _merge_similar_clusters(self, entity_dataframe: cudf.DataFrame) -> cudf.DataFrame:
+    def _merge_similar_clusters(self, entity_dataframe: cudf.DataFrame, vectorizer) -> cudf.DataFrame:
         """
         Merges clusters that represent the same real-world entity using GPU-accelerated
         graph algorithms and similarity computations.
@@ -121,23 +124,25 @@ class ClusterMerger:
         Args:
             entity_dataframe: The main DataFrame containing all entities and their current
                               cluster assignments from the previous stage.
+            vectorizer: The EmbeddingOrchestrator instance containing fitted embeddings
+                       for canonical name selection.
 
         Returns:
             A cuDF DataFrame with the 'cluster' column updated to reflect the merged assignments.
         """
         logger.info("Starting GPU-accelerated cluster similarity merging process...")
-        
+
         # Isolate only the records that were successfully clustered, excluding noise.
         entity_dataframe['cluster'] = entity_dataframe['cluster'].fillna(-1).astype('int32')
         clustered_entities = entity_dataframe[entity_dataframe['cluster'] != -1].copy()
-        
+
         if clustered_entities.empty:
             logger.info("No clusters found for merging.")
             return entity_dataframe
-        
+
         # --- Step 1: Create Cluster Profiles and Positional Index Mapping ---
         logger.debug("Building canonical profiles for each cluster...")
-        cluster_profiles = self._build_cluster_profiles_gpu(clustered_entities)
+        cluster_profiles = self._build_cluster_profiles_gpu(clustered_entities, vectorizer)
         
         if cluster_profiles is None or cluster_profiles.empty:
             logger.info("No valid cluster profiles were created; skipping merge.")
@@ -290,7 +295,7 @@ class ClusterMerger:
 
         return entity_dataframe
     
-    def _build_cluster_profiles_gpu(self, clustered_entities: cudf.DataFrame) -> Optional[cudf.DataFrame]:
+    def _build_cluster_profiles_gpu(self, clustered_entities: cudf.DataFrame, vectorizer) -> Optional[cudf.DataFrame]:
         """
         Builds canonical profiles for each cluster using a fully GPU-accelerated approach.
 
@@ -310,6 +315,8 @@ class ClusterMerger:
         Args:
             clustered_entities: A cuDF DataFrame containing only the entities that
                                 have been assigned to a valid cluster (i.e., not noise).
+            vectorizer: The EmbeddingOrchestrator instance containing fitted embeddings
+                       for canonical name selection.
 
         Returns:
             A cuDF DataFrame where each row represents a single cluster's canonical profile,
@@ -328,7 +335,7 @@ class ClusterMerger:
         # static method `_create_profile_for_group` on each group of data *in parallel on the GPU*,
         # avoiding the massive overhead of pulling data back to the CPU in a loop.
         canonical_profiles = clustered_entities.groupby('cluster').apply(
-            self._create_profile_for_group
+            lambda group: self._create_profile_for_group(group, vectorizer)
         )
 
         # Drop the index for a clean dataframe
@@ -759,7 +766,8 @@ class ClusterMerger:
     
     def _create_profile_for_group(
             self,
-            cluster_group: cudf.DataFrame, 
+            cluster_group: cudf.DataFrame,
+            vectorizer,
     ) -> cudf.DataFrame:
         """
         Creates a canonical profile for a single cluster group.
@@ -771,6 +779,8 @@ class ClusterMerger:
 
         Args:
             cluster_group: A cuDF DataFrame containing all rows for one cluster.
+            vectorizer: The EmbeddingOrchestrator instance containing fitted embeddings
+                       for canonical name selection.
 
         Returns:
             A single-row cuDF DataFrame containing the canonical representations
@@ -781,11 +791,27 @@ class ClusterMerger:
         # =============================================================================
         # This step processes all 'normalized_text' entries for the cluster group
         # and calculates the single most representative name for the entire cluster.
-        # The underlying `get_canonical_name_gpu` function handles the complex
-        # similarity and scoring logic on the GPU.
-        canonical_name = get_canonical_name_gpu(
-            cluster_group['normalized_text'],
-            self.vectorizer_config.similarity_tfidf
+        # We use pre-computed canonical name embeddings from the vectorizer to avoid
+        # recreating TF-IDF vectors on-the-fly.
+
+        # Get aligned name embeddings for this cluster group
+        aligned_embeddings = vectorizer.get_aligned_embeddings(cluster_group)
+        name_vectors = aligned_embeddings['name']
+
+        # Get unique names and use find_canonical_name with the canonical vectors
+        all_names = cluster_group['normalized_text']
+        unique_names = all_names.unique()
+
+        # Get vectors for just the unique names
+        unique_name_indices = all_names.isin(unique_names)
+        unique_group = cluster_group[unique_name_indices].drop_duplicates(subset=['normalized_text'])
+        unique_embeddings = vectorizer.get_aligned_embeddings(unique_group)
+        unique_name_vectors = unique_embeddings['name']
+
+        canonical_name = find_canonical_name(
+            all_names,
+            unique_group['normalized_text'].reset_index(drop=True),
+            unique_name_vectors
         )
         
         # =============================================================================

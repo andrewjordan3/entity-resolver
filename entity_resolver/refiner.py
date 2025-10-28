@@ -18,6 +18,7 @@ import logging
 from .config import ValidationConfig, OutputConfig, VectorizerConfig
 from .utils import (
     get_canonical_name_gpu,
+    find_canonical_name,
     get_best_address_gpu,
     create_address_key_gpu,
 )
@@ -76,23 +77,25 @@ class ClusterRefiner:
             f"output_format={output_config.output_format}"
         )
 
-    def refine_clusters(self, gdf: cudf.DataFrame) -> cudf.DataFrame:
+    def refine_clusters(self, gdf: cudf.DataFrame, vectorizer=None) -> cudf.DataFrame:
         """
         Refines clusters through address enrichment and conflict-based splitting.
-        
+
         This method performs two sequential refinement operations:
         1. Address enrichment: Fills in missing street-level information for records
            that share cluster, city, state, and zip with other complete records.
         2. Conflict splitting: Breaks apart clusters that span multiple states or
            have widely disparate street numbers for the same street.
-        
+
         Args:
-            gdf: Input cuDF DataFrame containing initial cluster assignments in 
+            gdf: Input cuDF DataFrame containing initial cluster assignments in
                  'cluster' column and address components.
-                 
+            vectorizer: Optional EmbeddingOrchestrator instance. Not used in this method,
+                       but accepted for consistency with build_canonical_map.
+
         Returns:
             cudf.DataFrame: DataFrame with added 'final_cluster' column containing
-                           refined cluster assignments and 'address_was_enriched' 
+                           refined cluster assignments and 'address_was_enriched'
                            flag for tracking enriched records.
         """
         # Check if address information is available for refinement
@@ -134,7 +137,7 @@ class ClusterRefiner:
         
         return gdf
 
-    def build_canonical_map(self, gdf: cudf.DataFrame) -> cudf.DataFrame:
+    def build_canonical_map(self, gdf: cudf.DataFrame, vectorizer) -> cudf.DataFrame:
         """
         Builds the final canonical map from refined clusters using vectorized ops.
 
@@ -147,6 +150,8 @@ class ClusterRefiner:
 
         Args:
             gdf: cuDF DataFrame with 'final_cluster' assignments and entity data.
+            vectorizer: The EmbeddingOrchestrator instance containing fitted embeddings
+                       for canonical name selection.
 
         Returns:
             A cuDF DataFrame serving as the canonical map, with one row per
@@ -188,7 +193,7 @@ class ClusterRefiner:
 
         # 3. Determine the canonical name for each cluster.
         logger.debug("Step 3: Determining canonical name for each cluster...")
-        canonical_names_df = self._get_canonical_names(clustered_records_gdf)
+        canonical_names_df = self._get_canonical_names(clustered_records_gdf, vectorizer)
         logger.debug("Canonical names determined.")
 
         # 4. Merge the components into the final canonical map.
@@ -302,7 +307,7 @@ class ClusterRefiner:
     # Private Helper Methods
     # ============================================================================
 
-    def _get_canonical_names(self, gdf: cudf.DataFrame) -> cudf.DataFrame:
+    def _get_canonical_names(self, gdf: cudf.DataFrame, vectorizer) -> cudf.DataFrame:
         """
         Vectorized helper to determine the canonical name for each cluster.
 
@@ -313,18 +318,36 @@ class ClusterRefiner:
 
         Args:
             gdf: DataFrame containing clustered records.
+            vectorizer: The EmbeddingOrchestrator instance containing fitted embeddings
+                       for canonical name selection.
 
         Returns:
             A DataFrame with 'final_cluster' and 'canonical_name' columns.
         """
         # This lambda function will be applied to the DataFrame subset for
         # each unique cluster.
-        def find_canonical_name(df_group):
-            return get_canonical_name_gpu(
-                df_group['normalized_text'], self.vectorizer_config.similarity_tfidf
+        def get_canonical_name_for_cluster(df_group):
+            # Get aligned name embeddings for this cluster group
+            aligned_embeddings = vectorizer.get_aligned_embeddings(df_group)
+            name_vectors = aligned_embeddings['name']
+
+            # Get unique names and use find_canonical_name with the canonical vectors
+            all_names = df_group['normalized_text']
+            unique_names = all_names.unique()
+
+            # Get vectors for just the unique names
+            unique_name_indices = all_names.isin(unique_names)
+            unique_group = df_group[unique_name_indices].drop_duplicates(subset=['normalized_text'])
+            unique_embeddings = vectorizer.get_aligned_embeddings(unique_group)
+            unique_name_vectors = unique_embeddings['name']
+
+            return find_canonical_name(
+                all_names,
+                unique_group['normalized_text'].reset_index(drop=True),
+                unique_name_vectors
             )
 
-        canonical_names_series = gdf.groupby('final_cluster').apply(find_canonical_name)
+        canonical_names_series = gdf.groupby('final_cluster').apply(get_canonical_name_for_cluster)
         canonical_names_df = canonical_names_series.to_frame('canonical_name').reset_index()
 
         return canonical_names_df

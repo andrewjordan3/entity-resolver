@@ -453,7 +453,7 @@ class EntityResolver:
         self.logger.debug("Cluster validation and reassignment complete")
         
         # Merge highly similar clusters
-        canonical_gdf = self.merger.merge_clusters(canonical_gdf)
+        canonical_gdf = self.merger.merge_clusters(canonical_gdf, self.vectorizer)
         self.logger.debug(f"Cluster merging complete, {canonical_gdf['cluster'].nunique():,} clusters remain")
         
         # Verify no duplicate cluster assignments
@@ -463,14 +463,14 @@ class EntityResolver:
         self.logger.info("Step 6/7: Refining clusters and building canonical map...")
         
         # Apply final refinement rules
-        canonical_gdf = self.refiner.refine_clusters(canonical_gdf)
+        canonical_gdf = self.refiner.refine_clusters(canonical_gdf, self.vectorizer)
         self.logger.debug("Cluster refinement complete")
         
         # Verify no duplicate final cluster assignments
         validate_no_duplicates(canonical_gdf, 'final_cluster', "refining")
         
         # Build mapping of clusters to canonical entities
-        self.canonical_map_ = self.refiner.build_canonical_map(canonical_gdf)
+        self.canonical_map_ = self.refiner.build_canonical_map(canonical_gdf, self.vectorizer)
         self.logger.debug(f"Built canonical map with {len(self.canonical_map_):,} entries")
         
         # Step 7: Apply canonical names and calculate scores
