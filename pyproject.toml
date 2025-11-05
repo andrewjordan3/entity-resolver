@@ -41,18 +41,33 @@ dependencies = [
 ]
 
 # Optional dependencies for GPU acceleration
-# Note: RAPIDS libraries (cudf, cupy, cuml, cugraph, rmm) must be installed via conda
-# conda create -n entity-resolver -c rapidsai -c conda-forge -c nvidia \
-#   cudf cuml cugraph cupy rmm python=3.11 cudatoolkit=11.8
+# Note: RAPIDS libraries now support pip installation with CUDA-specific wheels
+#
+# Installation methods:
+#
+# 1. Via pip (recommended for Colab, simpler environments):
+#    pip install cudf-cu12 cuml-cu12 cugraph-cu12 cupy-cuda12x rmm-cu12
+#    Or: pip install -e ".[gpu-cu12]"
+#
+# 2. Via conda (recommended for local development):
+#    conda create -n entity-resolver -c rapidsai -c conda-forge -c nvidia \
+#      cudf cuml cugraph cupy rmm python=3.11 cudatoolkit=11.8
 [project.optional-dependencies]
-gpu = [
-    # RAPIDS GPU libraries - install via conda, not pip
-    # Listed here for documentation purposes
-    # "cudf",
-    # "cupy",
-    # "cuml",
-    # "cugraph",
-    # "rmm",
+# GPU libraries for CUDA 12.x (pip-installable)
+gpu-cu12 = [
+    "cudf-cu12",
+    "cuml-cu12",
+    "cugraph-cu12",
+    "cupy-cuda12x",
+    "rmm-cu12",
+]
+# GPU libraries for CUDA 11.x (pip-installable)
+gpu-cu11 = [
+    "cudf-cu11",
+    "cuml-cu11",
+    "cugraph-cu11",
+    "cupy-cuda11x",
+    "rmm-cu11",
 ]
 dev = [
     "ruff",
