@@ -1,9 +1,9 @@
 # 🚀 GPU-Accelerated Entity Resolver
 
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/downloads/)
-[![CUDA](https://img.shields.io/badge/CUDA-11.5%2B-green)](https://developer.nvidia.com/cuda-downloads)
+[![CUDA](https://img.shields.io/badge/CUDA-11.5%2B%20%7C%2012.x-green)](https://developer.nvidia.com/cuda-downloads)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 
 A high-performance, production-ready Python package for entity resolution and deduplication at scale. Built on NVIDIA RAPIDS (`cudf`, `cuML`, `cupy`), the project keeps the entire pipeline on the GPU to minimize transfers and maximize throughput.
 
@@ -56,85 +56,112 @@ Creates rich entity embeddings by combining three complementary approaches:
 ## 💻 Requirements
 
 ### System Requirements
-- **GPU**: NVIDIA GPU with Compute Capability 7.0+ (e.g., V100, T4, RTX 2080+)
-- **CUDA**: Version 11.5 or higher
+- **GPU**: NVIDIA GPU with Compute Capability 7.0+ (e.g., V100, T4, A100, RTX 2080+, Colab GPUs)
+- **CUDA**: Version 11.5+ or 12.x (CUDA 12.x recommended)
 - **Memory**:
   - GPU: Minimum 8 GB VRAM (16 GB+ recommended for large datasets)
   - System RAM: ~2× your dataset size
 
 ### Software Dependencies
+
+**Core Libraries:**
 - Python 3.8+
-- RAPIDS Suite (`cudf`, `cuml`, `cupy`)
-- Additional CPU libraries: `sentence-transformers`, `phonetics`, `python-postal`
+- pandas, numpy, pydantic, pyyaml
+
+**GPU Libraries (auto-installed with pip method):**
+- RAPIDS Suite: `cudf`, `cuml`, `cugraph`, `cupy`, `rmm`
+
+**Specialized Libraries:**
+- `sentence-transformers` - Semantic embeddings
+- `phonetics` - Phonetic encoding
+- `postal` - Address parsing (libpostal)
+- `unicodedata2` - Unicode normalization
+
+**Development Tools (optional):**
+- `ruff` - Linting and formatting
+- `mypy` - Static type checking
+- `pytest` - Testing framework
 
 ## 📦 Installation
 
-This project can be set up in two primary environments: locally using Conda (for machines with NVIDIA GPUs) or on the cloud using Google Colab.
+The package supports two installation methods: **pip** (recommended for Colab and simpler setups) or **conda** (recommended for local development).
 
 ---
-### Local / On-Premise Installation
 
-This method is for setting up the project on your own machine with a compatible NVIDIA GPU.
+### Method 1: Pip Installation (Recommended for Google Colab)
 
-### Step 1: Install RAPIDS
+**For CUDA 12.x (most recent systems):**
 
-Conda is recommended:
+```bash
+# Clone the repository
+git clone https://github.com/andrewjordan3/entity-resolver.git
+cd entity-resolver
+
+# Install with GPU dependencies for CUDA 12
+pip install -e ".[gpu-cu12]"
+```
+
+**For CUDA 11.x (older systems):**
+
+```bash
+# Clone the repository
+git clone https://github.com/andrewjordan3/entity-resolver.git
+cd entity-resolver
+
+# Install with GPU dependencies for CUDA 11
+pip install -e ".[gpu-cu11]"
+```
+
+**Google Colab Quick Setup:**
+
+```python
+# In a Colab notebook cell:
+!git clone https://github.com/andrewjordan3/entity-resolver.git
+%cd entity-resolver
+!pip install -e ".[gpu-cu12]"
+
+# Restart runtime after installation
+# Go to: Runtime > Restart runtime
+```
+
+---
+
+### Method 2: Conda Installation (Recommended for Local Development)
+
+**Step 1: Create RAPIDS Environment**
 
 ```bash
 # Create a new environment with RAPIDS
-conda create -n rapids-24.12 -c rapidsai -c conda-forge -c nvidia \
+conda create -n entity-resolver -c rapidsai -c conda-forge -c nvidia \
     rapids=24.12 python=3.11 cuda-version=11.8
 
 # Activate the environment
-conda activate rapids-24.12
+conda activate entity-resolver
 ```
 
-For more detailed instructions, please refer to the official [RAPIDS installation guide](https://rapids.ai/start.html).
+For more detailed instructions, see the [RAPIDS installation guide](https://rapids.ai/start.html).
 
-### Step 2: Install the Package
-
-Once your environment is active, you can install the `entity-resolver` package.
+**Step 2: Install the Package**
 
 ```bash
-# Option A: Install directly from GitHub (Recommended)
-pip install git+https://github.com/andrewjordan3/entity-resolver.git
-
-# Option B: Install from a local clone
+# Clone the repository
 git clone https://github.com/andrewjordan3/entity-resolver.git
 cd entity-resolver
-pip install .
+
+# Install the package (CPU dependencies only, RAPIDS already installed)
+pip install -e .
 ```
+
 ---
-### Google Colab Installation
-This method uses a setup script to prepare the Google Colab environment automatically.
 
-### Step 1: Run the Setup Script
-Copy and paste the following code into a single cell in your Colab notebook and run it. This will clone the repository and install all dependencies.
-
-```bash
-# Clone the project repository
-!git clone https://github.com/andrewjordan3/entity-resolver.git
-
-# Navigate into the project directory
-%cd entity-resolver
-
-# Make the setup script executable and run it
-# This will install RAPIDS and other dependencies.
-!chmod +x setup_colab.sh
-!./setup_colab.sh
-```
-### Step 2: Restart the Runtime
-After the script finishes, you **must** restart the Colab runtime for the newly installed libraries (like cuDF) to be loaded correctly.
-
-> **Go to `Runtime` > `Restart runtime` in the Colab menu.**
-
-Your environment is now ready. You can proceed to import and use the `entity-resolver` package in the subsequent cells.
-
-### Step 3: Verify Installation
+### Verify Installation
 
 ```python
 import entity_resolver
-print(entity_resolver.__version__)  # Should print: 0.1.0
+import cudf
+
+print(f"Entity Resolver version: {entity_resolver.__version__}")
+print(f"cuDF version: {cudf.__version__}")
 ```
 
 ## 🚀 Quick Start
@@ -255,16 +282,50 @@ The `ResolverConfig` object controls all aspects of the pipeline:
 ## 🏗️ Pipeline Architecture
 
 ```mermaid
-graph LR
-    A[Input DataFrame] --> B[Text Normalization]
-    B --> C[Address Processing]
-    C --> D[Multi-Stream Vectorization]
-    D --> E[UMAP Ensemble]
-    E --> F[HDBSCAN + SNN Clustering]
-    F --> G[Validation & Merging]
-    G --> H[Canonical Mapping]
-    H --> I[Confidence Scoring]
-    I --> J[Output DataFrame]
+graph TB
+    Input[📄 Input DataFrame<br/>company_name, address] --> Normalizer
+
+    subgraph Preprocessing["🔧 PREPROCESSING"]
+        Normalizer[Text Normalizer<br/>• Remove suffixes<br/>• Replace patterns<br/>• Unicode normalization]
+        AddressProc[Address Processor<br/>• libpostal parsing<br/>• Component extraction<br/>• Name consolidation]
+        Normalizer --> AddressProc
+    end
+
+    subgraph Vectorization["🧬 VECTORIZATION"]
+        AddressProc --> TfidfStream[Syntactic Stream<br/>TF-IDF n-grams]
+        AddressProc --> PhoneticStream[Phonetic Stream<br/>Metaphone encoding]
+        AddressProc --> SemanticStream[Semantic Stream<br/>MiniLM embeddings]
+
+        TfidfStream --> ContextVec[Context Vectorizer<br/>• Energy balancing<br/>• Stream concatenation<br/>• SVD reduction]
+        PhoneticStream --> ContextVec
+        SemanticStream --> ContextVec
+    end
+
+    subgraph Clustering["🔍 CLUSTERING"]
+        ContextVec --> UMAP[UMAP Ensemble<br/>• Randomized params<br/>• Manifold learning]
+        UMAP --> HDBSCAN[HDBSCAN<br/>Density clustering]
+        HDBSCAN --> SNN[SNN Graph Rescue<br/>• Noise recovery<br/>• Consensus voting]
+    end
+
+    subgraph Refinement["✨ REFINEMENT"]
+        SNN --> Validator[Cluster Validator<br/>• Fuzzy matching<br/>• Address verification]
+        Validator --> Merger[Cluster Merger<br/>• Similar clusters<br/>• High-confidence joins]
+        Merger --> Refiner[Cluster Refiner<br/>• Canonical selection<br/>• Chain numbering]
+    end
+
+    subgraph Output["📊 OUTPUT"]
+        Refiner --> Scorer[Confidence Scorer<br/>• Multi-factor scoring<br/>• Review flagging]
+        Scorer --> Reporter[Reporter<br/>• Statistics<br/>• Quality metrics]
+        Reporter --> Result[📋 Resolved DataFrame<br/>canonical_name, confidence, chain_num]
+    end
+
+    style Input fill:#e1f5ff
+    style Result fill:#e7f5e1
+    style Preprocessing fill:#fff4e6
+    style Vectorization fill:#f3e5f5
+    style Clustering fill:#e8f5e9
+    style Refinement fill:#fce4ec
+    style Output fill:#e3f2fd
 ```
 
 ### Pipeline Stages
@@ -344,7 +405,18 @@ Contributions are welcome!
 # Development setup
 git clone https://github.com/andrewjordan3/entity-resolver.git
 cd entity-resolver
-pip install -e ".[dev]"
+
+# Install with GPU and development dependencies
+pip install -e ".[gpu-cu12,dev]"
+
+# Run linting and formatting
+ruff check .
+ruff format .
+
+# Run type checking
+mypy .
+
+# Run tests (when available)
 pytest tests/
 ```
 
@@ -371,7 +443,7 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 - OpenCage for libpostal address parsing  
 - Hugging Face for sentence-transformers  
 
-Maintained by: **Andrew Jordan**  
-Contact: **andrewjordan3@gmail.com**  
-Last Updated: **September 2025**
+Maintained by: **Andrew Jordan**
+Contact: **andrewjordan3@gmail.com**
+Last Updated: **November 2025**
 
