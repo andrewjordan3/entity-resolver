@@ -1,0 +1,133 @@
+###############################################################################
+# [build-system] - BUILD CONFIGURATION
+###############################################################################
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+###############################################################################
+# [project] - PROJECT METADATA AND DEPENDENCIES
+###############################################################################
+[project]
+name = "entity-resolver"
+version = "0.1.0"
+description = "A high-performance, GPU-accelerated entity resolution pipeline."
+readme = "README.md"
+authors = [
+    {name = "Andrew Jordan", email = "andrewjordan3@gmail.com"}
+]
+license = {text = "MIT"}
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+
+# Core CPU dependencies (pip-installable)
+dependencies = [
+    "pandas",
+    "numpy",
+    "phonetics",
+    "sentence-transformers",
+    "postal",
+    "pydantic",
+    "pyyaml",
+    "unicodedata2",
+    "scikit-learn",
+]
+
+# Optional dependencies for GPU acceleration
+# Note: RAPIDS libraries (cudf, cupy, cuml, cugraph, rmm) must be installed via conda
+# conda create -n entity-resolver -c rapidsai -c conda-forge -c nvidia \
+#   cudf cuml cugraph cupy rmm python=3.11 cudatoolkit=11.8
+[project.optional-dependencies]
+gpu = [
+    # RAPIDS GPU libraries - install via conda, not pip
+    # Listed here for documentation purposes
+    # "cudf",
+    # "cupy",
+    # "cuml",
+    # "cugraph",
+    # "rmm",
+]
+dev = [
+    "ruff",
+    "mypy",
+    "pytest",
+    "pytest-cov",
+]
+
+[project.urls]
+Homepage = "https://github.com/andrewjordan3/entity-resolver"
+
+[tool.setuptools]
+packages = {find = {}}
+
+###############################################################################
+# [tool.ruff] - LINTING AND FORMATTING
+###############################################################################
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+exclude = [".git", "__pycache__", "build", "dist"]
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "UP", # pyupgrade
+    "B",  # flake8-bugbear
+]
+
+ignore = [
+    "E501", # Line too long (handled by ruff format)
+    "E203", # Whitespace before ':' (conflicts with formatter)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["entity-resolver"]
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+###############################################################################
+# [tool.mypy] - STATIC TYPE CHECKING
+###############################################################################
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+show_error_codes = true
+
+# Ignore missing imports for libraries without type stubs
+[[tool.mypy.overrides]]
+module = [
+    "cudf.*",
+    "cuml.*",
+    "cugraph.*",
+    "cupy.*",
+    "cupyx.*",
+    "rmm.*",
+    "postal.*",
+    "phonetics.*",
+]
+ignore_missing_imports = true
