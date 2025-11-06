@@ -13,11 +13,9 @@ name = "entity-resolver"
 version = "0.1.0"
 description = "A high-performance, GPU-accelerated entity resolution pipeline."
 readme = "README.md"
-authors = [
-    {name = "Andrew Jordan", email = "andrewjordan3@gmail.com"}
-]
-license = {text = "MIT"}
-requires-python = ">=3.8"
+authors = [{ name = "Andrew Jordan", email = "andrewjordan3@gmail.com" }]
+license = { text = "MIT" }
+requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -69,18 +67,13 @@ gpu-cu11 = [
     "cupy-cuda11x",
     "rmm-cu11",
 ]
-dev = [
-    "ruff",
-    "mypy",
-    "pytest",
-    "pytest-cov",
-]
+dev = ["ruff", "mypy", "pytest", "pytest-cov"]
 
 [project.urls]
 Homepage = "https://github.com/andrewjordan3/entity-resolver"
 
 [tool.setuptools]
-packages = {find = {}}
+packages = { find = {} }
 
 ###############################################################################
 # [tool.ruff] - LINTING AND FORMATTING
@@ -89,7 +82,7 @@ packages = {find = {}}
 line-length = 100
 target-version = "py313"
 
-exclude = [".git", "__pycache__", "build", "dist"]
+exclude = [".git", "__pycache__", "build", "dist", ".venv"]
 
 [tool.ruff.lint]
 select = [
@@ -107,7 +100,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["entity-resolver"]
+known-first-party = ["entity_resolver"]
 
 [tool.ruff.format]
 quote-style = "single"
@@ -116,33 +109,30 @@ skip-magic-trailing-comma = false
 line-ending = "auto"
 
 ###############################################################################
-# [tool.mypy] - STATIC TYPE CHECKING
+# [tool.pyright] - STATIC TYPE CHECKING
 ###############################################################################
-[tool.mypy]
-python_version = "3.11"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = false
-disallow_incomplete_defs = false
-check_untyped_defs = true
-no_implicit_optional = true
-warn_redundant_casts = true
-warn_unused_ignores = true
-warn_no_return = true
-warn_unreachable = true
-strict_equality = true
-show_error_codes = true
+[tool.pyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.11"
+useLibraryCodeForTypes = true
+indexing = true
+autoSearchPaths = true
+autoImportCompletions = true
 
-# Ignore missing imports for libraries without type stubs
-[[tool.mypy.overrides]]
-module = [
-    "cudf.*",
-    "cuml.*",
-    "cugraph.*",
-    "cupy.*",
-    "cupyx.*",
-    "rmm.*",
-    "postal.*",
-    "phonetics.*",
-]
-ignore_missing_imports = true
+# Inlay hints supported by Pyright (subset of Pylance UI options)
+[tool.pyright.inlayHints]
+functionReturnTypes = true
+variableTypes = true
+
+# Match diagnosticSeverityOverrides
+[tool.pyright.diagnosticSeverityOverrides]
+reportMissingTypeStubs = "none"
+reportUnknownMemberType = "information"
+reportUnknownArgumentType = "information"
+reportUnknownVariableType = "information"
+reportUnknownParameterType = "information"
+reportUnknownLambdaType = "information"
+reportUnknownCallableType = "information"
+
+# Keep noise down
+exclude = [".venv", "build", "dist", "**/__pycache__"]

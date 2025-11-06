@@ -21,45 +21,17 @@ Modules:
 """
 
 # Text processing
-from .text import (
-    get_canonical_name_gpu,
-    nfkc_normalize_series,
-    find_canonical_name,
-)
-
 # Address operations
 from .address import (
-    safe_parse_address,
-    create_address_key_gpu,
     calculate_address_score_gpu,
+    create_address_key_gpu,
     get_best_address_gpu,
     normalize_us_states,
+    safe_parse_address,
 )
 
-# Similarity calculations
-from .similarity import (
-    calculate_similarity_gpu,
-    find_similar_pairs,
-    calculate_embedding_similarity,
-)
-
-# Vector operations
-from .vector import (
-    normalize_rows,
-    balance_feature_streams,
-    center_kernel_matrix,
-    center_kernel_vector,
-    get_top_k_positive_eigenpairs,
-    create_consensus_embedding,
-    create_initial_vector,
-)
-
-# Graph operations
-from .graph import (
-    create_edge_list,
-    find_graph_components,
-    build_mutual_rank_graph,
-)
+# GPU memory operations
+from .clean_mem import gpu_memory_cleanup
 
 # Clustering operations
 from .clustering import (
@@ -67,30 +39,57 @@ from .clustering import (
     merge_snn_clusters,
 )
 
-# Validation
-from .validation import (
-    validate_no_duplicates,
-    validate_canonical_consistency,
-    check_state_compatibility,
-    check_street_number_compatibility,
+# String preparation for vectorization
+from .embedding_streams import (
+    AllTextStreams,
+    TextStreamSet,
+    prepare_text_streams,
+)
+
+# Graph operations
+from .graph import (
+    build_mutual_rank_graph,
+    create_edge_list,
+    find_graph_components,
 )
 
 # Matrix operations
 from .matrix_ops import (
     ensure_finite_matrix,
-    winsorize_matrix,
-    scale_by_frobenius_norm,
     prune_sparse_matrix,
+    scale_by_frobenius_norm,
+    winsorize_matrix,
 )
 
-# GPU memory operations
-from .clean_mem import gpu_memory_cleanup
+# Similarity calculations
+from .similarity import (
+    calculate_embedding_similarity,
+    calculate_similarity_gpu,
+    find_similar_pairs,
+)
+from .text import (
+    find_canonical_name,
+    get_canonical_name_gpu,
+    nfkc_normalize_series,
+)
 
-# String preparation for vectorization
-from .embedding_streams import (
-    prepare_text_streams,
-    TextStreamSet,
-    AllTextStreams,
+# Validation
+from .validation import (
+    check_state_compatibility,
+    check_street_number_compatibility,
+    validate_canonical_consistency,
+    validate_no_duplicates,
+)
+
+# Vector operations
+from .vector import (
+    balance_feature_streams,
+    center_kernel_matrix,
+    center_kernel_vector,
+    create_consensus_embedding,
+    create_initial_vector,
+    get_top_k_positive_eigenpairs,
+    normalize_rows,
 )
 
 # The public API of the 'utils' package.
@@ -99,19 +98,16 @@ __all__ = [
     'get_canonical_name_gpu',
     'nfkc_normalize_series',
     'find_canonical_name',
-
     # address.py
     'safe_parse_address',
     'create_address_key_gpu',
     'calculate_address_score_gpu',
     'get_best_address_gpu',
     'normalize_us_states',
-
     # similarity.py
     'calculate_similarity_gpu',
     'find_similar_pairs',
     'calculate_embedding_similarity',
-
     # vector.py
     'normalize_rows',
     'balance_feature_streams',
@@ -120,33 +116,27 @@ __all__ = [
     'get_top_k_positive_eigenpairs',
     'create_consensus_embedding',
     'create_initial_vector',
-
     # graph.py
     'create_edge_list',
     'find_graph_components',
     'build_mutual_rank_graph',
-
     # clustering.py
     'attach_noise_points',
     'merge_snn_clusters',
-
     # validation.py
     'validate_no_duplicates',
     'validate_canonical_consistency',
     'check_state_compatibility',
     'check_street_number_compatibility',
-
     # matrix_ops.py
     'ensure_finite_matrix',
     'winsorize_matrix',
     'scale_by_frobenius_norm',
     'prune_sparse_matrix',
-
     # clean_mem.py
     'gpu_memory_cleanup',
-
     # embedding_streams.py
     'prepare_text_streams',
     'TextStreamSet',
-    'AllTextStreams'
+    'AllTextStreams',
 ]

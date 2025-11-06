@@ -5,10 +5,11 @@ generating human-readable reports and summary DataFrames from the results
 of the entity resolution pipeline.
 """
 
-import pandas as pd
-import cudf
 import logging
-from typing import Dict, Any
+from typing import Any
+
+import cudf
+import pandas as pd
 
 # --- Local Package Imports ---
 from .config import ResolverConfig
@@ -49,7 +50,7 @@ class ResolutionReporter:
         if resolved_gdf is None or resolved_gdf.empty:
             logger.error("Cannot generate review frame from empty or None resolved_gdf.")
             return pd.DataFrame(columns=[
-                'original_name', 'original_address', 
+                'original_name', 'original_address',
                 'canonical_name', 'canonical_address'
             ])
 
@@ -71,7 +72,7 @@ class ResolutionReporter:
             'canonical_name',
             'canonical_address'
         ]].rename(columns={original_name_col: 'original_name'})
-        
+
         unique_mappings = review_gdf.drop_duplicates()
 
         # --- Step 3: Sort for readability ---
@@ -82,8 +83,8 @@ class ResolutionReporter:
 
         logger.info(f"Found {len(sorted_mappings)} unique original -> canonical mappings.")
         return sorted_mappings.to_pandas()
-    
-    def generate_report(self, original_df: pd.DataFrame, resolved_gdf: cudf.DataFrame, canonical_map: cudf.DataFrame) -> Dict[str, Any]:
+
+    def generate_report(self, original_df: pd.DataFrame, resolved_gdf: cudf.DataFrame, canonical_map: cudf.DataFrame) -> dict[str, Any]:
         """
         Generates a dictionary of detailed statistics about the resolution process.
 
@@ -96,23 +97,23 @@ class ResolutionReporter:
             A dictionary containing detailed statistics about the resolution process.
         """
         logger.info("Generating enhanced final report...")
-        
+
         # --- Calculate Base Statistics ---
         unique_before = original_df[self.config.columns.entity_col].nunique()
         unique_after = resolved_gdf['canonical_name'].nunique()
-        
+
         # --- Calculate Distributional and Detailed Statistics ---
         cluster_sizes = resolved_gdf[resolved_gdf['final_cluster'] != -1].groupby('final_cluster').size()
         size_stats = cluster_sizes.describe().to_pandas().to_dict() if not cluster_sizes.empty else {}
         confidence_stats = resolved_gdf['confidence_score'].describe().to_pandas().to_dict() if 'confidence_score' in resolved_gdf.columns else {}
-        
+
         # --- Breakdown of Review Reasons ---
         review_reasons_breakdown = {}
         if 'needs_review' in resolved_gdf.columns and resolved_gdf['needs_review'].sum() > 0:
             review_reasons = resolved_gdf[resolved_gdf['needs_review']]['review_reason'].to_pandas()
             review_reasons_breakdown = review_reasons.str.get_dummies(sep=',').sum().to_dict()
 
-        # --- Assemble the Final Report Dictionary ---
+        # --- Assemble the Final Report dictionary ---
         report_dict = {
             'summary': {
                 'total_records_processed': len(resolved_gdf),
@@ -133,26 +134,26 @@ class ResolutionReporter:
                 'review_reasons_breakdown': review_reasons_breakdown
             }
         }
-        
+
         # Convert all GPU-based scalar values to standard Python numbers for clean output.
-        for section, content in report_dict.items():
+        for _, content in report_dict.items():
             if isinstance(content, dict):
                 for key, val in content.items():
                     if hasattr(val, 'item'):
                         content[key] = val.item()
-        
+
         # Log the formatted report to the console.
         self._log_report(report_dict)
-                
+
         return report_dict
 
-    def _log_report(self, report_dict: Dict[str, Any]) -> None:
+    def _log_report(self, report_dict: dict[str, Any]) -> None:
         """Formats and logs the generated report dictionary."""
         logger.info("--- Resolution Report ---")
         for key, val in report_dict['summary'].items():
             val_str = f"{val:.2%}" if 'rate' in key else str(val)
             logger.info(f"{key.replace('_', ' ').title():<28}: {val_str}")
-        
+
         logger.info("\n--- Clustering Details ---")
         for key, val in report_dict['clustering_details'].items():
             logger.info(f"{key.replace('_', ' ').title():<28}: {val}")

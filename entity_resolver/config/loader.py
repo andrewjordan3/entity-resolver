@@ -3,12 +3,12 @@
 Loads and saves the configuration from/to a YAML file using a validated schema.
 This module separates I/O operations from validation logic for flexibility.
 """
+
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 import cupy
-
 import yaml
 from pydantic import ValidationError
 
@@ -18,7 +18,7 @@ from .schema import ResolverConfig
 logger = logging.getLogger(__name__)
 
 
-def _validate_and_create_config(data: Dict[str, Any]) -> ResolverConfig:
+def _validate_and_create_config(data: dict[str, Any]) -> ResolverConfig:
     """
     Internal helper to validate a dictionary against the ResolverConfig schema.
 
@@ -36,11 +36,11 @@ def _validate_and_create_config(data: Dict[str, Any]) -> ResolverConfig:
         return ResolverConfig.model_validate(data)
     except ValidationError as e:
         # Log the critical error and re-raise to halt execution.
-        logger.critical(f"Configuration validation failed:\n{e}")
+        logger.critical(f'Configuration validation failed:\n{e}')
         raise
 
 
-def load_raw_config(config_path: Path | str) -> Dict[str, Any]:
+def load_raw_config(config_path: Path | str) -> dict[str, Any]:
     """
     Loads raw, unvalidated configuration from a YAML file into a dictionary.
 
@@ -58,15 +58,15 @@ def load_raw_config(config_path: Path | str) -> Dict[str, Any]:
     """
     config_path = Path(config_path)
     if not config_path.exists():
-        logger.error(f"Configuration file not found at: {config_path}")
-        raise FileNotFoundError(f"Configuration file not found at: {config_path}")
+        logger.error(f'Configuration file not found at: {config_path}')
+        raise FileNotFoundError(f'Configuration file not found at: {config_path}')
 
-    logger.info(f"Loading raw, unvalidated configuration from: {config_path}")
-    with open(config_path, 'r') as f:
+    logger.info(f'Loading raw, unvalidated configuration from: {config_path}')
+    with open(config_path) as f:
         return yaml.safe_load(f) or {}
 
 
-def load_config(config_path: Optional[Path | str] = None) -> ResolverConfig:
+def load_config(config_path: Path | str | None = None) -> ResolverConfig:
     """
     Loads, validates, and merges configuration from a YAML file.
 
@@ -86,7 +86,7 @@ def load_config(config_path: Optional[Path | str] = None) -> ResolverConfig:
     """
     if not config_path:
         user_config_data = {}
-        logger.info("No configuration path provided. Using default settings.")
+        logger.info('No configuration path provided. Using default settings.')
     else:
         # For the main loading function, we can reuse the raw loader.
         user_config_data = load_raw_config(config_path)
@@ -94,7 +94,8 @@ def load_config(config_path: Optional[Path | str] = None) -> ResolverConfig:
     # Always validate the loaded data and return a ResolverConfig object.
     return _validate_and_create_config(user_config_data)
 
-def _prepare_config_for_saving(data: Dict[str, Any]) -> Dict[str, Any]:
+
+def _prepare_config_for_saving(data: dict[str, Any]) -> dict[str, Any]:
     """
     Recursively converts non-serializable objects in a config dict to strings.
 
@@ -123,6 +124,7 @@ def _prepare_config_for_saving(data: Dict[str, Any]) -> Dict[str, Any]:
             serializable_data[key] = value
     return serializable_data
 
+
 def save_config(config: ResolverConfig, path: Path | str) -> None:
     """
     Saves a ResolverConfig instance to a YAML file.
@@ -135,7 +137,7 @@ def save_config(config: ResolverConfig, path: Path | str) -> None:
         TypeError: If the provided config is not a ResolverConfig instance.
     """
     if not isinstance(config, ResolverConfig):
-        raise TypeError("Input must be a valid ResolverConfig instance to save.")
+        raise TypeError('Input must be a valid ResolverConfig instance to save.')
 
     output_path = Path(path)
     # Ensure the parent directory exists before writing the file.
@@ -148,12 +150,8 @@ def save_config(config: ResolverConfig, path: Path | str) -> None:
     # Convert any non-serializable objects (e.g., cupy.dtype) to strings.
     serializable_config_dict = _prepare_config_for_saving(config_dict)
 
-    logger.info(f"Saving configuration to: {output_path}")
+    logger.info(f'Saving configuration to: {output_path}')
     with open(output_path, 'w') as f:
         yaml.safe_dump(
-            serializable_config_dict,
-            f,
-            default_flow_style=False,
-            sort_keys=False,
-            indent=2
+            serializable_config_dict, f, default_flow_style=False, sort_keys=False, indent=2
         )

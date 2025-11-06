@@ -5,9 +5,9 @@ consistency checking, crucial for ensuring the integrity of the final
 resolved entities.
 """
 
-import cudf
 import logging
-from typing import Optional
+
+import cudf
 
 from ..config import ValidationConfig
 
@@ -33,16 +33,10 @@ def _find_cross_cluster_duplicates(gdf: cudf.DataFrame, cluster_col: str) -> cud
     """
     # Create a composite key to uniquely identify an entity by its name and address.
     # The '|||' separator is used to reliably split the key back apart for logging.
-    entity_keys = (
-        gdf['normalized_text'] + '|||' +
-        gdf['addr_normalized_key'].fillna('')
-    )
+    entity_keys = gdf['normalized_text'] + '|||' + gdf['addr_normalized_key'].fillna('')
 
     # Create a temporary DataFrame for the check.
-    key_cluster_df = cudf.DataFrame({
-        'entity_key': entity_keys,
-        'cluster': gdf[cluster_col]
-    })
+    key_cluster_df = cudf.DataFrame({'entity_key': entity_keys, 'cluster': gdf[cluster_col]})
 
     # Group by the unique entity key and count the number of distinct cluster IDs.
     unique_clusters_per_key = key_cluster_df.groupby('entity_key')['cluster'].nunique()
@@ -52,10 +46,10 @@ def _find_cross_cluster_duplicates(gdf: cudf.DataFrame, cluster_col: str) -> cud
 
 
 def validate_no_duplicates(
-        gdf: cudf.DataFrame, 
-        cluster_col: str = 'final_cluster',
-        context: Optional[str] = None,
-    ) -> bool:
+    gdf: cudf.DataFrame,
+    cluster_col: str = 'final_cluster',
+    context: str | None = None,
+) -> bool:
     """
     Validates that no identical name+address combination exists in different clusters.
 
@@ -68,7 +62,7 @@ def validate_no_duplicates(
     Returns:
         True if validation passes, False otherwise.
     """
-    phase = f" during {context}" if context else ""
+    phase = f' during {context}' if context else ''
     logger.info(f"Validating for cross-cluster duplicates in column '{cluster_col}'{phase}...")
     if cluster_col not in gdf.columns:
         logger.error(f"Validation FAILED{phase}: Column '{cluster_col}' not found in DataFrame.")
@@ -77,29 +71,32 @@ def validate_no_duplicates(
     # We only need to check records that have been assigned to a cluster.
     clustered_gdf = gdf[gdf[cluster_col] != -1].copy()
     if clustered_gdf.empty:
-        logger.info(f"No clustered records to validate{phase}. Validation PASSED.")
+        logger.info(f'No clustered records to validate{phase}. Validation PASSED.')
         return True
 
     duplicates = _find_cross_cluster_duplicates(clustered_gdf, cluster_col)
 
     if not duplicates.empty:
-        logger.error(f"❌ VALIDATION FAILED{phase}: {len(duplicates)} entities appear in multiple clusters!")
+        logger.error(
+            f'❌ VALIDATION FAILED{phase}: {len(duplicates)} entities appear in multiple clusters!'
+        )
         # Log the first few examples for quick debugging.
         for entity_key, cluster_count in duplicates.head(5).to_pandas().items():
             name, addr = entity_key.split('|||', 1)
             logger.error(f"  '{name}' at '{addr}' appears in {cluster_count} different clusters.")
         return False
 
-    logger.info(f"✅ Validation PASSED{phase}: No cross-cluster duplicates found.")
+    logger.info(f'✅ Validation PASSED{phase}: No cross-cluster duplicates found.')
     return True
 
 
 def _log_canonical_consistency_errors(
-    clustered_gdf: cudf.DataFrame,
-    inconsistent_names: cudf.Series
+    clustered_gdf: cudf.DataFrame, inconsistent_names: cudf.Series
 ):
     """Logs detailed diagnostic information for inconsistent canonical mappings."""
-    logger.error(f"❌ CRITICAL: Canonical consistency FAILED! {len(inconsistent_names)} names are linked to multiple addresses!")
+    logger.error(
+        f'❌ CRITICAL: Canonical consistency FAILED! {len(inconsistent_names)} names are linked to multiple addresses!'
+    )
 
     # Log detailed examples of the first 5 inconsistent names.
     for name, count in inconsistent_names.head(5).to_pandas().items():
@@ -110,14 +107,18 @@ def _log_canonical_consistency_errors(
         logger.error(f"\n  '{name}' appears with {count} different addresses:")
         for _, row in problem_records.to_pandas().iterrows():
             logger.error(f"    - Address: '{row['canonical_address']}'")
-            logger.error(f"      Cluster: {row['final_cluster']}, Original Text: '{row['normalized_text']}'")
+            logger.error(
+                f"      Cluster: {row['final_cluster']}, Original Text: '{row['normalized_text']}'"
+            )
 
         # Specifically check for the problematic case of mixed null/non-null addresses.
         addr_values = clustered_gdf[clustered_gdf['canonical_name'] == name]['canonical_address']
         if addr_values.isnull().any() and addr_values.notna().any():
             null_count = addr_values.isnull().sum()
             total_count = len(addr_values)
-            logger.error(f"  WARNING: This name has both populated and missing addresses ({null_count}/{total_count} missing).")
+            logger.error(
+                f'  WARNING: This name has both populated and missing addresses ({null_count}/{total_count} missing).'
+            )
 
 
 def validate_canonical_consistency(final_gdf: cudf.DataFrame) -> bool:
@@ -133,10 +134,10 @@ def validate_canonical_consistency(final_gdf: cudf.DataFrame) -> bool:
     Returns:
         True if the output is consistent, False otherwise.
     """
-    logger.info("Performing final validation of canonical name/address consistency...")
+    logger.info('Performing final validation of canonical name/address consistency...')
     required_cols = ['canonical_name', 'canonical_address', 'final_cluster']
     if not all(col in final_gdf.columns for col in required_cols):
-        logger.warning("Canonical columns not found, skipping canonical consistency check.")
+        logger.warning('Canonical columns not found, skipping canonical consistency check.')
         return True
 
     # We only check entities that were successfully clustered.
@@ -145,7 +146,9 @@ def validate_canonical_consistency(final_gdf: cudf.DataFrame) -> bool:
     # For each canonical_name, count how many unique canonical_addresses it has.
     # CRITICAL: `dropna=False` is essential to catch cases where a name is linked
     # to both a real address and a null/missing address.
-    addresses_per_name = clustered_gdf.groupby('canonical_name')['canonical_address'].nunique(dropna=False)
+    addresses_per_name = clustered_gdf.groupby('canonical_name')['canonical_address'].nunique(
+        dropna=False
+    )
 
     # In a consistent output, this number should always be 1 for every name.
     inconsistent_names = addresses_per_name[addresses_per_name > 1]
@@ -154,13 +157,12 @@ def validate_canonical_consistency(final_gdf: cudf.DataFrame) -> bool:
         _log_canonical_consistency_errors(clustered_gdf, inconsistent_names)
         return False
 
-    logger.info("✅ Final validation PASSED: Canonical names and addresses are consistent.")
+    logger.info('✅ Final validation PASSED: Canonical names and addresses are consistent.')
     return True
 
+
 def check_state_compatibility(
-    entity_states: cudf.Series,
-    cluster_states: cudf.Series,
-    config: ValidationConfig
+    entity_states: cudf.Series, cluster_states: cudf.Series, config: ValidationConfig
 ) -> cudf.Series:
     """
     Checks if two state series are compatible using a vectorized GPU approach.
@@ -180,11 +182,7 @@ def check_state_compatibility(
       • Pairs with any null are treated as already compatible and are not sent to neighbor checks
     """
     # 1. Base case: states are compatible if they are identical or one is null.
-    states_match = (
-        (entity_states == cluster_states) |
-        entity_states.isna() |
-        cluster_states.isna()
-    )
+    states_match = (entity_states == cluster_states) | entity_states.isna() | cluster_states.isna()
 
     # 2. If all pairs are already compatible, we are done.
     if states_match.all() or not config.enforce_state_boundaries:
@@ -194,23 +192,25 @@ def check_state_compatibility(
     # Isolate pairs that are not yet considered a match.
     # Get mismatched indices
     mismatched_indices = states_match[~states_match].index
-    
+
     # Create DataFrame BUT PRESERVE THE INDEX
-    mismatched_df = cudf.DataFrame({
-        's1': entity_states.loc[mismatched_indices],
-        's2': cluster_states.loc[mismatched_indices]
-    }, index=mismatched_indices)  # KEEP THE ORIGINAL INDEX
-    
+    mismatched_df = cudf.DataFrame(
+        {'s1': entity_states.loc[mismatched_indices], 's2': cluster_states.loc[mismatched_indices]},
+        index=mismatched_indices,
+    )  # KEEP THE ORIGINAL INDEX
+
     # Now track which indices have non-null values before dropna
     non_null_mask = ~(mismatched_df['s1'].isna() | mismatched_df['s2'].isna())
-    
+
     # Only process non-null pairs
-    mismatched_df_clean = mismatched_df[non_null_mask].reset_index().rename(columns={'index': 'original_index'})
+    mismatched_df_clean = (
+        mismatched_df[non_null_mask].reset_index().rename(columns={'index': 'original_index'})
+    )
 
     if mismatched_df_clean.empty:
         return states_match
 
-    logger.debug(f"Checking {len(mismatched_df)} mismatched state pairs against neighbors config.")
+    logger.debug(f'Checking {len(mismatched_df)} mismatched state pairs against neighbors config.')
 
     # Create a DataFrame of allowed neighbor pairs for efficient joining.
     allowed_pairs_list = config.allow_neighboring_states
@@ -218,9 +218,13 @@ def check_state_compatibility(
 
     # Check for matches in both directions, e.g., (IL, WI) and (WI, IL).
     # Merge 1: (s1, s2) -> (p1, p2)
-    merged1 = mismatched_df_clean.merge(allowed_df, left_on=['s1', 's2'], right_on=['p1', 'p2'], how='inner')
+    merged1 = mismatched_df_clean.merge(
+        allowed_df, left_on=['s1', 's2'], right_on=['p1', 'p2'], how='inner'
+    )
     # Merge 2: (s1, s2) -> (p2, p1)
-    merged2 = mismatched_df_clean.merge(allowed_df, left_on=['s1', 's2'], right_on=['p2', 'p1'], how='inner')
+    merged2 = mismatched_df_clean.merge(
+        allowed_df, left_on=['s1', 's2'], right_on=['p2', 'p1'], how='inner'
+    )
 
     # Use the preserved 'original_index' column ---
     # Instead of using the incorrect .index attribute of the merged DataFrames,
@@ -231,10 +235,9 @@ def check_state_compatibility(
     # Combine indices of all pairs found in the allowed list.
     # The index of the merged result corresponds to the index of mismatched_df,
     # which in turn corresponds to the original index in the states_match series.
-    allowed_indices = cudf.concat([
-        allowed_indices_from_merge1, 
-        allowed_indices_from_merge2
-    ]).unique()
+    allowed_indices = cudf.concat(
+        [allowed_indices_from_merge1, allowed_indices_from_merge2]
+    ).unique()
 
     # Update the states_match series for the newly validated neighbors.
     if not allowed_indices.empty:
@@ -243,10 +246,9 @@ def check_state_compatibility(
 
     return states_match
 
+
 def check_street_number_compatibility(
-    source_numbers: cudf.Series,
-    target_numbers: cudf.Series,
-    threshold: int
+    source_numbers: cudf.Series, target_numbers: cudf.Series, threshold: int
 ) -> cudf.Series:
     """
     Return a boolean Series (aligned to `source_numbers.index`) indicating whether

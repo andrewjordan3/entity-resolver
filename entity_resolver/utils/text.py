@@ -25,13 +25,15 @@ consistent, and ready for accurate vectorization and matching.
 """
 
 import logging
-import pandas as pd
 import re
+
 import cudf
 import cupy
+import pandas as pd
 import unicodedata2
 from cuml.feature_extraction.text import TfidfVectorizer
 from cuml.metrics.pairwise_distances import pairwise_distances
+
 from ..config import SimilarityTfidfParams
 
 # Set up a logger for this module.
@@ -44,156 +46,149 @@ logger = logging.getLogger(__name__)
 # representation for matching against messy, real-world data.
 _ASCII_COMPAT_MAP = {
     # --- Punctuation and Symbols (fold to ASCII) ---
-    "\u2044": "/",  # FRACTION SLASH → SOLIDUS
-    "\u2215": "/",  # DIVISION SLASH → SOLIDUS
-    "\u00F7": "/",  # DIVISION SIGN → SOLIDUS (keep for part numbers)
-    "\u00D7": "x",  # MULTIPLICATION SIGN → letter x
-    "\u2212": "-",  # MINUS SIGN → HYPHEN-MINUS
-    "\u2010": "-",  # HYPHEN
-    "\u2011": "-",  # NON-BREAKING HYPHEN
-    "\u2012": "-",  # FIGURE DASH
-    "\u2013": "-",  # EN DASH
-    "\u2014": "-",  # EM DASH
-    "\u2015": "-",  # HORIZONTAL BAR
-    "\u2043": "-",  # HYPHEN BULLET → hyphen
-    "\u2022": "-",  # BULLET → hyphen (your existing choice)
-    "\u2219": ".",  # BULLET OPERATOR → period
-    "\u00B7": " ",  # MIDDLE DOT → space (acts as separator)
-    "\u2218": "o",  # RING OPERATOR → 'o' (seen in part numbers)
-    "\u2026": "...",# HORIZONTAL ELLIPSIS → three periods
-    "\u00AE": "",   # REGISTERED SIGN (®) → remove
-    "\u2122": "",   # TRADE MARK SIGN (™) → remove
-    "\u00A9": "",   # COPYRIGHT SIGN (©) → remove
-    "\u2120": "",   # SERVICE MARK (℠) → remove
-    "\u00B0": "",   # DEGREE SIGN (°) → remove
-    "\u02DA": "",   # RING ABOVE (˚) → remove
-    
+    '\u2044': '/',  # FRACTION SLASH → SOLIDUS
+    '\u2215': '/',  # DIVISION SLASH → SOLIDUS
+    '\u00f7': '/',  # DIVISION SIGN → SOLIDUS (keep for part numbers)
+    '\u00d7': 'x',  # MULTIPLICATION SIGN → letter x
+    '\u2212': '-',  # MINUS SIGN → HYPHEN-MINUS
+    '\u2010': '-',  # HYPHEN
+    '\u2011': '-',  # NON-BREAKING HYPHEN
+    '\u2012': '-',  # FIGURE DASH
+    '\u2013': '-',  # EN DASH
+    '\u2014': '-',  # EM DASH
+    '\u2015': '-',  # HORIZONTAL BAR
+    '\u2043': '-',  # HYPHEN BULLET → hyphen
+    '\u2022': '-',  # BULLET → hyphen (your existing choice)
+    '\u2219': '.',  # BULLET OPERATOR → period
+    '\u00b7': ' ',  # MIDDLE DOT → space (acts as separator)
+    '\u2218': 'o',  # RING OPERATOR → 'o' (seen in part numbers)
+    '\u2026': '...',  # HORIZONTAL ELLIPSIS → three periods
+    '\u00ae': '',  # REGISTERED SIGN (®) → remove
+    '\u2122': '',  # TRADE MARK SIGN (™) → remove
+    '\u00a9': '',  # COPYRIGHT SIGN (©) → remove
+    '\u2120': '',  # SERVICE MARK (℠) → remove
+    '\u00b0': '',  # DEGREE SIGN (°) → remove
+    '\u02da': '',  # RING ABOVE (˚) → remove
     # --- Currency Symbols (remove for entity matching) ---
-    "\u00A2": "",   # CENT SIGN (¢) → remove
-    "\u00A3": "",   # POUND SIGN (£) → remove
-    "\u00A4": "",   # CURRENCY SIGN (¤) → remove
-    "\u00A5": "",   # YEN SIGN (¥) → remove
-    "\u20AC": "",   # EURO SIGN (€) → remove
-    "\u2030": "",   # PER MILLE SIGN (‰) → remove
-    "\u2031": "",   # PER TEN THOUSAND SIGN → remove
-    
+    '\u00a2': '',  # CENT SIGN (¢) → remove
+    '\u00a3': '',  # POUND SIGN (£) → remove
+    '\u00a4': '',  # CURRENCY SIGN (¤) → remove
+    '\u00a5': '',  # YEN SIGN (¥) → remove
+    '\u20ac': '',  # EURO SIGN (€) → remove
+    '\u2030': '',  # PER MILLE SIGN (‰) → remove
+    '\u2031': '',  # PER TEN THOUSAND SIGN → remove
     # --- Mathematical and Technical Symbols ---
-    "\u00B1": "+-", # PLUS-MINUS SIGN → plus-minus
-    "\u2248": "~",  # ALMOST EQUAL TO → tilde
-    "\u2260": "!=", # NOT EQUAL TO → != 
-    "\u2264": "<=", # LESS-THAN OR EQUAL TO → <=
-    "\u2265": ">=", # GREATER-THAN OR EQUAL TO → >=
-    "\u00AC": "!",  # NOT SIGN → exclamation
-    "\u221E": "",   # INFINITY → remove
-    
+    '\u00b1': '+-',  # PLUS-MINUS SIGN → plus-minus
+    '\u2248': '~',  # ALMOST EQUAL TO → tilde
+    '\u2260': '!=',  # NOT EQUAL TO → !=
+    '\u2264': '<=',  # LESS-THAN OR EQUAL TO → <=
+    '\u2265': '>=',  # GREATER-THAN OR EQUAL TO → >=
+    '\u00ac': '!',  # NOT SIGN → exclamation
+    '\u221e': '',  # INFINITY → remove
     # --- Ordinal Indicators (important for addresses) ---
-    "\u00AA": "a",  # FEMININE ORDINAL INDICATOR (ª) → 'a'
-    "\u00BA": "o",  # MASCULINE ORDINAL INDICATOR (º) → 'o'
-    "\u02E2": "s",  # MODIFIER LETTER SMALL S (superscript s)
-    "\u02E3": "x",  # MODIFIER LETTER SMALL X (superscript x)
-    
+    '\u00aa': 'a',  # FEMININE ORDINAL INDICATOR (ª) → 'a'
+    '\u00ba': 'o',  # MASCULINE ORDINAL INDICATOR (º) → 'o'
+    '\u02e2': 's',  # MODIFIER LETTER SMALL S (superscript s)
+    '\u02e3': 'x',  # MODIFIER LETTER SMALL X (superscript x)
     # --- Quotes and Primes (unify to ASCII) ---
-    "\u2018": "'",  # LEFT SINGLE QUOTATION MARK
-    "\u2019": "'",  # RIGHT SINGLE QUOTATION MARK
-    "\u201A": "'",  # SINGLE LOW-9 QUOTATION MARK
-    "\u201B": "'",  # SINGLE HIGH-REVERSED-9 QUOTATION MARK
-    "\u2032": "'",  # PRIME (feet/minutes) → apostrophe
-    "\u2035": "'",  # REVERSED PRIME → apostrophe
-    "\u201C": '"',  # LEFT DOUBLE QUOTATION MARK
-    "\u201D": '"',  # RIGHT DOUBLE QUOTATION MARK
-    "\u201E": '"',  # DOUBLE LOW-9 QUOTATION MARK
-    "\u201F": '"',  # DOUBLE HIGH-REVERSED-9 QUOTATION MARK
-    "\u2033": '"',  # DOUBLE PRIME (inches/seconds) → quote
-    "\u2036": '"',  # REVERSED DOUBLE PRIME → quote
-    "\u2034": "'''", # TRIPLE PRIME → three apostrophes
-    "\u2037": "'''", # REVERSED TRIPLE PRIME → three apostrophes
-    "\u00AB": '"',  # LEFT-POINTING DOUBLE ANGLE QUOTATION MARK («)
-    "\u00BB": '"',  # RIGHT-POINTING DOUBLE ANGLE QUOTATION MARK (»)
-    "\u2039": "'",  # SINGLE LEFT-POINTING ANGLE QUOTATION MARK (‹)
-    "\u203A": "'",  # SINGLE RIGHT-POINTING ANGLE QUOTATION MARK (›)
-    
+    '\u2018': "'",  # LEFT SINGLE QUOTATION MARK
+    '\u2019': "'",  # RIGHT SINGLE QUOTATION MARK
+    '\u201a': "'",  # SINGLE LOW-9 QUOTATION MARK
+    '\u201b': "'",  # SINGLE HIGH-REVERSED-9 QUOTATION MARK
+    '\u2032': "'",  # PRIME (feet/minutes) → apostrophe
+    '\u2035': "'",  # REVERSED PRIME → apostrophe
+    '\u201c': '"',  # LEFT DOUBLE QUOTATION MARK
+    '\u201d': '"',  # RIGHT DOUBLE QUOTATION MARK
+    '\u201e': '"',  # DOUBLE LOW-9 QUOTATION MARK
+    '\u201f': '"',  # DOUBLE HIGH-REVERSED-9 QUOTATION MARK
+    '\u2033': '"',  # DOUBLE PRIME (inches/seconds) → quote
+    '\u2036': '"',  # REVERSED DOUBLE PRIME → quote
+    '\u2034': "'''",  # TRIPLE PRIME → three apostrophes
+    '\u2037': "'''",  # REVERSED TRIPLE PRIME → three apostrophes
+    '\u00ab': '"',  # LEFT-POINTING DOUBLE ANGLE QUOTATION MARK («)
+    '\u00bb': '"',  # RIGHT-POINTING DOUBLE ANGLE QUOTATION MARK (»)
+    '\u2039': "'",  # SINGLE LEFT-POINTING ANGLE QUOTATION MARK (‹)
+    '\u203a': "'",  # SINGLE RIGHT-POINTING ANGLE QUOTATION MARK (›)
     # --- Whitespace Variants (map to standard space) ---
-    "\t": " ",      # TAB → space
-    "\n": " ",      # NEWLINE → space (for multi-line addresses)
-    "\r": " ",      # CARRIAGE RETURN → space
-    "\u00A0": " ",  # NO-BREAK SPACE
-    "\u2000": " ",  # EN QUAD
-    "\u2001": " ",  # EM QUAD
-    "\u2002": " ",  # EN SPACE
-    "\u2003": " ",  # EM SPACE
-    "\u2004": " ",  # THREE-PER-EM SPACE
-    "\u2005": " ",  # FOUR-PER-EM SPACE
-    "\u2006": " ",  # SIX-PER-EM SPACE
-    "\u2007": " ",  # FIGURE SPACE
-    "\u2008": " ",  # PUNCTUATION SPACE
-    "\u2009": " ",  # THIN SPACE
-    "\u200A": " ",  # HAIR SPACE
-    "\u202F": " ",  # NARROW NO-BREAK SPACE
-    "\u205F": " ",  # MEDIUM MATHEMATICAL SPACE
-    "\u3000": " ",  # IDEOGRAPHIC SPACE
-    "\u2028": " ",  # LINE SEPARATOR
-    "\u2029": " ",  # PARAGRAPH SEPARATOR
-    
+    '\t': ' ',  # TAB → space
+    '\n': ' ',  # NEWLINE → space (for multi-line addresses)
+    '\r': ' ',  # CARRIAGE RETURN → space
+    '\u00a0': ' ',  # NO-BREAK SPACE
+    '\u2000': ' ',  # EN QUAD
+    '\u2001': ' ',  # EM QUAD
+    '\u2002': ' ',  # EN SPACE
+    '\u2003': ' ',  # EM SPACE
+    '\u2004': ' ',  # THREE-PER-EM SPACE
+    '\u2005': ' ',  # FOUR-PER-EM SPACE
+    '\u2006': ' ',  # SIX-PER-EM SPACE
+    '\u2007': ' ',  # FIGURE SPACE
+    '\u2008': ' ',  # PUNCTUATION SPACE
+    '\u2009': ' ',  # THIN SPACE
+    '\u200a': ' ',  # HAIR SPACE
+    '\u202f': ' ',  # NARROW NO-BREAK SPACE
+    '\u205f': ' ',  # MEDIUM MATHEMATICAL SPACE
+    '\u3000': ' ',  # IDEOGRAPHIC SPACE
+    '\u2028': ' ',  # LINE SEPARATOR
+    '\u2029': ' ',  # PARAGRAPH SEPARATOR
     # --- Zero-Width and Invisible Characters (remove completely) ---
-    "\u00AD": "",   # SOFT HYPHEN
-    "\u200B": "",   # ZERO WIDTH SPACE
-    "\u200C": "",   # ZERO WIDTH NON-JOINER
-    "\u200D": "",   # ZERO WIDTH JOINER
-    "\u2060": "",   # WORD JOINER
-    "\u180E": "",   # MONGOLIAN VOWEL SEPARATOR
-    "\uFEFF": "",   # ZERO WIDTH NO-BREAK SPACE (BOM)
-    "\u034F": "",   # COMBINING GRAPHEME JOINER
-    "\u061C": "",   # ARABIC LETTER MARK
-    "\u115F": "",   # HANGUL CHOSEONG FILLER
-    "\u1160": "",   # HANGUL JUNGSEONG FILLER
-    "\u17B4": "",   # KHMER VOWEL INHERENT AQ
-    "\u17B5": "",   # KHMER VOWEL INHERENT AA
-    
+    '\u00ad': '',  # SOFT HYPHEN
+    '\u200b': '',  # ZERO WIDTH SPACE
+    '\u200c': '',  # ZERO WIDTH NON-JOINER
+    '\u200d': '',  # ZERO WIDTH JOINER
+    '\u2060': '',  # WORD JOINER
+    '\u180e': '',  # MONGOLIAN VOWEL SEPARATOR
+    '\ufeff': '',  # ZERO WIDTH NO-BREAK SPACE (BOM)
+    '\u034f': '',  # COMBINING GRAPHEME JOINER
+    '\u061c': '',  # ARABIC LETTER MARK
+    '\u115f': '',  # HANGUL CHOSEONG FILLER
+    '\u1160': '',  # HANGUL JUNGSEONG FILLER
+    '\u17b4': '',  # KHMER VOWEL INHERENT AQ
+    '\u17b5': '',  # KHMER VOWEL INHERENT AA
     # --- BiDi / Directional Controls (remove completely) ---
-    "\u200E": "",   # LEFT-TO-RIGHT MARK
-    "\u200F": "",   # RIGHT-TO-LEFT MARK
-    "\u202A": "",   # LEFT-TO-RIGHT EMBEDDING
-    "\u202B": "",   # RIGHT-TO-LEFT EMBEDDING
-    "\u202C": "",   # POP DIRECTIONAL FORMATTING
-    "\u202D": "",   # LEFT-TO-RIGHT OVERRIDE
-    "\u202E": "",   # RIGHT-TO-LEFT OVERRIDE
-    "\u2066": "",   # LEFT-TO-RIGHT ISOLATE
-    "\u2067": "",   # RIGHT-TO-LEFT ISOLATE
-    "\u2068": "",   # FIRST STRONG ISOLATE
-    "\u2069": "",   # POP DIRECTIONAL ISOLATE
-    "\u206A": "",   # INHIBIT SYMMETRIC SWAPPING
-    "\u206B": "",   # ACTIVATE SYMMETRIC SWAPPING
-    "\u206C": "",   # INHIBIT ARABIC FORM SHAPING
-    "\u206D": "",   # ACTIVATE ARABIC FORM SHAPING
-    "\u206E": "",   # NATIONAL DIGIT SHAPES
-    "\u206F": "",   # NOMINAL DIGIT SHAPES
-    
+    '\u200e': '',  # LEFT-TO-RIGHT MARK
+    '\u200f': '',  # RIGHT-TO-LEFT MARK
+    '\u202a': '',  # LEFT-TO-RIGHT EMBEDDING
+    '\u202b': '',  # RIGHT-TO-LEFT EMBEDDING
+    '\u202c': '',  # POP DIRECTIONAL FORMATTING
+    '\u202d': '',  # LEFT-TO-RIGHT OVERRIDE
+    '\u202e': '',  # RIGHT-TO-LEFT OVERRIDE
+    '\u2066': '',  # LEFT-TO-RIGHT ISOLATE
+    '\u2067': '',  # RIGHT-TO-LEFT ISOLATE
+    '\u2068': '',  # FIRST STRONG ISOLATE
+    '\u2069': '',  # POP DIRECTIONAL ISOLATE
+    '\u206a': '',  # INHIBIT SYMMETRIC SWAPPING
+    '\u206b': '',  # ACTIVATE SYMMETRIC SWAPPING
+    '\u206c': '',  # INHIBIT ARABIC FORM SHAPING
+    '\u206d': '',  # ACTIVATE ARABIC FORM SHAPING
+    '\u206e': '',  # NATIONAL DIGIT SHAPES
+    '\u206f': '',  # NOMINAL DIGIT SHAPES
     # --- Additional Symbols and Punctuation ---
-    "\u00A6": "|",  # BROKEN BAR → vertical bar
-    "\u00A7": "",   # SECTION SIGN (§) → remove
-    "\u00B6": "",   # PILCROW SIGN (¶) → remove
-    "\u2020": "",   # DAGGER (†) → remove
-    "\u2021": "",   # DOUBLE DAGGER (‡) → remove
-    "\u2023": "-",  # TRIANGULAR BULLET → hyphen
-    "\u2024": ".",  # ONE DOT LEADER → period
-    "\u2025": "..", # TWO DOT LEADER → two periods
-    "\u2027": "-",  # HYPHENATION POINT → hyphen
-    "\u203B": "*",  # REFERENCE MARK → asterisk
-    "\u203C": "!!", # DOUBLE EXCLAMATION MARK → two exclamations
-    "\u203D": "?!", # INTERROBANG → question-exclamation
-    "\u2047": "??", # DOUBLE QUESTION MARK → two questions
-    "\u2048": "?!", # QUESTION EXCLAMATION MARK → question-exclamation
-    "\u2049": "!?", # EXCLAMATION QUESTION MARK → exclamation-question
-    "\u204B": "",   # REVERSED PILCROW SIGN → remove
-    "\u204C": "",   # BLACK LEFTWARDS BULLET → remove
-    "\u204D": "",   # BLACK RIGHTWARDS BULLET → remove
-    "\u2052": "%",  # COMMERCIAL MINUS SIGN → percent
-    "\u2053": "~",  # SWUNG DASH → tilde
+    '\u00a6': '|',  # BROKEN BAR → vertical bar
+    '\u00a7': '',  # SECTION SIGN (§) → remove
+    '\u00b6': '',  # PILCROW SIGN (¶) → remove
+    '\u2020': '',  # DAGGER (†) → remove
+    '\u2021': '',  # DOUBLE DAGGER (‡) → remove
+    '\u2023': '-',  # TRIANGULAR BULLET → hyphen
+    '\u2024': '.',  # ONE DOT LEADER → period
+    '\u2025': '..',  # TWO DOT LEADER → two periods
+    '\u2027': '-',  # HYPHENATION POINT → hyphen
+    '\u203b': '*',  # REFERENCE MARK → asterisk
+    '\u203c': '!!',  # DOUBLE EXCLAMATION MARK → two exclamations
+    '\u203d': '?!',  # INTERROBANG → question-exclamation
+    '\u2047': '??',  # DOUBLE QUESTION MARK → two questions
+    '\u2048': '?!',  # QUESTION EXCLAMATION MARK → question-exclamation
+    '\u2049': '!?',  # EXCLAMATION QUESTION MARK → exclamation-question
+    '\u204b': '',  # REVERSED PILCROW SIGN → remove
+    '\u204c': '',  # BLACK LEFTWARDS BULLET → remove
+    '\u204d': '',  # BLACK RIGHTWARDS BULLET → remove
+    '\u2052': '%',  # COMMERCIAL MINUS SIGN → percent
+    '\u2053': '~',  # SWUNG DASH → tilde
 }
 
 # Create the translation table once when the module is imported.
 # This is a significant performance optimization.
 _ASCII_TRANSLATION_TABLE = str.maketrans(_ASCII_COMPAT_MAP)
+
 
 def _calculate_centrality_score(
     unique_names: cudf.Series,
@@ -215,43 +210,43 @@ def _calculate_centrality_score(
     Returns:
         A CuPy array of centrality scores, one for each unique name.
     """
-    min_for_df = 20 # Need to make this a parameter eventually
+    min_for_df = 20  # Need to make this a parameter eventually
     n_unique = len(unique_names)
     # Calculate frequency weights (proportion of total).
     total_items = name_counts.sum()
     freq_weights = (name_counts / total_items).values
-    
+
     # For very small groups, use edit distance instead of TF-IDF
     if n_unique < min_unique_for_similarity:
         if n_unique == 1:
             # Single name - it's 100% central by definition
             return cupy.ones(1)
-        
+
         # Calculate edit distance matrix
         similarity_matrix = cupy.zeros((n_unique, n_unique))
-        
+
         for i in range(n_unique):
             # Get edit distances from name i to all names
             distances = unique_names.str.edit_distance(unique_names.iloc[i])
-            
+
             # Convert distances to similarities (0 to 1 scale)
             # Using exponential decay: similarity = exp(-distance/max_len)
             max_len = unique_names.str.len().max()
             similarities = cupy.exp(-cupy.asarray(distances.values) / max_len)
             similarity_matrix[i, :] = similarities
-        
+
         # Weight similarities by frequency
         centrality_score = similarity_matrix @ freq_weights
-        
+
         logger.debug(
-            f"Using edit distance for {n_unique} unique names (< {min_unique_for_similarity})"
+            f'Using edit distance for {n_unique} unique names (< {min_unique_for_similarity})'
         )
         return centrality_score
-    
+
     exclude_keys = {'min_df', 'max_df'} if n_unique < min_for_df else set()
 
     vec_params = tfidf_params.model_dump(
-        mode="python",
+        mode='python',
         round_trip=True,
         exclude=exclude_keys,
         exclude_none=True,
@@ -263,7 +258,7 @@ def _calculate_centrality_score(
 
     # Check if we got meaningful features
     if tfidf_matrix.shape[1] == 0:
-        logger.warning("TF-IDF produced no features, falling back to frequency weights")
+        logger.warning('TF-IDF produced no features, falling back to frequency weights')
         return cupy.asarray(freq_weights)
 
     # Calculate the cosine similarity between all pairs of unique names.
@@ -276,6 +271,7 @@ def _calculate_centrality_score(
     centrality_score = similarity_matrix @ freq_weights
 
     return cupy.asarray(centrality_score)
+
 
 def _calculate_length_bonus(unique_names: cudf.Series) -> cupy.ndarray:
     """
@@ -299,9 +295,9 @@ def _calculate_length_bonus(unique_names: cudf.Series) -> cupy.ndarray:
 
 
 def get_canonical_name_gpu(
-        name_series: cudf.Series, 
-        tfidf_params: SimilarityTfidfParams,
-    ) -> str:
+    name_series: cudf.Series,
+    tfidf_params: SimilarityTfidfParams,
+) -> str:
     """
     Selects the best canonical name from a Series of candidates on the GPU.
 
@@ -320,14 +316,16 @@ def get_canonical_name_gpu(
         if the input is empty.
     """
     if name_series.empty:
-        logger.warning("get_canonical_name_gpu received an empty series.")
-        return ""
+        logger.warning('get_canonical_name_gpu received an empty series.')
+        return ''
 
     unique_names = name_series.unique()
     if len(unique_names) == 1:
         return unique_names.iloc[0]
 
-    logger.debug(f"Finding canonical name from {len(unique_names)} unique candidates (out of {len(name_series)} total).")
+    logger.debug(
+        f'Finding canonical name from {len(unique_names)} unique candidates (out of {len(name_series)} total).'
+    )
 
     # --- Score Calculation ---
     name_counts = name_series.value_counts().reindex(unique_names).fillna(0)
@@ -350,7 +348,7 @@ def get_canonical_name_gpu(
     # The final score is modulated by the length bonus. This helps break ties
     # and promotes more descriptive names.
     final_scores = base_score * length_bonus
-    logger.debug(f"Calculated final scores for {len(final_scores)} unique names.")
+    logger.debug(f'Calculated final scores for {len(final_scores)} unique names.')
 
     # Find the index of the highest score and return the corresponding name.
     best_name_index = final_scores.argmax()
@@ -359,10 +357,11 @@ def get_canonical_name_gpu(
 
     return best_name
 
+
 def find_canonical_name(
     all_names_in_group: cudf.Series,
     unique_names_series: cudf.Series,
-    unique_name_vectors: cupy.ndarray
+    unique_name_vectors: cupy.ndarray,
 ) -> str:
     """
     Selects the best canonical name from a group using pre-computed embeddings.
@@ -426,13 +425,15 @@ def find_canonical_name(
         used to generate the canonical vectors required by this function.
     """
     if all_names_in_group.empty:
-        logger.warning("find_canonical_name received an empty series.")
-        return ""
+        logger.warning('find_canonical_name received an empty series.')
+        return ''
 
     if len(unique_names_series) == 1:
         return unique_names_series.iloc[0]
 
-    logger.debug(f"Finding canonical name from {len(unique_names_series)} unique candidates (out of {len(all_names_in_group)} total).")
+    logger.debug(
+        f'Finding canonical name from {len(unique_names_series)} unique candidates (out of {len(all_names_in_group)} total).'
+    )
 
     # --- Score Calculation ---
     # Ensure the name counts are aligned with the unique names series.
@@ -461,18 +462,20 @@ def find_canonical_name(
     # The final score is modulated by the length bonus. This helps break ties
     # and promotes more descriptive names.
     final_scores = base_score * length_bonus
-    logger.debug(f"Calculated final scores for {len(final_scores)} unique names.")
+    logger.debug(f'Calculated final scores for {len(final_scores)} unique names.')
 
     # Find the index of the highest score and return the corresponding name.
     best_name_index = int(cupy.argmax(final_scores))
     best_name = unique_names_series.iloc[best_name_index]
-    logger.debug(f"Selected '{best_name}' as the canonical name with score {final_scores[best_name_index]:.4f}.")
+    logger.debug(
+        f"Selected '{best_name}' as the canonical name with score {final_scores[best_name_index]:.4f}."
+    )
 
     return best_name
 
+
 def _calculate_centrality_score_with_vectors(
-    aligned_name_vectors: cupy.ndarray,
-    name_counts: cudf.Series
+    aligned_name_vectors: cupy.ndarray, name_counts: cudf.Series
 ) -> cupy.ndarray:
     """
     Calculates a centrality score for each unique name using canonical embeddings.
@@ -496,7 +499,7 @@ def _calculate_centrality_score_with_vectors(
         A dense CuPy array of shape (N, D) containing the "name-only" canonical
         embeddings. These vectors MUST be L2-normalized and must be perfectly
         aligned (row-for-row) with the `name_counts` Series.
-        
+
     name_counts : cudf.Series
         A Series of length N containing the frequency count for each unique name,
         aligned with the `aligned_name_vectors`.
@@ -505,24 +508,24 @@ def _calculate_centrality_score_with_vectors(
     -------
     cupy.ndarray
         A 1D CuPy array of centrality scores of length N, one for each unique name.
-        
+
     Usage Example (within your pipeline)
     -------------------------------------
     # Assume 'cluster_group' is a DataFrame for a single cluster, and
     # 'orchestrator' is your fitted EmbeddingOrchestrator instance.
-    
+
     # Get the embeddings aligned to this specific cluster group
     aligned_embeddings = orchestrator.get_aligned_embeddings(cluster_group)
     name_vectors = aligned_embeddings['name']
-    
+
     # Get the name counts for this group
     counts = cluster_group['name'].value_counts()
-    
+
     # Calculate the score
     scores = calculate_centrality_score(name_vectors, counts)
     """
     n_unique = aligned_name_vectors.shape[0]
-    logger.debug(f"Calculating centrality for {n_unique} unique names using canonical embeddings.")
+    logger.debug(f'Calculating centrality for {n_unique} unique names using canonical embeddings.')
 
     if n_unique == 0:
         return cupy.array([], dtype=cupy.float32)
@@ -551,8 +554,9 @@ def _calculate_centrality_score_with_vectors(
     # The '@' operator performs matrix-vector multiplication.
     centrality_score = similarity_matrix @ freq_weights
 
-    logger.debug(f"Centrality score calculation complete for {n_unique} names.")
+    logger.debug(f'Centrality score calculation complete for {n_unique} names.')
     return centrality_score
+
 
 def _nfkc_normalize(text_element: str) -> str:
     """
@@ -586,17 +590,17 @@ def _nfkc_normalize(text_element: str) -> str:
     """
     # Handle None/NaN values gracefully
     if pd.isna(text_element) or text_element is None:
-        return ""
-    
+        return ''
+
     # Ensure we're working with a string
     text_element = str(text_element)
-    
+
     # Stage 1: Apply the formal Unicode NFKC normalization.
     normalized_text = unicodedata2.normalize('NFKC', text_element)
 
     # Stage 2: Apply the fast, manual translation for remaining compatibility characters.
     normalized_text = normalized_text.translate(_ASCII_TRANSLATION_TABLE)
-    
+
     # Stage 3: Collapse all whitespace to single spaces and strip ends.
     return re.sub(r'\s+', ' ', normalized_text).strip()
 
@@ -621,10 +625,10 @@ def nfkc_normalize_series(input_series: cudf.Series) -> cudf.Series:
     """
     # Store original null mask to preserve it in the output
     original_null_mask = input_series.isna()
-    
+
     # Move the data to the CPU for pandas' highly optimized string operations.
     # Nulls are handled and type is guaranteed before processing.
-    pandas_series = input_series.fillna("").astype("str").to_pandas()
+    pandas_series = input_series.fillna('').astype('str').to_pandas()
 
     # Factorize the Series to get the unique string values and the integer codes
     # that map each original row to its unique value.
@@ -639,8 +643,8 @@ def nfkc_normalize_series(input_series: cudf.Series) -> cudf.Series:
 
     # Move the final, normalized series back to the GPU, preserving the original index.
     result_series = cudf.Series(remapped_series.values, index=input_series.index)
-    
+
     # Restore original nulls (important for data integrity)
     result_series[original_null_mask] = None
-    
+
     return result_series

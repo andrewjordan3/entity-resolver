@@ -10,10 +10,8 @@ of addresses in large datasets.
 
 import logging
 import re
-from typing import Dict
 
 import cudf
-from postal.expand import expand_address
 from postal.parser import parse_address
 
 # ============================================================================
@@ -30,7 +28,7 @@ ADDRESS_COMPONENT_COLUMNS = [
     'addr_street_name',
     'addr_city',
     'addr_state',
-    'addr_zip'
+    'addr_zip',
 ]
 
 # Define weights for address completeness scoring.
@@ -42,7 +40,7 @@ ADDRESS_SCORE_WEIGHTS = {
     'street_number': 1,
     'city': 1,
     'state': 1,
-    'zip': 1          # A valid 5-digit zip code adds confidence.
+    'zip': 1,  # A valid 5-digit zip code adds confidence.
 }
 
 # --- U.S. State and Territory Mappings ---
@@ -50,33 +48,79 @@ ADDRESS_SCORE_WEIGHTS = {
 # It is defined at the module level for efficiency and is computed only once
 # when the module is imported. All keys and values are lowercase.
 STATE_NORMALIZATION_MAP = {
-    'al': 'alabama', 'ak': 'alaska', 'az': 'arizona', 'ar': 'arkansas',
-    'ca': 'california', 'co': 'colorado', 'ct': 'connecticut', 'de': 'delaware',
-    'fl': 'florida', 'ga': 'georgia', 'hi': 'hawaii', 'id': 'idaho',
-    'il': 'illinois', 'in': 'indiana', 'ia': 'iowa', 'ks': 'kansas',
-    'ky': 'kentucky', 'la': 'louisiana', 'me': 'maine', 'md': 'maryland',
-    'ma': 'massachusetts', 'mi': 'michigan', 'mn': 'minnesota',
-    'ms': 'mississippi', 'mo': 'missouri', 'mt': 'montana', 'ne': 'nebraska',
-    'nv': 'nevada', 'nh': 'new hampshire', 'nj': 'new jersey',
-    'nm': 'new mexico', 'ny': 'new york', 'nc': 'north carolina',
-    'nd': 'north dakota', 'oh': 'ohio', 'ok': 'oklahoma', 'or': 'oregon',
-    'pa': 'pennsylvania', 'ri': 'rhode island', 'sc': 'south carolina',
-    'sd': 'south dakota', 'tn': 'tennessee', 'tx': 'texas', 'ut': 'utah',
-    'vt': 'vermont', 'va': 'virginia', 'wa': 'washington',
-    'wv': 'west virginia', 'wi': 'wisconsin', 'wy': 'wyoming',
-    'dc': 'district of columbia', 'as': 'american samoa', 'gu': 'guam',
-    'mp': 'northern mariana islands', 'pr': 'puerto rico', 'vi': 'us virgin islands',
-    'd.c.': 'district of columbia', 'd c': 'district of columbia',
-    'calif': 'california', 'cal': 'california', 'penn': 'pennsylvania',
-    'penna': 'pennsylvania', 'mass': 'massachusetts', 'conn': 'connecticut',
-    'okla': 'oklahoma'
+    'al': 'alabama',
+    'ak': 'alaska',
+    'az': 'arizona',
+    'ar': 'arkansas',
+    'ca': 'california',
+    'co': 'colorado',
+    'ct': 'connecticut',
+    'de': 'delaware',
+    'fl': 'florida',
+    'ga': 'georgia',
+    'hi': 'hawaii',
+    'id': 'idaho',
+    'il': 'illinois',
+    'in': 'indiana',
+    'ia': 'iowa',
+    'ks': 'kansas',
+    'ky': 'kentucky',
+    'la': 'louisiana',
+    'me': 'maine',
+    'md': 'maryland',
+    'ma': 'massachusetts',
+    'mi': 'michigan',
+    'mn': 'minnesota',
+    'ms': 'mississippi',
+    'mo': 'missouri',
+    'mt': 'montana',
+    'ne': 'nebraska',
+    'nv': 'nevada',
+    'nh': 'new hampshire',
+    'nj': 'new jersey',
+    'nm': 'new mexico',
+    'ny': 'new york',
+    'nc': 'north carolina',
+    'nd': 'north dakota',
+    'oh': 'ohio',
+    'ok': 'oklahoma',
+    'or': 'oregon',
+    'pa': 'pennsylvania',
+    'ri': 'rhode island',
+    'sc': 'south carolina',
+    'sd': 'south dakota',
+    'tn': 'tennessee',
+    'tx': 'texas',
+    'ut': 'utah',
+    'vt': 'vermont',
+    'va': 'virginia',
+    'wa': 'washington',
+    'wv': 'west virginia',
+    'wi': 'wisconsin',
+    'wy': 'wyoming',
+    'dc': 'district of columbia',
+    'as': 'american samoa',
+    'gu': 'guam',
+    'mp': 'northern mariana islands',
+    'pr': 'puerto rico',
+    'vi': 'us virgin islands',
+    'd.c.': 'district of columbia',
+    'd c': 'district of columbia',
+    'calif': 'california',
+    'cal': 'california',
+    'penn': 'pennsylvania',
+    'penna': 'pennsylvania',
+    'mass': 'massachusetts',
+    'conn': 'connecticut',
+    'okla': 'oklahoma',
 }
 
 # ============================================================================
 # CPU-Based Address Parsing (libpostal)
 # ============================================================================
 
-def _expand_and_parse_address(address_string: str) -> Dict[str, str]:
+
+def _expand_and_parse_address(address_string: str) -> dict[str, str]:
     """
     Internal helper to expand and parse an address string using libpostal.
 
@@ -92,7 +136,7 @@ def _expand_and_parse_address(address_string: str) -> Dict[str, str]:
         Returns an empty dictionary if the input is invalid or empty.
     """
     if not address_string or not isinstance(address_string, str):
-        logger.debug("Input to _expand_and_parse_address was empty or not a string.")
+        logger.debug('Input to _expand_and_parse_address was empty or not a string.')
         return {}
 
     # *****Expansion was causing issues (st -> saint, ky -> key) *****
@@ -108,7 +152,9 @@ def _expand_and_parse_address(address_string: str) -> Dict[str, str]:
     return {label: value for value, label in parsed_tuples}
 
 
-def _format_parsed_components(parsed_components: Dict[str, str], original_address: str) -> Dict[str, str]:
+def _format_parsed_components(
+    parsed_components: dict[str, str], original_address: str
+) -> dict[str, str]:
     """
     Internal helper to format libpostal's output into a standardized schema.
 
@@ -128,7 +174,7 @@ def _format_parsed_components(parsed_components: Dict[str, str], original_addres
     if 'po_box' in parsed_components:
         # Use regex to robustly find the P.O. Box number.
         po_box_match = re.search(r'box\s*#?\s*(\d+)', original_address, re.IGNORECASE)
-        street_name = f"PO BOX {po_box_match.group(1)}" if po_box_match else "PO BOX"
+        street_name = f'PO BOX {po_box_match.group(1)}' if po_box_match else 'PO BOX'
         street_number = ''  # P.O. Boxes do not have a separate street number.
     else:
         street_number = parsed_components.get('house_number', '')
@@ -142,11 +188,11 @@ def _format_parsed_components(parsed_components: Dict[str, str], original_addres
         'state': parsed_components.get('state', ''),
         # Standardize postal codes to the 5-digit US format.
         # Note: This may truncate non-US postal codes.
-        'postal_code': parsed_components.get('postcode', '')[:5]
+        'postal_code': parsed_components.get('postcode', '')[:5],
     }
 
 
-def safe_parse_address(address_string: str) -> Dict[str, str]:
+def safe_parse_address(address_string: str) -> dict[str, str]:
     """
     Parses a raw address string into a structured dictionary of components.
 
@@ -179,6 +225,7 @@ def safe_parse_address(address_string: str) -> Dict[str, str]:
 # ============================================================================
 # GPU-Accelerated Address Utilities (cuDF)
 # ============================================================================
+
 
 def _is_series_present(series: cudf.Series) -> cudf.Series:
     """
@@ -237,7 +284,7 @@ def create_address_key_gpu(address_dataframe: cudf.DataFrame) -> cudf.Series:
     # Work on a copy of the DataFrame to prevent unintended side effects on the
     # original DataFrame passed to the function. This is a safe practice.
     address_dataframe_copy = _ensure_address_columns(address_dataframe.copy())
-    
+
     # --- Component-wise Normalization ---
 
     # Normalize the street number.
@@ -247,20 +294,24 @@ def create_address_key_gpu(address_dataframe: cudf.DataFrame) -> cudf.Series:
     # of numbers. This effectively handles ranges (e.g., "123-125" becomes "123")
     # and extraneous text (e.g., "456 Apt B" becomes "456").
     normalized_street_number = normalized_street_number.str.replace(r'[^0-9].*', '', regex=True)
-    
+
     # Normalize the street name.
     # Fill nulls, convert to string, and lowercase for case-insensitive matching.
-    standardized_street_name = address_dataframe_copy['addr_street_name'].fillna('').astype(str).str.lower()
+    standardized_street_name = (
+        address_dataframe_copy['addr_street_name'].fillna('').astype(str).str.lower()
+    )
     # Remove common directional suffixes (e.g., n, s, e, w and their full-word
     # counterparts). This is crucial because their usage can be inconsistent in
     # source data ("Main St" vs "Main St N").
-    standardized_street_name = standardized_street_name.str.replace(r'\s+(n|s|e|w|north|south|east|west)$', '', regex=True)
-    
+    standardized_street_name = standardized_street_name.str.replace(
+        r'\s+(n|s|e|w|north|south|east|west)$', '', regex=True
+    )
+
     # Standardize the city name.
     # Fill nulls, convert to string, and lowercase. City name abbreviations
     # are handled by the upstream libpostal process, so no replacements are needed here.
     standardized_city = address_dataframe_copy['addr_city'].fillna('').astype(str).str.lower()
-    
+
     # --- Key Assembly ---
 
     # Create a list of the cleaned, standardized component Series.
@@ -271,15 +322,15 @@ def create_address_key_gpu(address_dataframe: cudf.DataFrame) -> cudf.Series:
         standardized_street_name,
         standardized_city,
         address_dataframe_copy['addr_state'].fillna('').astype(str).str.lower(),
-        address_dataframe_copy['addr_zip'].fillna('').astype(str).str[:5]
+        address_dataframe_copy['addr_zip'].fillna('').astype(str).str[:5],
     ]
-    
+
     # Concatenate all the processed components into a single string Series.
     # A pipe character '|' is used as a delimiter. This is a robust choice
     # because it is not a character that typically appears in address data,
     # preventing ambiguity that a space or comma could cause.
     final_address_key = address_key_components[0].str.cat(address_key_components[1:], sep='|')
-    
+
     # As a final cleanup step, normalize all whitespace to single spaces and
     # trim any leading/trailing whitespace. This handles any extraneous spaces
     # that may have been introduced during the replacement steps.
@@ -304,10 +355,16 @@ def calculate_address_score_gpu(gdf: cudf.DataFrame) -> cudf.Series:
     score = cudf.Series(0, index=gdf.index, dtype='int32')
 
     # Street name is most critical.
-    score += _is_series_present(gdf['addr_street_name']).astype('int32') * ADDRESS_SCORE_WEIGHTS['street_name']
+    score += (
+        _is_series_present(gdf['addr_street_name']).astype('int32')
+        * ADDRESS_SCORE_WEIGHTS['street_name']
+    )
 
     # Street number, city, and state are also important.
-    score += _is_series_present(gdf['addr_street_number']).astype('int32') * ADDRESS_SCORE_WEIGHTS['street_number']
+    score += (
+        _is_series_present(gdf['addr_street_number']).astype('int32')
+        * ADDRESS_SCORE_WEIGHTS['street_number']
+    )
     score += _is_series_present(gdf['addr_city']).astype('int32') * ADDRESS_SCORE_WEIGHTS['city']
 
     # For state, we check for a valid 2-character abbreviation.
@@ -316,9 +373,7 @@ def calculate_address_score_gpu(gdf: cudf.DataFrame) -> cudf.Series:
 
     # For ZIP code, we validate a 5-digit format.
     is_valid_zip = (
-        gdf['addr_zip'].notna() &
-        (gdf['addr_zip'].str.len() == 5) &
-        gdf['addr_zip'].str.isdigit()
+        gdf['addr_zip'].notna() & (gdf['addr_zip'].str.len() == 5) & gdf['addr_zip'].str.isdigit()
     )
     score += is_valid_zip.astype('int32') * ADDRESS_SCORE_WEIGHTS['zip']
 
@@ -344,10 +399,10 @@ def get_best_address_gpu(address_gdf: cudf.DataFrame) -> cudf.DataFrame:
         DataFrame if the input is empty.
     """
     if address_gdf.empty:
-        logger.debug("get_best_address_gpu received an empty DataFrame, returning empty.")
+        logger.debug('get_best_address_gpu received an empty DataFrame, returning empty.')
         return address_gdf
 
-    logger.debug(f"Finding best address from {len(address_gdf)} candidates.")
+    logger.debug(f'Finding best address from {len(address_gdf)} candidates.')
 
     # Step 1: Calculate frequency of each unique normalized address key.
     frequency_map = address_gdf['addr_normalized_key'].value_counts()
@@ -358,10 +413,7 @@ def get_best_address_gpu(address_gdf: cudf.DataFrame) -> cudf.DataFrame:
 
     # Step 3: Map frequency counts back to the unique candidates.
     unique_candidates = unique_candidates.merge(
-        frequency_map,
-        left_on='addr_normalized_key',
-        right_index=True,
-        how='left'
+        frequency_map, left_on='addr_normalized_key', right_index=True, how='left'
     )
 
     # Step 4: Calculate completeness score for each unique address.
@@ -371,18 +423,18 @@ def get_best_address_gpu(address_gdf: cudf.DataFrame) -> cudf.DataFrame:
     # The logic is: highest score wins. If scores are tied, highest frequency wins.
     # If both are tied, sort by key for a deterministic result.
     best_candidate = unique_candidates.sort_values(
-        by=['score', 'frequency', 'addr_normalized_key'],
-        ascending=[False, False, True]
+        by=['score', 'frequency', 'addr_normalized_key'], ascending=[False, False, True]
     ).head(1)
 
     if not best_candidate.empty:
         # Use .item() to extract the scalar value for logging.
         score = best_candidate['score'].iloc[0].item()
         freq = best_candidate['frequency'].iloc[0].item()
-        logger.debug(f"Selected best address with score {score} and frequency {freq}.")
+        logger.debug(f'Selected best address with score {score} and frequency {freq}.')
 
     # Drop intermediate columns used for ranking before returning.
     return best_candidate.drop(columns=['score', 'frequency'])
+
 
 def normalize_us_states(gdf: cudf.DataFrame, state_col: str) -> cudf.DataFrame:
     """
@@ -430,7 +482,7 @@ def normalize_us_states(gdf: cudf.DataFrame, state_col: str) -> cudf.DataFrame:
     # --- Step 4: Restore Nulls and Update the DataFrame ---
     # Create a copy of the input DataFrame to avoid modifying it in place.
     result_gdf = gdf.copy()
-    
+
     # Use the mask to restore nulls. The .where() method is perfect for this:
     # - Where the mask is False (i.e., the original value was NOT null),
     #   it keeps the value from `normalized_states`.

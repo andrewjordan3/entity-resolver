@@ -10,13 +10,13 @@
 # === Core Data and I/O Configurations ===
 columns:
   # The column containing the primary entity name (e.g., 'company_name').
-  entity_col: 'company_name'
+  entity_col: "company_name"
   # A list of columns that together form the address.
-  address_cols: ['address']
+  address_cols: ["address"]
 
 output:
   # The case style for the final canonical name. Options: 'proper' for Title Case, 'raw' for as-is.
-  output_format: 'proper'
+  output_format: "proper"
   # The confidence score (0.0 to 1.0) below which a match will be flagged for manual review.
   review_confidence_threshold: 0.75
   # The logging level for console output. 10=DEBUG, 20=INFO, 30=WARNING.
@@ -82,9 +82,9 @@ normalization:
 # === Modeling Stage Configurations ===
 vectorizer:
   # A list of feature streams to generate. Options: 'tfidf', 'phonetic', 'semantic'.
-  encoders: ['tfidf', 'phonetic', 'semantic']
+  encoders: ["tfidf", "phonetic", "semantic"]
   # A list of dimensionality reduction techniques for sparse vectors. Options: 'svd', 'pca'.
-  sparse_reducers: ['svd', 'pca']
+  sparse_reducers: ["svd", "pca"]
   # If True, the normalized address will be appended to the entity name for the TF-IDF stream.
   use_address_in_encoding: true
   # Controls the strength of spectral damping (0.0 to 1.0). 1.0 is full whitening, 0.0 is no whitening.
@@ -94,18 +94,18 @@ vectorizer:
 
   # --- Semantic Stream ---
   # Sentence-transformer model for semantic encoding.
-  semantic_model: 'all-mpnet-base-v2'
+  semantic_model: "all-mpnet-base-v2"
   semantic_batch_size: 512
 
   # --- TF-IDF Stream ---
   # Parameters for the TfidfVectorizer.
   tfidf_params:
-    analyzer: 'char'
+    analyzer: "char"
     ngram_range: [3, 5]
     max_features: 10000
     min_df: 3
     sublinear_tf: true
-    dtype: 'float64'
+    dtype: "float64"
   # Parameters for TruncatedSVD applied to TF-IDF vectors.
   tfidf_svd_params:
     n_components: 2048
@@ -118,7 +118,7 @@ vectorizer:
   phonetic_max_words: 5
   # Parameters for CountVectorizer on phonetic codes.
   phonetic_params:
-    analyzer: 'word'
+    analyzer: "word"
     binary: true
     max_features: 2000
   # Parameters for TruncatedSVD applied to phonetic vectors.
@@ -131,7 +131,7 @@ vectorizer:
   # --- SVD Eigsh Fallback Configuration ---
   # Parameters for the robust SVD fallback mechanism used when the standard solver fails.
   eigsh_fallback_params:
-    fallback_dtype: 'float64'
+    fallback_dtype: "float64"
     eigsh_restarts: 3
     prune_min_row_sum: 1.0e-9
     prune_min_df: 2
@@ -149,15 +149,15 @@ vectorizer:
   # --- String Matching ---
   # TF-IDF parameters for the string similarity search fallback.
   similarity_tfidf:
-    analyzer: 'char'
+    analyzer: "char"
     ngram_range: [3, 5]
     min_df: 2
     sublinear_tf: true
-    norm: 'l2'
+    norm: "l2"
   # Nearest neighbor parameters for the string similarity search fallback.
   similarity_nn:
     n_neighbors: 24
-    metric: 'cosine'
+    metric: "cosine"
 
 # === Clustering Stage Configurations ===
 clusterer:
@@ -171,8 +171,8 @@ clusterer:
     n_components: 48
     min_dist: 0.05
     spread: 0.5
-    metric: 'cosine'
-    init: 'spectral'
+    metric: "cosine"
+    init: "spectral"
     n_epochs: 400
     negative_sample_rate: 7
     repulsion_strength: 1.0
@@ -188,7 +188,7 @@ clusterer:
     learning_rate: [0.5, 1.5]
     repulsion_strength: [0.5, 1.5]
     negative_sample_rate: [5, 20]
-    init_strategies: ['spectral', 'random']
+    init_strategies: ["spectral", "random"]
 
   # --- Kernel PCA Consensus Embedding ---
   cosine_consensus_n_samples: 8192
@@ -204,7 +204,7 @@ clusterer:
     cluster_selection_epsilon: 0.15
     prediction_data: true
     alpha: 0.8
-    cluster_selection_method: 'leaf'
+    cluster_selection_method: "leaf"
 
   # --- SNN Graph Clustering Engine ---
   snn_clustering_params:

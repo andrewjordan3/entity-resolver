@@ -40,7 +40,7 @@ Creates rich entity embeddings by combining three complementary approaches:
 |--------------|---------------|--------------------------|-------------------------------|
 | **Syntactic**| TF-IDF        | Character-level patterns | N-gram analysis (3–5 chars)   |
 | **Phonetic** | Metaphone     | Sound-based matching     | Phonetic encoding             |
-| **Semantic** | Transformers  | Contextual meaning       | `all-MiniLM-L6-v2` embeddings |
+| **Semantic** | Transformers  | Contextual meaning       | `bge-base-en-v1.5` embeddings |
 
 ### Advanced Clustering
 - **HDBSCAN + SNN Ensemble**: Combines density-based clustering with graph-based rescue mechanism
@@ -65,7 +65,7 @@ Creates rich entity embeddings by combining three complementary approaches:
 ### Software Dependencies
 
 **Core Libraries:**
-- Python 3.8+
+- Python 3.11+
 - pandas, numpy, pydantic, pyyaml
 
 **GPU Libraries (auto-installed with pip method):**
@@ -185,7 +185,7 @@ df = pd.DataFrame({
     ]
 })
 
-# Initialize the resolver. 
+# Initialize the resolver.
 # This uses the default settings. For custom settings, provide a path
 # to your YAML file, e.g., EntityResolver(config_path='my_config.yaml')
 resolver = EntityResolver()
@@ -319,45 +319,45 @@ graph TB
         Reporter --> Result[📋 Resolved DataFrame<br/>canonical_name, confidence, chain_num]
     end
 
-    style Input fill:#e1f5ff
-    style Result fill:#e7f5e1
-    style Preprocessing fill:#fff4e6
-    style Vectorization fill:#f3e5f5
-    style Clustering fill:#e8f5e9
-    style Refinement fill:#fce4ec
-    style Output fill:#e3f2fd
+    style Input fill:#4A90E2,stroke:#2E5C8A,stroke-width:3px,color:#fff
+    style Result fill:#50C878,stroke:#2D7A4A,stroke-width:3px,color:#fff
+    style Preprocessing fill:#FFB74D,stroke:#E68900,stroke-width:2px,color:#333
+    style Vectorization fill:#BA68C8,stroke:#7B1FA2,stroke-width:2px,color:#fff
+    style Clustering fill:#4DB6AC,stroke:#00695C,stroke-width:2px,color:#fff
+    style Refinement fill:#F06292,stroke:#C2185B,stroke-width:2px,color:#fff
+    style Output fill:#64B5F6,stroke:#1976D2,stroke-width:2px,color:#fff
 ```
 
 ### Pipeline Stages
 
 **Preprocessing (Steps 1–2)**
-- Text normalization and standardization  
-- Address parsing with libpostal  
+- Text normalization and standardization
+- Address parsing with libpostal
 - Name consolidation for shared addresses
 
 **Vectorization (Step 3)**
-- TF-IDF character n-grams  
-- Phonetic encoding  
-- Semantic embeddings  
+- TF-IDF character n-grams
+- Phonetic encoding
+- Semantic embeddings
 - Energy balancing across streams
 
 **Clustering (Steps 4–5)**
-- UMAP ensemble for dimensionality reduction  
-- HDBSCAN for core clustering  
-- SNN graph for noise rescue  
+- UMAP ensemble for dimensionality reduction
+- HDBSCAN for core clustering
+- SNN graph for noise rescue
 - Cluster validation and merging
 
 **Finalization (Steps 6–7)**
-- Canonical entity selection  
-- Chain entity numbering  
-- Confidence scoring  
+- Canonical entity selection
+- Chain entity numbering
+- Confidence scoring
 - Review flagging
 
 ## 📚 API Reference
 
 ### Main Classes
-- `EntityResolver`: Main orchestrator class  
-- `ResolverConfig`: Configuration management  
+- `EntityResolver`: Main orchestrator class
+- `ResolverConfig`: Configuration management
 - Component classes: `TextNormalizer`, `AddressProcessor`, `MultiStreamVectorizer`, `EntityClusterer`, `ClusterValidator`, `ClusterMerger`, `ClusterRefiner`, `ConfidenceScorer`
 
 ### Key Methods
@@ -439,9 +439,9 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 ## 🙏 Acknowledgments
 
-- NVIDIA RAPIDS team for the GPU acceleration framework  
-- OpenCage for libpostal address parsing  
-- Hugging Face for sentence-transformers  
+- NVIDIA RAPIDS team for the GPU acceleration framework
+- OpenCage for libpostal address parsing
+- Hugging Face for sentence-transformers
 
 Maintained by: **Andrew Jordan**
 Contact: **andrewjordan3@gmail.com**

@@ -5,28 +5,27 @@ similarity and finding similar pairs within a dataset using TF-IDF and
 Nearest Neighbors.
 """
 
+import logging
+
 import cudf
 import cupy
 import cupyx.scipy.sparse
-import logging
-from typing import Dict, Any
 from cuml.feature_extraction.text import TfidfVectorizer
 from cuml.neighbors import NearestNeighbors
-from .graph import create_edge_list
-from .text import nfkc_normalize_series
+
+from ..config import SimilarityNnParams, SimilarityTfidfParams
 from .clean_mem import gpu_memory_cleanup
+from .graph import create_edge_list
 from .matrix_ops import ensure_finite_matrix, prune_sparse_matrix, scale_by_frobenius_norm
+from .text import nfkc_normalize_series
 from .vector import normalize_rows
-from ..config import SimilarityTfidfParams, SimilarityNnParams
 
 # Set up a logger for this module.
 logger = logging.getLogger(__name__)
 
+
 def _log_series_samples(
-    series_a: cudf.Series,
-    series_b: cudf.Series,
-    min_n: int,
-    message: str
+    series_a: cudf.Series, series_b: cudf.Series, min_n: int, message: str
 ) -> None:
     """
     A helper function to log descriptive statistics and samples from two series
@@ -39,27 +38,27 @@ def _log_series_samples(
         message: A descriptive message to include in the log header.
     """
     try:
-        sample_df = cudf.DataFrame({
-            'series_a_sample': series_a.head(5),
-            'series_a_len': series_a.head(5).str.len(),
-            'series_b_sample': series_b.head(5),
-            'series_b_len': series_b.head(5).str.len(),
-        })
-        logger.debug(
-            f"{message} (min_n={min_n}):\n"
-            f"{sample_df.to_pandas().to_string(index=True)}"
+        sample_df = cudf.DataFrame(
+            {
+                'series_a_sample': series_a.head(5),
+                'series_a_len': series_a.head(5).str.len(),
+                'series_b_sample': series_b.head(5),
+                'series_b_len': series_b.head(5).str.len(),
+            }
         )
+        logger.debug(f'{message} (min_n={min_n}):\n{sample_df.to_pandas().to_string(index=True)}')
         a_len = series_a.str.len()
         b_len = series_b.str.len()
         stats = {
-            "A_min_len": int(a_len.min()),
-            "A_max_len": int(a_len.max()),
-            "B_min_len": int(b_len.min()),
-            "B_max_len": int(b_len.max()),
+            'A_min_len': int(a_len.min()),
+            'A_max_len': int(a_len.max()),
+            'B_min_len': int(b_len.min()),
+            'B_max_len': int(b_len.max()),
         }
-        logger.debug(f"Length statistics for logged series: {stats}")
+        logger.debug(f'Length statistics for logged series: {stats}')
     except Exception as log_ex:
-        logger.debug(f"Failed to log series samples due to: {log_ex}")
+        logger.debug(f'Failed to log series samples due to: {log_ex}')
+
 
 def calculate_similarity_gpu(
     series_a: cudf.Series,
@@ -101,7 +100,7 @@ def calculate_similarity_gpu(
     if not series_a.index.equals(series_b.index):
         raise ValueError("Input series 'series_a' and 'series_b' must have the same index.")
 
-    logger.debug(f"Starting row-wise similarity for two series of length {len(series_a)}.")
+    logger.debug(f'Starting row-wise similarity for two series of length {len(series_a)}.')
 
     # --- 1. Preprocessing and Cleaning ---
     def clean_series(series: cudf.Series) -> cudf.Series:
@@ -128,40 +127,44 @@ def calculate_similarity_gpu(
 
     # --- Use Edit Distance for Small Datasets ---
     if n_unique < min_unique_for_tfidf:
-        logger.debug(f"Using vectorized edit distance for {n_unique} unique strings (< {min_unique_for_tfidf})")
-        
+        logger.debug(
+            f'Using vectorized edit distance for {n_unique} unique strings (< {min_unique_for_tfidf})'
+        )
+
         # 1. Filter out rows where either string is empty.
         valid_mask = (series_a_cleaned.str.len() > 0) & (series_b_cleaned.str.len() > 0)
-        
+
         if not valid_mask.any():
-            logger.debug("No valid non-empty string pairs found.")
+            logger.debug('No valid non-empty string pairs found.')
             return result_series
-            
+
         # 2. Get the subset of series that will be processed.
         # The original index is correctly preserved here.
         valid_a = series_a_cleaned[valid_mask]
         valid_b = series_b_cleaned[valid_mask]
-        
+
         # 3. Perform all calculations in a vectorized way (NO LOOPS).
         # Calculate raw Levenshtein distance for all pairs at once.
         raw_distances = valid_a.str.edit_distance(valid_b)
-        
+
         # Calculate lengths needed for normalization.
         len_a = valid_a.str.len()
         len_b = valid_b.str.len()
-        max_dist = len_a + len_b # This is the denominator in your formula
-        
+        max_dist = len_a + len_b  # This is the denominator in your formula
+
         # 4. Calculate normalized similarity using the formula for all pairs at once.
         # We use .values to get the underlying CuPy arrays for the calculation.
         similarities_array = cupy.exp(-2.0 * raw_distances.values / max_dist.values)
-        
+
         # Create the final series with the correct index.
         similarities_series = cudf.Series(similarities_array, index=valid_a.index, dtype='float32')
 
         # 5. Update the result series. This remains the same.
         result_series.update(similarities_series)
-        
-        logger.debug(f"Edit distance similarity calculation complete. Mean similarity: {similarities_array.mean():.4f}")
+
+        logger.debug(
+            f'Edit distance similarity calculation complete. Mean similarity: {similarities_array.mean():.4f}'
+        )
         return result_series
 
     # --- 2. Identify Rows Valid for N-gram Processing ---
@@ -174,19 +177,30 @@ def calculate_similarity_gpu(
     # Create a single boolean mask to identify rows where BOTH strings are long enough.
     # This check is performed AFTER all cleaning to be as accurate as possible.
     if min_n > 0:
-        valid_rows_mask = (series_a_cleaned.str.len() >= min_n) & (series_b_cleaned.str.len() >= min_n)
+        valid_rows_mask = (series_a_cleaned.str.len() >= min_n) & (
+            series_b_cleaned.str.len() >= min_n
+        )
     else:
         # If not using character n-grams, all rows are considered valid from a length perspective.
         valid_rows_mask = cudf.Series(cupy.ones(len(series_a), dtype=bool), index=series_a.index)
 
     # If there are no valid rows to process, we can return the zeros series immediately.
     if not valid_rows_mask.any():
-        logger.debug("No rows with sufficient string length for n-gram generation. Returning all zeros.")
+        logger.debug(
+            'No rows with sufficient string length for n-gram generation. Returning all zeros.'
+        )
         # Log the CLEANED series as well to diagnose normalization issues.
-        logger.debug("--- Logging Original Series for Context ---")
-        _log_series_samples(series_a, series_b, min_n, "Sample at insufficient-length condition (ORIGINAL)")
-        logger.debug("--- Logging Cleaned Series That Caused Failure ---")
-        _log_series_samples(series_a_cleaned, series_b_cleaned, min_n, "Sample at insufficient-length condition (CLEANED)")
+        logger.debug('--- Logging Original Series for Context ---')
+        _log_series_samples(
+            series_a, series_b, min_n, 'Sample at insufficient-length condition (ORIGINAL)'
+        )
+        logger.debug('--- Logging Cleaned Series That Caused Failure ---')
+        _log_series_samples(
+            series_a_cleaned,
+            series_b_cleaned,
+            min_n,
+            'Sample at insufficient-length condition (CLEANED)',
+        )
         return result_series
 
     # Filter the series down to only the valid rows that need processing.
@@ -194,26 +208,29 @@ def calculate_similarity_gpu(
     series_a_to_process = series_a_cleaned[valid_rows_mask]
     series_b_to_process = series_b_cleaned[valid_rows_mask]
 
-    logger.debug(f"Found {len(series_a_to_process)} valid rows to process for similarity.")
-    
+    logger.debug(f'Found {len(series_a_to_process)} valid rows to process for similarity.')
+
     try:
         # To ensure a fair comparison, the TF-IDF vectorizer must be fitted on the
         # combined vocabulary of both series. This guarantees that the same features
         # map to the same indices and have consistent IDF weights.
         combined_series = cudf.concat(
-            [series_a_to_process, series_b_to_process],
-            ignore_index=True
+            [series_a_to_process, series_b_to_process], ignore_index=True
         ).dropna()
 
         # It's possible the combined series is empty if inputs only contained empty strings
         # or strings that were filtered out.
         if combined_series.empty:
-            logger.debug("Combined series for TF-IDF fitting is empty. No similarities to calculate.")
+            logger.debug(
+                'Combined series for TF-IDF fitting is empty. No similarities to calculate.'
+            )
             return result_series
 
         vectorizer = TfidfVectorizer(**tfidf_params.model_dump())
         vectorizer.fit(combined_series)
-        logger.debug(f"TF-IDF vectorizer fitted. Vocabulary size: {len(getattr(vectorizer, 'vocabulary_', {}))}")
+        logger.debug(
+            f'TF-IDF vectorizer fitted. Vocabulary size: {len(getattr(vectorizer, "vocabulary_", {}))}'
+        )
 
         # Transform each valid series into a TF-IDF matrix with L2 normalization (the default).
         vectors_a = vectorizer.transform(series_a_to_process)
@@ -229,7 +246,9 @@ def calculate_similarity_gpu(
         active_rows_mask = (row_nnz_a > 0) & (row_nnz_b > 0)
 
         if not cupy.any(active_rows_mask):
-            logger.debug("No rows with overlapping non-empty vectors after transform. Returning all zeros.")
+            logger.debug(
+                'No rows with overlapping non-empty vectors after transform. Returning all zeros.'
+            )
             return result_series
 
         # 2. Get the original index for active rows to map results back later.
@@ -259,10 +278,12 @@ def calculate_similarity_gpu(
         vectors_b_proc.sum_duplicates()
         vectors_a_proc = ensure_finite_matrix(vectors_a_proc, replace_non_finite=True, copy=False)
         vectors_b_proc = ensure_finite_matrix(vectors_b_proc, replace_non_finite=True, copy=False)
-        
+
         # To ensure column pruning is consistent, we must determine the columns
         # to keep based on the combined statistics of both matrices.
-        combined_proc_vectors = cupyx.scipy.sparse.vstack([vectors_a_proc, vectors_b_proc], format='csr')
+        combined_proc_vectors = cupyx.scipy.sparse.vstack(
+            [vectors_a_proc, vectors_b_proc], format='csr'
+        )
 
         # Run prune on the combined matrix to get a single, consistent set of columns.
         # We only care about the column mask/indices that are kept.
@@ -271,8 +292,8 @@ def calculate_similarity_gpu(
         # Apply the common column filter to both matrices.
         if kept_cols is not None:
             vectors_a_proc = vectors_a_proc[:, kept_cols]
-            vectors_b_proc = vectors_b_proc[:, kept_cols]        
-        
+            vectors_b_proc = vectors_b_proc[:, kept_cols]
+
         # With columns synchronized, we can now scale each matrix independently.
         vectors_a_proc, _ = scale_by_frobenius_norm(vectors_a_proc, copy=False)
         vectors_b_proc, _ = scale_by_frobenius_norm(vectors_b_proc, copy=False)
@@ -287,37 +308,37 @@ def calculate_similarity_gpu(
         # Enforce canonical format and data types for stability and performance.
         # This conditionally creates a copy only if a matrix is a complex view
         # or has a non-standard format, preventing memory corruption errors.
-        
+
         # Process vectors_a_proc
-        vectors_a_proc.data    = vectors_a_proc.data.astype(cupy.float32, copy=False)
-        vectors_a_proc.indices = vectors_a_proc.indices.astype(cupy.int32,  copy=False)
-        vectors_a_proc.indptr  = vectors_a_proc.indptr.astype(cupy.int32,  copy=False)
+        vectors_a_proc.data = vectors_a_proc.data.astype(cupy.float32, copy=False)
+        vectors_a_proc.indices = vectors_a_proc.indices.astype(cupy.int32, copy=False)
+        vectors_a_proc.indptr = vectors_a_proc.indptr.astype(cupy.int32, copy=False)
         needs_copy_a = (
-            (vectors_a_proc.data.base is not None) or
-            (vectors_a_proc.indices.base is not None) or
-            (vectors_a_proc.indptr.base is not None) or
-            (getattr(vectors_a_proc, "has_canonical_format", True) is False)
+            (vectors_a_proc.data.base is not None)
+            or (vectors_a_proc.indices.base is not None)
+            or (vectors_a_proc.indptr.base is not None)
+            or (getattr(vectors_a_proc, 'has_canonical_format', True) is False)
         )
         if needs_copy_a:
             vectors_a_proc = vectors_a_proc.copy()
 
         # Process vectors_b_proc
-        vectors_b_proc.data    = vectors_b_proc.data.astype(cupy.float32, copy=False)
-        vectors_b_proc.indices = vectors_b_proc.indices.astype(cupy.int32,  copy=False)
-        vectors_b_proc.indptr  = vectors_b_proc.indptr.astype(cupy.int32,  copy=False)
+        vectors_b_proc.data = vectors_b_proc.data.astype(cupy.float32, copy=False)
+        vectors_b_proc.indices = vectors_b_proc.indices.astype(cupy.int32, copy=False)
+        vectors_b_proc.indptr = vectors_b_proc.indptr.astype(cupy.int32, copy=False)
         needs_copy_b = (
-            (vectors_b_proc.data.base is not None) or
-            (vectors_b_proc.indices.base is not None) or
-            (vectors_b_proc.indptr.base is not None) or
-            (getattr(vectors_b_proc, "has_canonical_format", True) is False)
+            (vectors_b_proc.data.base is not None)
+            or (vectors_b_proc.indices.base is not None)
+            or (vectors_b_proc.indptr.base is not None)
+            or (getattr(vectors_b_proc, 'has_canonical_format', True) is False)
         )
         if needs_copy_b:
             vectors_b_proc = vectors_b_proc.copy()
 
         assert vectors_a_proc.shape == vectors_b_proc.shape, (
             f"Vector shapes don't match after synchronized pruning.\n"
-            f"Shape A: {vectors_a_proc.shape}\n"
-            f"Shape B: {vectors_b_proc.shape}"
+            f'Shape A: {vectors_a_proc.shape}\n'
+            f'Shape B: {vectors_b_proc.shape}'
         )
 
         # A key property of L2-normalized vectors is that their cosine similarity
@@ -331,39 +352,46 @@ def calculate_similarity_gpu(
         if logger.isEnabledFor(logging.DEBUG):
             try:
                 cupy.cuda.Stream.null.synchronize()
-                logger.debug(f"CUDA sync successful after multiply/sum for {len(series_a_to_process)} rows")
+                logger.debug(
+                    f'CUDA sync successful after multiply/sum for {len(series_a_to_process)} rows'
+                )
             except cupy.cuda.runtime.CUDARuntimeError as e:
-                logger.error(f"CUDA corruption detected immediately after multiply/sum operation!")
-                logger.error(f"Error details: {e}")
-                logger.error(f"Batch size: {len(series_a_to_process)}, Vocabulary size: {len(getattr(vectorizer, 'vocabulary_', {}))}")
-                _log_series_samples(series_a_to_process, series_b_to_process, min_n, 
-                                  "Data that triggered CUDA corruption during multiply/sum")
+                logger.error('CUDA corruption detected immediately after multiply/sum operation!')
+                logger.error(f'Error details: {e}')
+                logger.error(
+                    f'Batch size: {len(series_a_to_process)}, Vocabulary size: {len(getattr(vectorizer, "vocabulary_", {}))}'
+                )
+                _log_series_samples(
+                    series_a_to_process,
+                    series_b_to_process,
+                    min_n,
+                    'Data that triggered CUDA corruption during multiply/sum',
+                )
                 raise
 
         # Now continue with flattening - ravel() converts (n,1) to (n)
         similarities_array = similarities_array.ravel()
-            
+
         # Ensure the array is contiguous in memory for efficient access
         similarities_array = cupy.ascontiguousarray(similarities_array, dtype='float32')
-        
+
         # Verify array length matches expected number of rows
         if len(similarities_array) != len(active_index):
-            logger.error(f"Shape mismatch: got {len(similarities_array)} similarities for {len(active_index)} rows.")
+            logger.error(
+                f'Shape mismatch: got {len(similarities_array)} similarities for {len(active_index)} rows.'
+            )
             # Fall back to zeros for safety
             return result_series
 
         # Create a cuDF Series from the calculated similarities.
-        # CRITICAL: Use the copied index to ensure the results align correctly 
+        # CRITICAL: Use the copied index to ensure the results align correctly
         # with their original positions.
-        similarities_series = cudf.Series(
-            similarities_array,
-            index=active_index
-        )
+        similarities_series = cudf.Series(similarities_array, index=active_index)
 
         # CRITICAL: Force cuDF to own its own device buffer instead of borrowing
         # from CuPy's memory pool. This prevents potential use-after-free issues
         # when CuPy's memory pool is cleared.
-        similarities_series = similarities_series.astype("float32", copy=True)
+        similarities_series = similarities_series.astype('float32', copy=True)
 
         # Place the calculated similarities back into the full result series.
         # The `Series.update()` method modifies `result_series` in-place.
@@ -372,26 +400,33 @@ def calculate_similarity_gpu(
         result_series.update(similarities_series)
 
     except RuntimeError as e:
-        logger.error(f"A runtime error occurred in 'calculate_similarity_gpu' during TF-IDF processing: {e}", exc_info=True)
-        _log_series_samples(series_a_to_process, series_b_to_process, min_n, "Sample of valid rows at failure")
-        if "Insufficient number of characters" in str(e):
-            logger.warning(f"N-gram generation failed despite pre-checks. Returning calculated similarities so far.")
+        logger.error(
+            f"A runtime error occurred in 'calculate_similarity_gpu' during TF-IDF processing: {e}",
+            exc_info=True,
+        )
+        _log_series_samples(
+            series_a_to_process, series_b_to_process, min_n, 'Sample of valid rows at failure'
+        )
+        if 'Insufficient number of characters' in str(e):
+            logger.warning(
+                'N-gram generation failed despite pre-checks. Returning calculated similarities so far.'
+            )
             # The result_series will contain zeros for the rows that failed, which is the desired outcome.
         else:
             # For other unexpected errors, re-raise the exception.
             raise
-    
+
     finally:
         # --- 4. Memory Cleanup ---
         # Clean up all intermediate objects in reverse order of creation.
         # This ensures dependencies are freed in the correct order and helps
         # prevent memory fragmentation. The 'del' statements remove Python
         # references, allowing the GPU memory manager to reclaim the memory.
-        
+
         # Clean up the similarity calculation intermediates
         if similarities_array is not None:
             del similarities_array
-        
+
         # Clean up the TF-IDF vectors
         if vectors_b is not None:
             del vectors_b
@@ -401,11 +436,11 @@ def calculate_similarity_gpu(
             del vectors_b_proc
         if vectors_a_proc is not None:
             del vectors_a_proc
-        
+
         # Clean up the vectorizer (can be large with big vocabularies)
         if vectorizer is not None:
             del vectorizer
-        
+
         # Clean up the combined series used for fitting
         if combined_series is not None:
             del combined_series
@@ -413,19 +448,20 @@ def calculate_similarity_gpu(
         # Clean up combined vectors from pruning
         if combined_proc_vectors is not None:
             del combined_proc_vectors
-        
+
         # Clean up the cleaned series that are no longer needed
         del series_b_cleaned
         del series_a_cleaned
 
     return result_series
 
+
 @gpu_memory_cleanup
 def find_similar_pairs(
     string_series: cudf.Series,
     tfidf_params: SimilarityTfidfParams,
     nn_params: SimilarityNnParams,
-    distance_threshold: float
+    distance_threshold: float,
 ) -> cudf.DataFrame:
     """
     Finds similar pairs within a single series of strings on the GPU.
@@ -447,11 +483,11 @@ def find_similar_pairs(
         indices of the matched pairs in the input string_series.
     """
     if len(string_series) < 2:
-        logger.warning("find_similar_pairs requires at least two strings to compare.")
+        logger.warning('find_similar_pairs requires at least two strings to compare.')
         return cudf.DataFrame({'source': [], 'destination': []})
 
-    logger.debug(f"Finding similar pairs within a series of {len(string_series)} strings.")
-    logger.debug(f"Using distance threshold: {distance_threshold}")
+    logger.debug(f'Finding similar pairs within a series of {len(string_series)} strings.')
+    logger.debug(f'Using distance threshold: {distance_threshold}')
 
     # Step 1: Vectorize the input strings into a TF-IDF matrix.
     vectorizer = TfidfVectorizer(**tfidf_params.model_dump())
@@ -461,7 +497,7 @@ def find_similar_pairs(
     nn_model = NearestNeighbors(**nn_params.model_dump())
     nn_model.fit(tfidf_matrix)
     distances, indices = nn_model.kneighbors(tfidf_matrix)
-    logger.debug(f"Found neighbors for {len(indices)} items.")
+    logger.debug(f'Found neighbors for {len(indices)} items.')
 
     # We are now done with the large TF-IDF matrix, so we can delete it.
     del tfidf_matrix
@@ -471,7 +507,7 @@ def find_similar_pairs(
     matched_pairs = create_edge_list(
         neighbor_indices=indices,
         neighbor_distances=distances,
-        distance_threshold=distance_threshold
+        distance_threshold=distance_threshold,
     )
 
     # We are now done with the large distance and index arrays.
@@ -482,9 +518,9 @@ def find_similar_pairs(
     # integer indices of the items in the original `string_series`.
     return matched_pairs[['source', 'destination']]
 
+
 def calculate_embedding_similarity(
-    vectors_a: cupy.ndarray,
-    vectors_b: cupy.ndarray
+    vectors_a: cupy.ndarray, vectors_b: cupy.ndarray
 ) -> cupy.ndarray:
     """
     Calculates the row-wise cosine similarity between two dense embedding matrices.
@@ -527,32 +563,34 @@ def calculate_embedding_similarity(
         If the input arrays are not 2D CuPy ndarrays, are empty, or do not have
         the exact same shape.
     """
-    logger.debug(f"Calculating row-wise embedding similarity for matrices of shape {vectors_a.shape}.")
+    logger.debug(
+        f'Calculating row-wise embedding similarity for matrices of shape {vectors_a.shape}.'
+    )
 
     # --- Input Validation ---
     if not isinstance(vectors_a, cupy.ndarray) or not isinstance(vectors_b, cupy.ndarray):
-        raise ValueError("Inputs `vectors_a` and `vectors_b` must be CuPy ndarrays.")
+        raise ValueError('Inputs `vectors_a` and `vectors_b` must be CuPy ndarrays.')
 
     if vectors_a.ndim != 2 or vectors_b.ndim != 2:
         raise ValueError(
-            f"Input vectors must be 2-dimensional. "
-            f"Got dimensions: vectors_a={vectors_a.ndim}, vectors_b={vectors_b.ndim}."
+            f'Input vectors must be 2-dimensional. '
+            f'Got dimensions: vectors_a={vectors_a.ndim}, vectors_b={vectors_b.ndim}.'
         )
 
     if vectors_a.shape != vectors_b.shape:
         raise ValueError(
-            f"Input vector shapes do not match: "
-            f"vectors_a shape is {vectors_a.shape}, vectors_b shape is {vectors_b.shape}."
+            f'Input vector shapes do not match: '
+            f'vectors_a shape is {vectors_a.shape}, vectors_b shape is {vectors_b.shape}.'
         )
 
     if vectors_a.size == 0:
-        logger.warning("Input vectors are empty. Returning an empty similarity array.")
+        logger.warning('Input vectors are empty. Returning an empty similarity array.')
         return cupy.array([], dtype=cupy.float32)
 
     # --- Data Sanitization ---
     # Ensure that both matrices contain only finite values (no NaN or infinity).
     # This is a critical step to prevent silent corruption of results or CUDA errors.
-    logger.debug("Ensuring input matrices contain finite values.")
+    logger.debug('Ensuring input matrices contain finite values.')
     vectors_a = ensure_finite_matrix(vectors_a, replace_non_finite=True, copy=False)
     vectors_b = ensure_finite_matrix(vectors_b, replace_non_finite=True, copy=False)
 
@@ -563,8 +601,10 @@ def calculate_embedding_similarity(
     # This is a single, highly optimized GPU operation.
     similarity_scores = (vectors_a * vectors_b).sum(axis=1)
 
-    logger.debug(f"Similarity calculation complete. Mean similarity: {float(similarity_scores.mean()):.4f}")
-    
+    logger.debug(
+        f'Similarity calculation complete. Mean similarity: {float(similarity_scores.mean()):.4f}'
+    )
+
     # --- Finalization ---
     # Ensure the output array is in a contiguous block of memory and has the
     # standard float32 dtype for consistency in downstream operations.

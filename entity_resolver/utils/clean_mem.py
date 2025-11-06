@@ -25,15 +25,18 @@ Public API:
 
 import gc
 import logging
+from collections.abc import Callable
+from functools import wraps
+from typing import Any
+
 import cupy
 import rmm
-from functools import wraps
-from typing import Callable, Any
 
 # Set up a logger for decorator-specific messages.
 logger = logging.getLogger(__name__)
 
 # --- Public API ---
+
 
 def gpu_memory_cleanup(func: Callable) -> Callable:
     """
@@ -54,6 +57,7 @@ def gpu_memory_cleanup(func: Callable) -> Callable:
             # ... create cudf DataFrames and cupy arrays ...
             pass
     """
+
     @wraps(func)
     def wrapper(*args, **kwargs) -> Any:
         try:
@@ -61,7 +65,9 @@ def gpu_memory_cleanup(func: Callable) -> Callable:
         finally:
             # Call the core cleanup logic with default settings.
             _cleanup_gpu_memory(synchronize=True, run_gc=True, release_pools=True)
+
     return wrapper
+
 
 def manual_gpu_cleanup():
     """
@@ -70,10 +76,12 @@ def manual_gpu_cleanup():
     This is useful for freeing GPU memory in interactive environments like
     Jupyter notebooks or an IPython console after performing large computations.
     """
-    logger.debug("Manual GPU memory cleanup initiated.")
+    logger.debug('Manual GPU memory cleanup initiated.')
     _cleanup_gpu_memory(synchronize=True, run_gc=True, release_pools=True)
 
+
 # --- Internal Implementation ---
+
 
 def _cleanup_gpu_memory(synchronize: bool, run_gc: bool, release_pools: bool):
     """
@@ -85,16 +93,16 @@ def _cleanup_gpu_memory(synchronize: bool, run_gc: bool, release_pools: bool):
     # Step 1: Synchronize CUDA operations to wait for pending kernels.
     if synchronize:
         try:
-            #cupy.cuda.Stream.null.synchronize()
-            cupy.cuda.runtime.deviceSynchronize()   # More thorough sync
-            logger.debug(f'Cuda device sync inside gpu_memory_cleanup successful.')
+            # cupy.cuda.Stream.null.synchronize()
+            cupy.cuda.runtime.deviceSynchronize()  # More thorough sync
+            logger.debug('Cuda device sync inside gpu_memory_cleanup successful.')
         except Exception as e:
-            logger.warning(f"Error during CUDA stream sync: {e}")
+            logger.warning(f'Error during CUDA stream sync: {e}')
 
     # Step 2: Run garbage collection to free Python-level object references.
     if run_gc:
         gc.collect()
-        logger.debug(f'Python garbage collection inside gpu_memory_cleanup successful.')
+        logger.debug('Python garbage collection inside gpu_memory_cleanup successful.')
 
     # Step 3: Release memory from the underlying memory pools.
     if release_pools:
@@ -106,28 +114,29 @@ def _cleanup_gpu_memory(synchronize: bool, run_gc: bool, release_pools: bool):
             releasable_mr = _find_releasable_rmm_resource(initial_mr)
             if releasable_mr is not None:
                 releasable_mr.release()
-                logger.debug("RMM memory pool released.")
+                logger.debug('RMM memory pool released.')
         except Exception as e:
-            logger.warning(f"Error during RMM pool release (non-critical): {e}")
+            logger.warning(f'Error during RMM pool release (non-critical): {e}')
 
         # 3b) Independently free CuPy's pools. This is safe to do even if
         # CuPy is using the RMM allocator, as the call will be a harmless
         # redundant operation. If CuPy is using its own pools, this is critical.
         try:
             cupy.get_default_memory_pool().free_all_blocks()
-            logger.debug(f'Cupy free all blocks in default memory pool successful.')
+            logger.debug('Cupy free all blocks in default memory pool successful.')
         except Exception as e:
-            logger.warning(f"Error freeing CuPy default pool (non-critical): {e}")
+            logger.warning(f'Error freeing CuPy default pool (non-critical): {e}')
         try:
             cupy.get_default_pinned_memory_pool().free_all_blocks()
-            logger.debug(f'Cupy free all blocks in pinned memory pool successful.')
+            logger.debug('Cupy free all blocks in pinned memory pool successful.')
         except Exception as e:
-            logger.warning(f"Error freeing CuPy pinned pool (non-critical): {e}")
+            logger.warning(f'Error freeing CuPy pinned pool (non-critical): {e}')
+
 
 def _find_releasable_rmm_resource(mr):
     """
     Traverse RMM's wrapped resources to find the actual pool allocator.
-    
+
     RMM can wrap resources (e.g., for logging or tracking stats), so this function
     traverses the chain of upstream resources to find the underlying object that
     exposes a `.release()` method.
@@ -136,17 +145,18 @@ def _find_releasable_rmm_resource(mr):
     current_resource = mr
     while current_resource is not None and id(current_resource) not in seen_resources:
         seen_resources.add(id(current_resource))
-        
-        if hasattr(current_resource, "release"):
+
+        if hasattr(current_resource, 'release'):
             return current_resource
-        
+
         # Introspect to find the upstream resource, covering different RMM versions.
-        upstream_attr = getattr(current_resource, "upstream_mr", None) or \
-                        getattr(current_resource, "get_upstream", None)
-        
+        upstream_attr = getattr(current_resource, 'upstream_mr', None) or getattr(
+            current_resource, 'get_upstream', None
+        )
+
         if callable(upstream_attr):
             current_resource = upstream_attr()
         else:
             current_resource = upstream_attr
-            
+
     return None

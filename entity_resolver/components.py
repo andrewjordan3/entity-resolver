@@ -36,25 +36,21 @@ Example:
 """
 
 import logging
-from typing import Optional, Dict, Any, Union
+from typing import Any
 
 import cupy
-from cupyx.scipy.sparse import csr_matrix, spmatrix, isspmatrix_csr
-from cupyx.scipy.sparse.linalg import svds, eigsh, LinearOperator
+from cupyx.scipy.sparse import csr_matrix, isspmatrix_csr, spmatrix
+from cupyx.scipy.sparse.linalg import LinearOperator, eigsh, svds
 
+from .config.schema import PhoneticSvdParams, SvdEigshFallbackConfig, TfidfSvdParams
 from .utils import (
-    normalize_rows,
-    ensure_finite_matrix,
-    prune_sparse_matrix,
-    winsorize_matrix,
-    scale_by_frobenius_norm,
     create_initial_vector,
+    ensure_finite_matrix,
     gpu_memory_cleanup,
-)
-from .config.schema import (
-    SvdEigshFallbackConfig, 
-    TfidfSvdParams, 
-    PhoneticSvdParams
+    normalize_rows,
+    prune_sparse_matrix,
+    scale_by_frobenius_norm,
+    winsorize_matrix,
 )
 
 # Set up module-level logger
@@ -96,18 +92,18 @@ class GPUTruncatedSVD:
 
     # --- Model State (populated during fit) ---
     # Type hints for attributes that will be populated by fit()
-    components_: Optional[cupy.ndarray] = None
-    singular_values_: Optional[cupy.ndarray] = None
-    explained_variance_: Optional[cupy.ndarray] = None
-    explained_variance_ratio_: Optional[cupy.ndarray] = None
-    total_variance_: Optional[float] = None
-    true_explained_variance_ratio_: Optional[float] = None
+    components_: cupy.ndarray | None = None
+    singular_values_: cupy.ndarray | None = None
+    explained_variance_: cupy.ndarray | None = None
+    explained_variance_ratio_: cupy.ndarray | None = None
+    total_variance_: float | None = None
+    true_explained_variance_ratio_: float | None = None
 
     def __init__(
-            self, 
-            fallback_config: SvdEigshFallbackConfig, 
-            svds_kwargs: Union[TfidfSvdParams, PhoneticSvdParams]
-        ):
+        self,
+        fallback_config: SvdEigshFallbackConfig,
+        svds_kwargs: TfidfSvdParams | PhoneticSvdParams,
+    ):
         """
         Initializes the GPUTruncatedSVD transformer.
 
@@ -139,7 +135,7 @@ class GPUTruncatedSVD:
         # Clip top 0.1% of values to handle extreme outliers.
         self.winsorize_limits = fallback_config.winsorize_limits
 
-    def fit(self, input_matrix: spmatrix, target_variable: Optional[Any] = None) -> 'GPUTruncatedSVD':
+    def fit(self, input_matrix: spmatrix, target_variable: Any | None = None) -> 'GPUTruncatedSVD':
         """
         Fits the SVD model to the data matrix.
 
@@ -165,7 +161,7 @@ class GPUTruncatedSVD:
 
         # Return the instance itself to allow for method chaining.
         return self
-    
+
     def transform(self, input_matrix: spmatrix) -> cupy.ndarray:
         """
         Transforms a matrix using the already-fitted SVD components.
@@ -205,17 +201,19 @@ class GPUTruncatedSVD:
         # the model. The dimensions of `self.components_` are (n_components, n_features).
         if prepared_matrix.shape[1] != self.components_.shape[1]:
             raise ValueError(
-                f"Input matrix has {prepared_matrix.shape[1]} features, but the model "
-                f"was fitted with {self.components_.shape[1]} features."
+                f'Input matrix has {prepared_matrix.shape[1]} features, but the model '
+                f'was fitted with {self.components_.shape[1]} features.'
             )
 
-        logger.debug(f"Transforming matrix of shape {input_matrix.shape}")
+        logger.debug(f'Transforming matrix of shape {input_matrix.shape}')
         # The core transformation is a matrix multiplication. We multiply the prepared input
         # matrix by the transpose of the components matrix.
         # Shape: (n_samples, n_features) @ (n_features, n_components) -> (n_samples, n_components)
         return prepared_matrix @ self.components_.T
 
-    def fit_transform(self, input_matrix: spmatrix, target_variable: Optional[Any] = None) -> cupy.ndarray:
+    def fit_transform(
+        self, input_matrix: spmatrix, target_variable: Any | None = None
+    ) -> cupy.ndarray:
         """
         Fits the SVD model to the input data and applies dimensionality reduction.
 
@@ -238,7 +236,9 @@ class GPUTruncatedSVD:
             cupy.ndarray: The transformed matrix of shape (n_samples, n_components) after
                           dimensionality reduction.
         """
-        logger.info(f"Starting fit_transform for GPUTruncatedSVD with n_components={self.n_components}")
+        logger.info(
+            f'Starting fit_transform for GPUTruncatedSVD with n_components={self.n_components}'
+        )
 
         # --- Step 1: Prepare and Validate the Input Matrix ---
         cleaned_input_matrix = self._prepare_input_matrix(input_matrix)
@@ -253,12 +253,16 @@ class GPUTruncatedSVD:
                 cleaned_input_matrix, k=self.n_components, **self.svds_kwargs
             )
             if cupy.all(singular_values == 0):
-                raise RuntimeError("The 'svds' solver returned all-zero singular values, indicating non-convergence.")
+                raise RuntimeError(
+                    "The 'svds' solver returned all-zero singular values, indicating non-convergence."
+                )
             logger.info("Standard 'svds' solver completed successfully.")
 
         # --- Step 3: Fallback to Robust Augmented Eigendecomposition Method ---
         except Exception as svds_exception:
-            logger.warning(f"Standard 'svds' solver failed: {svds_exception}. Falling back to the robust 'eigsh' method.")
+            logger.warning(
+                f"Standard 'svds' solver failed: {svds_exception}. Falling back to the robust 'eigsh' method."
+            )
 
             # --- Step 3a: Pre-process the Matrix for Enhanced Stability ---
             pruned_matrix, kept_row_indices, kept_column_indices = prune_sparse_matrix(
@@ -269,8 +273,12 @@ class GPUTruncatedSVD:
                 energy_cutoff_ratio=self.prune_energy_cutoff,
             )
             finite_matrix = ensure_finite_matrix(pruned_matrix, replace_non_finite=True, copy=False)
-            winsorized_matrix = winsorize_matrix(finite_matrix, limits=self.winsorize_limits, copy=False)
-            scaled_matrix, frobenius_scale_factor = scale_by_frobenius_norm(winsorized_matrix, copy=False)
+            winsorized_matrix = winsorize_matrix(
+                finite_matrix, limits=self.winsorize_limits, copy=False
+            )
+            scaled_matrix, frobenius_scale_factor = scale_by_frobenius_norm(
+                winsorized_matrix, copy=False
+            )
             normalized_row_matrix = normalize_rows(scaled_matrix, copy=False)
             matrix_for_decomposition = normalized_row_matrix
             n_pruned_samples, n_pruned_features = normalized_row_matrix.shape
@@ -278,7 +286,9 @@ class GPUTruncatedSVD:
 
             # --- Step 3b: Define the Regularized Augmented Matrix Operator ---
             alpha_regularization = 0.01
-            regularization_term = self.calculate_initial_regularization(normalized_row_matrix, alpha=alpha_regularization)
+            regularization_term = self.calculate_initial_regularization(
+                normalized_row_matrix, alpha=alpha_regularization
+            )
 
             # Create a LinearOperator. This object encapsulates the matrix-vector product function.
             # A lambda function is used here to pass the required contextual arguments
@@ -289,38 +299,54 @@ class GPUTruncatedSVD:
                     vec,
                     normalized_row_matrix=normalized_row_matrix,
                     regularization_term=regularization_term,
-                    n_pruned_samples=n_pruned_samples
+                    n_pruned_samples=n_pruned_samples,
                 ),
-                dtype=self.fallback_dtype
+                dtype=self.fallback_dtype,
             )
 
             # --- Step 3c: Run `eigsh` with a Restart Mechanism ---
-            eigsh_parameters: Dict[str, Any] = self.svds_kwargs.copy()
+            eigsh_parameters: dict[str, Any] = self.svds_kwargs.copy()
 
             eigenvalues, eigenvectors = None, None
             for attempt in range(self.eigsh_restarts):
                 try:
-                    logger.debug(f"Starting eigsh attempt {attempt + 1}/{self.eigsh_restarts} with params: {eigsh_parameters}")
-                    initial_vector = create_initial_vector(augmented_matrix_dimension, dtype=self.fallback_dtype, seed=attempt)
+                    logger.debug(
+                        f'Starting eigsh attempt {attempt + 1}/{self.eigsh_restarts} with params: {eigsh_parameters}'
+                    )
+                    initial_vector = create_initial_vector(
+                        augmented_matrix_dimension, dtype=self.fallback_dtype, seed=attempt
+                    )
                     eigenvalues, eigenvectors = eigsh(
-                        augmented_matrix_operator, k=self.n_components, v0=initial_vector, which='LA', **eigsh_parameters
+                        augmented_matrix_operator,
+                        k=self.n_components,
+                        v0=initial_vector,
+                        which='LA',
+                        **eigsh_parameters,
                     )
                     logger.info("The 'eigsh' solver completed successfully.")
                     break
                 except Exception as eigsh_exception:
-                    logger.warning(f"Eigsh attempt {attempt + 1} failed: {eigsh_exception}")
+                    logger.warning(f'Eigsh attempt {attempt + 1} failed: {eigsh_exception}')
                     if attempt < self.eigsh_restarts - 1:
                         regularization_term *= 10
-                        eigsh_parameters = self._get_eigsh_restart_params(eigsh_parameters, augmented_matrix_dimension)
+                        eigsh_parameters = self._get_eigsh_restart_params(
+                            eigsh_parameters, augmented_matrix_dimension
+                        )
                     else:
-                        raise RuntimeError("The 'eigsh' fallback solver failed after all restart attempts.") from eigsh_exception
+                        raise RuntimeError(
+                            "The 'eigsh' fallback solver failed after all restart attempts."
+                        ) from eigsh_exception
 
             # --- Step 3d: Reconstruct SVD Components from Eigenpairs ---
             adjusted_eigenvalues = cupy.maximum(eigenvalues - regularization_term, 0.0)
             singular_values = adjusted_eigenvalues
             right_singular_vectors_pruned = eigenvectors[n_pruned_samples:, :]
-            right_singular_vectors_pruned /= cupy.linalg.norm(right_singular_vectors_pruned, axis=0, keepdims=True)
-            right_singular_vectors_full = cupy.zeros((number_of_features, self.n_components), dtype=self.fallback_dtype)
+            right_singular_vectors_pruned /= cupy.linalg.norm(
+                right_singular_vectors_pruned, axis=0, keepdims=True
+            )
+            right_singular_vectors_full = cupy.zeros(
+                (number_of_features, self.n_components), dtype=self.fallback_dtype
+            )
             right_singular_vectors_full[kept_column_indices, :] = right_singular_vectors_pruned
             right_singular_vectors_transposed = right_singular_vectors_full.T
 
@@ -328,15 +354,21 @@ class GPUTruncatedSVD:
         descending_sort_indices = cupy.argsort(singular_values)[::-1]
         self.singular_values_ = singular_values[descending_sort_indices]
         self.components_ = right_singular_vectors_transposed[descending_sort_indices, :]
-        self._calculate_variance_explained(matrix_for_decomposition, matrix_for_decomposition.shape[0])
-        logger.info(f"GPUTruncatedSVD fit complete. Top singular value: {float(self.singular_values_[0]):.4e}")
+        self._calculate_variance_explained(
+            matrix_for_decomposition, matrix_for_decomposition.shape[0]
+        )
+        logger.info(
+            f'GPUTruncatedSVD fit complete. Top singular value: {float(self.singular_values_[0]):.4e}'
+        )
 
         # --- Step 5: Transform the Data into the Lower-Dimensional Space ---
         transformed_matrix = self.transform(cleaned_input_matrix)
 
         if kept_row_indices.size < number_of_samples:
-            logger.debug("Re-inserting zero-rows into the output for the pruned samples.")
-            full_transformed_matrix = cupy.zeros((number_of_samples, self.n_components), dtype=transformed_matrix.dtype)
+            logger.debug('Re-inserting zero-rows into the output for the pruned samples.')
+            full_transformed_matrix = cupy.zeros(
+                (number_of_samples, self.n_components), dtype=transformed_matrix.dtype
+            )
             full_transformed_matrix[kept_row_indices] = transformed_matrix
             transformed_matrix = full_transformed_matrix
 
@@ -360,7 +392,7 @@ class GPUTruncatedSVD:
         self.explained_variance_ratio_ = None
         self.total_variance_ = None
         self.true_explained_variance_ratio_ = None
-        logger.debug("Model state has been reset.")
+        logger.debug('Model state has been reset.')
 
     def _prepare_input_matrix(self, input_matrix: spmatrix) -> csr_matrix:
         """
@@ -391,7 +423,7 @@ class GPUTruncatedSVD:
             ValueError: If `self.n_components` is not strictly less than the smaller
                         dimension of the input matrix.
         """
-        logger.debug("Preparing and validating the input matrix.")
+        logger.debug('Preparing and validating the input matrix.')
 
         # Step 1: Handle non-finite values (NaN, infinity). This is the first and most
         # critical cleaning step. A copy is made to avoid modifying the user's original data.
@@ -401,13 +433,13 @@ class GPUTruncatedSVD:
         # matrix-vector products and row slicing, which are core operations in the
         # Lanczos-based algorithms used by `svds` and `eigsh`.
         if not isspmatrix_csr(prepared_matrix):
-            logger.debug("Input matrix is not in CSR format. Converting.")
+            logger.debug('Input matrix is not in CSR format. Converting.')
             prepared_matrix = prepared_matrix.tocsr(copy=False)
 
         # Step 3: Ensure a floating-point dtype for all subsequent numerical calculations.
         # SVD algorithms are fundamentally based on floating-point arithmetic.
         if not cupy.issubdtype(prepared_matrix.dtype, cupy.floating):
-            logger.debug(f"Input matrix dtype is not float. Casting to {self.fallback_dtype}.")
+            logger.debug(f'Input matrix dtype is not float. Casting to {self.fallback_dtype}.')
             prepared_matrix = prepared_matrix.astype(self.fallback_dtype, copy=False)
 
         # Step 4: Validate shape constraints for SVD. The number of singular values to
@@ -416,14 +448,16 @@ class GPUTruncatedSVD:
         number_of_samples, number_of_features = prepared_matrix.shape
         if self.n_components >= min(number_of_samples, number_of_features):
             raise ValueError(
-                f"n_components ({self.n_components}) must be < min(n_samples, n_features) "
-                f"which is {min(number_of_samples, number_of_features)} for the given matrix."
+                f'n_components ({self.n_components}) must be < min(n_samples, n_features) '
+                f'which is {min(number_of_samples, number_of_features)} for the given matrix.'
             )
 
-        logger.debug("Input matrix preparation complete.")
+        logger.debug('Input matrix preparation complete.')
         return prepared_matrix
 
-    def _get_eigsh_restart_params(self, previous_parameters: Dict[str, Any], augmented_matrix_dimension: int) -> Dict[str, Any]:
+    def _get_eigsh_restart_params(
+        self, previous_parameters: dict[str, Any], augmented_matrix_dimension: int
+    ) -> dict[str, Any]:
         """
         Generates a tweaked set of parameters for an `eigsh` restart attempt.
 
@@ -447,7 +481,7 @@ class GPUTruncatedSVD:
         # It's capped to be at least `n_components + 2` and no more than the matrix dimension minus one.
         updated_lanczos_vectors = min(
             max(self.n_components + 2, int(0.9 * previous_parameters['ncv'])),
-            augmented_matrix_dimension - 1
+            augmented_matrix_dimension - 1,
         )
 
         # Strategy 2: Relax the convergence tolerance (`tol`).
@@ -462,22 +496,22 @@ class GPUTruncatedSVD:
         increased_max_iterations = int(previous_parameters['maxiter'] * 1.5)
 
         logger.warning(
-            f"Restarting eigsh with new params: ncv={updated_lanczos_vectors}, "
-            f"tol={relaxed_tolerance:.1e}, maxiter={increased_max_iterations}"
+            f'Restarting eigsh with new params: ncv={updated_lanczos_vectors}, '
+            f'tol={relaxed_tolerance:.1e}, maxiter={increased_max_iterations}'
         )
 
         return {
             'ncv': updated_lanczos_vectors,
             'tol': relaxed_tolerance,
-            'maxiter': increased_max_iterations
+            'maxiter': increased_max_iterations,
         }
-    
+
     def _regularized_augmented_matvec(
         self,
         vector_z: cupy.ndarray,
         normalized_row_matrix: spmatrix,
         regularization_term: float,
-        n_pruned_samples: int
+        n_pruned_samples: int,
     ) -> cupy.ndarray:
         """
         Computes the matrix-vector product for the regularized augmented matrix.
@@ -500,24 +534,38 @@ class GPUTruncatedSVD:
         regularization_lambda = vector_z.dtype.type(regularization_term)
 
         # Split the input vector `z` into its two components `u` and `v`.
-        vector_u_component, vector_v_component = vector_z[:n_pruned_samples], vector_z[n_pruned_samples:]
+        vector_u_component, vector_v_component = (
+            vector_z[:n_pruned_samples],
+            vector_z[n_pruned_samples:],
+        )
 
         # Compute the matrix-vector products for each block of the augmented matrix.
-        top_block_result = regularization_lambda * vector_u_component + normalized_row_matrix @ vector_v_component
-        bottom_block_result = normalized_row_matrix.T @ vector_u_component + regularization_lambda * vector_v_component
+        top_block_result = (
+            regularization_lambda * vector_u_component + normalized_row_matrix @ vector_v_component
+        )
+        bottom_block_result = (
+            normalized_row_matrix.T @ vector_u_component
+            + regularization_lambda * vector_v_component
+        )
 
         # Concatenate the results to form the final output vector.
         final_result_vector = cupy.concatenate([top_block_result, bottom_block_result])
 
         # Sanity check for numerical issues like NaN or Inf, which can derail the solver.
         if not cupy.isfinite(final_result_vector).all():
-            max_finite_val = float(cupy.abs(final_result_vector[cupy.isfinite(final_result_vector)]).max()) if cupy.isfinite(final_result_vector).any() else 0
-            logger.error(
-                f"Non-finite values detected in regularized matvec result. Max finite value: {max_finite_val:.2e}, "
-                f"NaN count: {int(cupy.isnan(final_result_vector).sum())}, Inf count: {int(cupy.isinf(final_result_vector).sum())}, "
-                f"Regularization value: {regularization_term:.2e}"
+            max_finite_val = (
+                float(cupy.abs(final_result_vector[cupy.isfinite(final_result_vector)]).max())
+                if cupy.isfinite(final_result_vector).any()
+                else 0
             )
-            raise FloatingPointError("NaN or Inf generated during the regularized matrix-vector product.")
+            logger.error(
+                f'Non-finite values detected in regularized matvec result. Max finite value: {max_finite_val:.2e}, '
+                f'NaN count: {int(cupy.isnan(final_result_vector).sum())}, Inf count: {int(cupy.isinf(final_result_vector).sum())}, '
+                f'Regularization value: {regularization_term:.2e}'
+            )
+            raise FloatingPointError(
+                'NaN or Inf generated during the regularized matrix-vector product.'
+            )
 
         return final_result_vector
 
@@ -547,37 +595,37 @@ class GPUTruncatedSVD:
         # For sparse matrices in TruncatedSVD, we DON'T center the data
         # Total variance is simply ||X||_F^2 / (n-1)
         # where ||X||_F is the Frobenius norm
-        
+
         # Degrees of freedom is n_samples - 1. Safeguard against n_samples <= 1.
         degrees_of_freedom = max(n_samples - 1, 1)
 
         # The total variance is defined as ||X||_F^2 / (n - 1), where ||X||_F is the
         # Frobenius norm. For a sparse matrix, the squared norm is the sum of its
         # squared non-zero elements.
-        frobenius_norm_squared = float((decomposed_matrix.data ** 2).sum())
+        frobenius_norm_squared = float((decomposed_matrix.data**2).sum())
 
         # Total variance estimate
         # Note: This is the total variance of the matrix we actually decomposed
         # If we pruned columns or normalized, this reflects that processed matrix
         total_variance_of_decomposed_matrix = frobenius_norm_squared / degrees_of_freedom
         self.total_variance_ = total_variance_of_decomposed_matrix
-        
+
         # Component variance: s_i^2 / (n-1)
         # The variance explained by each individual component is its corresponding
         # singular value squared, divided by the degrees of freedom.
-        self.explained_variance_ = (self.singular_values_ ** 2) / degrees_of_freedom
-        
+        self.explained_variance_ = (self.singular_values_**2) / degrees_of_freedom
+
         # For Truncated SVD, we can only explain variance up to the sum of
         # the k singular values we computed. The true total variance would require
         # ALL singular values, which we don't have.
-        
+
         # Two approaches for explained variance ratio:
-        
+
         # Approach 1: Conservative (what sklearn does)
         # Use the sum of computed variances as denominator
         # This ensures ratios sum to 1.0 but doesn't reflect true % of total variance
         sum_of_component_variances = float(self.explained_variance_.sum())
-        
+
         # Use Approach 1 (conservative, always sums to ≤ 1.0)
         epsilon = 1e-18  # A small constant to avoid division by zero.
 
@@ -589,7 +637,7 @@ class GPUTruncatedSVD:
             self.explained_variance_ratio_ = self.explained_variance_ / sum_of_component_variances
         else:
             self.explained_variance_ratio_ = cupy.zeros_like(self.explained_variance_)
-        
+
         # Approach 2: Approximate total variance from Frobenius norm
         # This can give ratios > 1 if we're missing significant singular values
         # but is more truthful about what % of total variance we captured
@@ -598,37 +646,36 @@ class GPUTruncatedSVD:
         # This provides a more insightful diagnostic, showing what fraction of the
         # *total* matrix variance is captured by our selected components.
         # This can be > 1.0 if matrix was poorly conditioned, but usually should be < 1.0
-        self.true_explained_variance_ratio_ = sum_of_component_variances / max(total_variance_of_decomposed_matrix, epsilon)
-        
+        self.true_explained_variance_ratio_ = sum_of_component_variances / max(
+            total_variance_of_decomposed_matrix, epsilon
+        )
+
         # Log diagnostic information
         cumulative_relative_variance = float(self.explained_variance_ratio_.sum())
         true_variance_captured = float(self.true_explained_variance_ratio_)
 
         logger.info(
-            f"Variance explained (relative): {cumulative_relative_variance:.4f}, "
-            f"Variance captured (absolute): {true_variance_captured:.4f}"
+            f'Variance explained (relative): {cumulative_relative_variance:.4f}, '
+            f'Variance captured (absolute): {true_variance_captured:.4f}'
         )
 
         # A ratio > 1.0 is a red flag for numerical instability, suggesting the sum of
         # squared singular values found is greater than the total squared norm of the matrix.
         if true_variance_captured > 1.0:
             logger.warning(
-                f"Captured variance ratio > 1.0 ({true_variance_captured:.4f}). "
-                "This suggests numerical instability in the matrix. "
-                "The `explained_variance_ratio_` has been normalized to sum to 1.0."
+                f'Captured variance ratio > 1.0 ({true_variance_captured:.4f}). '
+                'This suggests numerical instability in the matrix. '
+                'The `explained_variance_ratio_` has been normalized to sum to 1.0.'
             )
         # A low ratio indicates that more components may be needed to represent the data.
         elif true_variance_captured < 0.5:
             logger.warning(
-                f"Only {true_variance_captured:.2%} of true variance captured. "
-                f"Consider increasing n_components (current: {self.n_components})."
+                f'Only {true_variance_captured:.2%} of true variance captured. '
+                f'Consider increasing n_components (current: {self.n_components}).'
             )
 
     @staticmethod
-    def calculate_initial_regularization(
-        matrix: spmatrix,
-        alpha: float = 1e-3
-    ) -> float:
+    def calculate_initial_regularization(matrix: spmatrix, alpha: float = 1e-3) -> float:
         """
         Calculates an initial regularization term based on the matrix's properties.
 
@@ -669,7 +716,7 @@ class GPUTruncatedSVD:
         # sum of squared singular values. By dividing by the square root of the matrix
         # rank (approximated by min(rows, cols)), we get a rough estimate of the average σ.
         estimated_rank = max(min(number_of_rows, number_of_columns), 1)
-        estimated_average_singular_value = (frobenius_norm_squared ** 0.5) / (estimated_rank ** 0.5)
+        estimated_average_singular_value = (frobenius_norm_squared**0.5) / (estimated_rank**0.5)
 
         # Set the initial regularization term as a small fraction of the average singular value.
         regularization_lambda = alpha * estimated_average_singular_value
@@ -686,9 +733,9 @@ class GPUTruncatedSVD:
         clamped_lambda = float(max(lower_bound, min(regularization_lambda, upper_bound)))
 
         logger.debug(
-            f"Calculated regularization={clamped_lambda:.2e} from ||A||_F="
-            f"{frobenius_norm_squared**0.5:.4f}, avg_sigma≈{estimated_average_singular_value:.2e}, "
-            f"alpha={alpha}, shape=({number_of_rows}, {number_of_columns})"
+            f'Calculated regularization={clamped_lambda:.2e} from ||A||_F='
+            f'{frobenius_norm_squared**0.5:.4f}, avg_sigma≈{estimated_average_singular_value:.2e}, '
+            f'alpha={alpha}, shape=({number_of_rows}, {number_of_columns})'
         )
 
         return clamped_lambda
