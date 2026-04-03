@@ -1240,7 +1240,7 @@ class ClusterValidator:
             if logger.isEnabledFor(logging.DEBUG):
                 try:
                     cp.cuda.Stream.null.synchronize()
-                except:
+                except:  # noqa: E722
                     logger.debug(
                         '*** CUDA sync failed inside _find_matches_for_state_group single chunk branch ***'
                     )
@@ -1258,7 +1258,7 @@ class ClusterValidator:
                 if logger.isEnabledFor(logging.DEBUG):
                     try:
                         cp.cuda.Stream.null.synchronize()
-                    except:
+                    except:  # noqa: E722
                         logger.debug(
                             '*** CUDA sync failed inside _find_matches_for_state_group multi chunk branch ***'
                         )

@@ -1,3 +1,44 @@
+# Entity Resolution Pipeline
+
+## Architecture Status
+
+This project is currently undergoing an architectural transition from **stage-local ad-hoc embeddings** to a **canonical embedding architecture**.
+
+### What is changing
+Earlier iterations of the pipeline generated embeddings at multiple points in the workflow, depending on the needs of each stage. That approach supported rapid experimentation, but it also introduced duplicated computation, inconsistent representations across stages, and tighter coupling between embedding logic and downstream matching behavior.
+
+The current direction is to move toward a **single canonical embedding representation** that is generated once and reused throughout the pipeline. This representation is intended to serve as a stable intermediate artifact for candidate generation, similarity scoring, clustering, and downstream review.
+
+### Why this transition matters
+This refactor is intended to improve:
+
+- consistency of entity representation across the pipeline
+- computational efficiency by reducing repeated embedding generation
+- reproducibility and traceability of downstream results
+- maintainability through clearer separation of concerns
+
+### Current repository state
+Because this migration is still in progress, the repository may contain a mix of:
+
+- newer components built around canonical embeddings
+- legacy components that still generate embeddings inline
+- temporary compatibility paths that exist to support the transition
+
+This mixed state reflects an active refactor rather than the intended final architecture.
+
+### Practical note
+The repository is best understood as a **working and evolving implementation** rather than a fully hardened, packaged release. The core design and direction are real, but some components are still being consolidated around the canonical embedding model.
+
+### Contributor guidance
+New development should prefer the canonical embedding path wherever possible and avoid introducing new duplicated embedding-generation logic unless it is explicitly temporary and documented.
+
+This project is being actively refined, and the repository currently reflects both the target architecture and transitional implementation details needed to move toward it.
+
+---
+
+# Overview
+
+
 # 🚀 GPU-Accelerated Entity Resolver
 
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/downloads/)
